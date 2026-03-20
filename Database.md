@@ -598,7 +598,7 @@ Store/Process: Sử dụng mặt nạ này để trích xuất các dòng dữ l
 - **Sức mạnh cực lớn của FST trong Lucene**:
     - **Cực kì tiết kiệm RAM**: Nén toàn bộ metadata dictionary từ hàng chục GB text data nằm gọn lỏn vào một vài chục MB RAM mà không cần cắt cụt từ.
     - **Tốc độ tra cứu $O(K)$**: Thời gian chỉ phụ thuộc vào độ dài chữ $K$, cộng trừ vài phép toán bit siêu nhẹ.
-    - Sẵn sàng hỗ trợ **Wildcard / Regex Search / Fuzzy match** (ví dụ search `B*C` hoặc tìm sai chính tả `BNC`) dễ dàng vì căn nguyên gốc của nó là Automaton Engine.
+    - Sẵn sàng hỗ trợ **Wildcard / Regex Search / Fuzzy match** (ví dụ search `B*C` hoặc tìm sai chính tả `BNC`) dễ dàng vì căn nguyên gốc của nó là Automaton Engine.(tính điểm)
 
 - **Cơ chế Xử lý khi Insert (Tính Bất biến của Term Dictionary)**:
     - **Vấn đề nghịch lý**: FST tính toán phân chia trọng lượng (weight) rất tinh vi ở từng ngã rẽ. Nếu có một Term mới chèn vào giữa, đồ thị sẽ phải tính toán lại toàn bộ trọng số dọc đường để bảo toàn ID, gây sập hiệu năng.
@@ -608,3 +608,208 @@ Store/Process: Sử dụng mặt nạ này để trích xuất các dòng dữ l
         3. **Build FST 1 Lần Duy Nhất**: Trước khi ghi xuống, danh sách từ vựng được Sắp xếp Alphabet (`Sort`). Thuật toán của Lucene bắt đầu Build cây FST từ dưới lên (Bottom-up). Vì đã có sẵn mảng đã Sort, FST biết chính xác phải đặt bao nhiêu trọng số lên ngã rẽ nào, làm 1 lần ăn ngay rồi cất vĩnh viễn vào Segment đó.
     - **Quy trình Tìm kiếm (Query)**: Bắn truy vấn Search tới toàn bộ FST của tất cả Segments đang có $\rightarrow$ Gom Postings List lại $\rightarrow$ Hợp nhất (Merge) $\rightarrow$ Trả kết quả.
     - **Gộp rác (Background Merge)**: Khi lượng Segment quá nhiều (đọc nhiều FST gây chậm), máy sẽ chạy ngầm tiến trình gộp nhiều Segment nhỏ thành 1 Segment bự, loại bỏ rác/doc đã xóa, và **Build lại 1 cây FST duy nhất** cho Segment lớn, sau đó xóa đống cây FST lẻ tẻ cũ.
+
+##### 8.2.1. PostgreSQL GIN (B+ Tree) vs Lucene (FST)
+
+###### A. Cách PostgreSQL GIN liên kết data bằng B+ Tree
+
+- **Cấu trúc tổng quan**: PostgreSQL dùng **B+ Tree** làm Term Dictionary cho GIN (Generalized Inverted Index)
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                  B+ Tree (Term Dictionary)                  │
+│                                                             │
+│  Internal Nodes: [key1 | key2 | key3 | ...]                 │
+│       ↓           ↓           ↓                             │
+│  Leaf Nodes:  [term_A → ptr] [term_B → ptr] [term_C → ptr]  │
+│                   │               │               │         │
+└───────────────────┼───────────────┼───────────────┼─────────┘
+                    ↓               ↓               ↓
+          ┌─────────────┐  ┌──────────────┐  ┌───────────────┐
+          │ Posting List│  │ Posting List │  │ Posting Tree  │
+          │ (sorted arr)│  │ (sorted arr) │  │ (B+ Tree)     │
+          │ [rid1, rid2]│  │ [rid5]       │  │ Hàng ngàn rids│
+          └─────────────┘  └──────────────┘  └───────────────┘
+```
+
+- **Luồng tra cứu**:
+    1. **Traverse B+ Tree**: Query `WHERE content @@ 'database'` → traverse từ root xuống leaf bằng binary search tại mỗi node
+    2. **Tìm entry tại leaf**: Leaf node chứa entry cho term `"database"` → entry có **pointer** trỏ tới Posting List/Tree
+    3. **Đọc Posting List**: Lấy danh sách `heap TIDs` (row IDs)
+    4. **Truy cập heap table**: Dùng TIDs truy cập bảng chính lấy dữ liệu thực
+
+- **2 cấu trúc Posting List tuỳ theo số lượng document**:
+
+| Số lượng Document IDs | Cấu trúc | Lý do |
+|---|---|---|
+| **Ít** (fit trong 1 page) | **Sorted Array** | Compact, sequential scan nhanh, ít overhead |
+| **Nhiều** (vượt 1 page) | **B+ Tree riêng** (Posting Tree) | Binary search trên tập lớn, insert/delete hiệu quả không cần rewrite toàn bộ |
+
+- **Chuyển đổi Posting List → Posting Tree**:
+    ```text
+    Ban đầu: term "the" → Posting List: [1, 5, 9, 12]     (sorted array, 1 page)
+                              ↓ (thêm nhiều document chứa "the")
+    Sau đó:  term "the" → Posting Tree (B+ Tree):
+                             [root: 50, 150]
+                            /       |        \
+                        [1..49]  [51..149]  [151..200]   ← leaf nodes = sorted doc IDs
+    ```
+    - Khi posting list quá dài → PostgreSQL tự động **promote** thành B+ Tree (Posting Tree)
+    - Ngưỡng chuyển đổi dựa trên việc data có fit trong 1 page hay không
+
+###### B. So sánh PostgreSQL GIN (B+ Tree) vs Lucene (FST)
+
+**Kiến trúc Term Dictionary**:
+
+| Tiêu chí | PostgreSQL GIN | Lucene |
+|---|---|---|
+| Cấu trúc Dictionary | **B+ Tree** trên disk | **FST (Finite State Transducer)** trên RAM |
+| Chia sẻ dữ liệu | Chỉ chia sẻ **prefix** | Chia sẻ cả **prefix VÀ suffix** → nén cực mạnh |
+| Bộ nhớ Dictionary | Tốn hơn (mỗi node = 1 page 8KB) | Cực nhỏ (GB data → vài chục MB FST) |
+| Tốc độ lookup | O(log N) — traverse qua nhiều page | O(K) — K = độ dài term |
+
+**Posting List**:
+
+| Tiêu chí | PostgreSQL GIN | Lucene |
+|---|---|---|
+| Cấu trúc | Sorted Array hoặc B+ Tree | Sorted Array nén (delta + varint + block compression) |
+| Nén | Không nén đặc biệt | Rất mạnh: Frame of Reference, PForDelta, roaring bitmap |
+| Hỗ trợ update | ✅ Insert/Delete trực tiếp | ❌ Immutable — phải tạo segment mới |
+
+**Write (Insert/Update/Delete)**:
+
+| Tiêu chí | PostgreSQL GIN | Lucene |
+|---|---|---|
+| Insert | Trực tiếp vào B+ Tree (có pending list để batch) | Buffer RAM → flush thành **Segment mới** (immutable) |
+| Delete | Xóa trực tiếp posting list/tree | Soft delete → gộp khi merge segment |
+| Consistency | Full **ACID transaction** | **Near real-time** (cần refresh mới visible) |
+
+**Ưu điểm PostgreSQL GIN**:
+- ACID compliant: transaction, rollback được
+- Mutable: Insert/Delete/Update trực tiếp, không cần background merge
+- Tích hợp sẵn: query SQL bình thường
+- Phù hợp write-heavy + mixed workload (OLTP + full-text search)
+
+**Nhược điểm PostgreSQL GIN**:
+- Tốn RAM hơn (B+ Tree không nén tốt bằng FST)
+- Full-text search chậm hơn: O(log N) vs O(K), posting list không nén mạnh
+- Không hỗ trợ fuzzy/wildcard tốt (B+ Tree chỉ match prefix, không có automaton engine)
+- Scale hạn chế: single-node, không có distributed segment
+
+**Ưu điểm Lucene**:
+- Search cực nhanh: FST trên RAM, posting list nén tối ưu
+- Cực tiết kiệm RAM cho dictionary (nén prefix + suffix)
+- Hỗ trợ fuzzy, wildcard, regex nhờ bản chất automaton
+- Horizontal scaling qua sharding segment (Elasticsearch)
+
+**Nhược điểm Lucene**:
+- Không ACID: near real-time, không rollback được
+- Immutable segment: Delete/Update tốn kém (soft delete + rewrite)
+- Background merge bắt buộc: tốn CPU/IO, có thể gây spike
+- Write amplification: rebuild FST từ đầu khi merge segment
+
+**Khi nào dùng gì?**:
+
+| Tình huống | Nên dùng |
+|---|---|
+| ACID + full-text search đơn giản | PostgreSQL GIN |
+| Search engine chuyên biệt, tỷ records, fuzzy | Lucene/Elasticsearch |
+| Write-heavy + cần search | PostgreSQL GIN (ít overhead merge) |
+| Read-heavy + search phức tạp + distributed | Lucene/Elasticsearch |
+| Cần cả hai | PostgreSQL OLTP + Elasticsearch search (đồng bộ CDC) |
+
+
+##### 8.2.2. Vector index (ANN - Approximate Nearest Neighbor)
+Trong môi trường cơ sở dữ liệu vector, việc tìm kiếm chính xác tuyệt đối (gọi là **KNN - K-Nearest Neighbors**) đòi hỏi phải quét và tính khoảng cách với *toàn bộ* vector đang có. Độ phức tạp là $O(N \times D)$ (N số record, D số chiều), điều này là thảm hoạ hiệu năng khi DB có hàng triệu vector lớn. 
+
+Do đó, hầu hết các hệ thống Vector DB sử dụng các thuật toán **ANN (Approximate Nearest Neighbor)** để đánh đổi một chút định luật "khoảng cách sát nhất" lấy tốc độ search cực nhanh $O(\log N)$ hoặc $O(1)$. Ở đây ta bỏ qua quá trình biến text/image thành các embedded vector, chỉ đề cập cấu trúc dữ liệu bên dưới.
+
+###### 8.2.2.1. Inverted File Index (IVF)
+- **Ý tưởng cốt lõi**: Chia không gian vector rộng lớn thành nhiều "hộp" nhỏ (clusters / cells). Inverted table sẽ chứa `Cluster ID -> [Posting list các danh sách vector thuộc hộp đó]`. Thay vì tìm cả thế giới, ta chỉ tìm trong 1 vài hộp gần ta nhất.
+- **Phân chia cluster như nào?**
+  - Hệ thống sử dụng thuật toán gom cụm máy học, chuyên biệt và phổ biến nhất là **K-means Clustering** trong quá trình build index.
+  - DB sẽ tính toán và đánh dấu ra $K$ điểm làm "tâm" (Centroids) mang tính đại diện cho không gian dữ liệu đó.
+- **Làm sao đảm bảo các vector trong cùng 1 cluster gần nhau?**
+  - Cơ sở toán học của nó là **Voronoi Diagram (Biểu đồ Voronoi)**. Không gian n chiều được chia thành nhiều khối đa giác vây quanh $K$ tâm.
+  - Mọi điểm vector rơi vào đa giác A đều được chứng minh bằng toán học là **có khoảng cách đến tâm A gần hơn bất kỳ tâm của các tế bào xung quanh nào khác**.
+  - **Cơ chế Search (tham số $nprobe$)**: Đầu tiên, DB đo query vector với $K$ tâm. Chọn ra $nprobe$ tâm gần query nhất (ví dụ chỉ nhặt 10 vùng trên tổng 1000 vùng mốc) ->  truy cập Posting list của 10 vùng đó và vét cạn (brute-force) cục bộ để nhặt ra Top vector sát nhất. Tốc độ rất nhanh vì chỉ phải quét 1% lượng dữ liệu.
+
+###### 8.2.2.2. Graph Index (HNSW - Hierarchical Navigable Small World)
+**HNSW** là thuật toán tìm kiếm vector state-of-the-art đỉnh cao nhất hiện nay, là trái tim của Milvus, Qdrant, pgvector.
+- **Ý tưởng thiết kế**: Phép lai ghép rực rỡ giữa **NSW (Navigable Small World)** (đồ thị điều hướng các nút mạng bạn bè lân cận, giống mạng lưới liên kết Facebook) và **Skip List** (cấu trúc nhảy vọt phân tầng).
+- **Search các vector lân cận** và **Sử dụng ý tưởng của skip list để search theo từng tầng**:
+  - Đồ thị HNSW không phẳng mà phân thành **nhiều tầng (layers)**.
+  - **Tầng trên cùng**: Rất thưa thớt, khoảng cách giữa các node rất xa, đóng vai trò như các "trạm trung chuyển cao tốc" (Hubs).
+  - **Tầng dưới cùng (Layer 0)**: Chứa toàn bộ 100% vector chằng chịt các ngã rẽ lân cận.
+  - **Luồng đi (Routing)**: Khi vector truy vấn (query) bay vào, nó bắt đầu ở node gốc ẩn tại tầng cao nhất $\rightarrow$ dò dẫm xem có node "bạn bè" cùng tầng nào gần query hơn không $\rightarrow$ Cứ men theo chiều gần hơn $\rightarrow$ Cho tới khi bị kẹt (không thấy ai ở tầng đó gần hơn nữa), nó lập tức **Xuyên thủng (Drop down)** xuống tầng kế tiếp (y nguyên logic Skip List).
+  - Liên tục lặp lại các bước rơi xuống cho đến tầng đáy (Layer 0). Lăng kính ngày càng thu hẹp lại. Tại đây, hệ thống tung lưới lân cận và chấm điểm chính xác (local beam search) để trả kết quả. Nhờ nhảy cóc từ trên cao, ta triệt tiêu đi việc phải lết từng centimet từ ngoài rìa vào không gian sâu.
+- **Xác định khoảng cách như nào để không đi lệch vector?**
+  Bất kể thuật toán IVF hay HNSW, việc định lượng "2 vector vector như thế nào thì được coi là gần nhau" phụ thuộc vào việc cấu hình hàm **Distance Metrics**. Quá trình search là chập query vector vào metric này để đo đạc với các vector trong Index.
+  1. **Cosine Similarity (Khoảng cách Cosine)**:
+     - Đo **Góc (Angle)** tạo bởi 2 tuyến vector. Càng hẹp (gần 0 độ) thì Cosine Similarity càng tiến về 1 (giống nhau nhất).
+     - Nó bỏ qua "độ dài thẳng" cường độ (Magnitude), chỉ chắt lọc **Hướng đi (Direction)**.
+     - *Dùng khi nào?*: Cực kì lý tưởng cho **Text Embeddings (NLP)** (VD: OpenAI text-embedding). Vì một câu siêu ngắn hay câu siêu dài cùng giải thích về chữ "Mèo" thì hướng vector phát triển giống nhau, chỉ khác độ dài.
+  2. **Euclidean Distance (Độ đo L2 / L2 Norm)**:
+     - Lấy thước đo đoạn thẳng vật lý nối trực tiếp 2 toạ độ điểm (Định lý Pytago không gian N chiều).
+     - Đo cả khoảng cách và cường độ (Magnitude).
+     - *Dùng khi nào?*: Computer Vision (Hình ảnh, Âm thanh) hay các Time-series recommendation.
+  3. **Inner Product (Tích vô hướng / Dot Product - IP)**:
+     - Gần y hệt đo Cosine nhưng nhân thêm độ dài, dễ tính hơn Cosine rất nhiều.
+     - **Bí kíp tối ưu hệ thống**: Muốn chạy siêu tốc? Hãy đảm bảo mô hình AI ngay từ ban đầu sinh ra output vector đã ép độ dài bằng 1 (gọi là *L2 normalized*). Lúc đó toán học chứng minh `Inner Product = Cosine Similarity`. Lúc này ta cấu hình DB xài Inner Product thay vì Cosine. Việc này giúp bỏ 100% các phép Khai căn bậc 2 và chia phân số phức tạp $\rightarrow$ Tính bằng tập lệnh *SIMD* trực tiếp trên cấu trúc thanh ghi CPU quét vèo vèo siêu tốc độ!
+
+
+
+### 9. Latching in database
+Là cơ chế đảm bảo multi thread cho data trong nội bộ database(không phải transaction)
+
+#### 9.1. Mục tiêu
+   - Small memory footprint
+   - Fast execution when no contention
+   - Decentralize management of latches
+   - Avoid expensive system calls(Linux torvals phản đối nó vào năm 2020)
+
+#### 9.2. Các loại latch
+
+   **1. Test-and-set Spinlock (Atomic)**
+   - **Cơ chế hoạt động**: Sử dụng vòng lặp vô hạn (spin) liên tục kiểm tra và giành khóa bằng lệnh nguyên thủy của vi xử lý (như Compare-And-Swap - CAS). Khi không lấy được khóa, thread sẽ không ngủ mà liên tục "chạy không tải" (busy-wait).
+   - **Nhược điểm**: Hiệu năng cao cho các giao dịch siêu ngắn, nhưng **không scale** khi có tranh chấp cao. Gây lãng phí CPU (burning cycle), hiện tượng quá tải cache coherence (các core liên tục giật cache line của nhau), và không thân thiện với OS (không nhường CPU cho thread khác).
+   - **Nơi sử dụng**: Rất hiếm khi dùng độc lập trong Database hiện đại vì hao tổn CPU lớn. Chủ yếu dùng làm block xây dựng cơ sở hoặc bảo vệ các đoạn mã cực kỳ ngắn (ví dụ: cập nhật một biến counter nội bộ duy nhất tốn vài chỉ thị CPU).
+
+   **2. Blocking Mutex (OS Lock)**
+   - **Cơ chế hoạt động**: Sử dụng cơ chế khóa của hệ điều hành (như `std::mutex` hay `pthread_mutex`). Khi không lấy được khóa, thread chuyển trạng thái sang **ngủ (sleep)** và được OS đưa vào hàng đợi chờ (wait queue). Khi khóa được giải phóng, OS sẽ đánh thức (wake up) thread.
+   - **Nhược điểm**: **Chi phí Context Switch (chuyển đổi ngữ cảnh) cao** (~25ns cho mỗi lần sys-call và sleep/wake). Nếu thời gian giữ khóa siêu ngắn (vài nanosecond), việc phải gọi sys-call rồi ngủ mất tài nguyên đáng kể, dẫn tới không thể scale.
+   - **Nơi sử dụng**: Bảo vệ các cấu trúc dữ liệu hoặc tác vụ tốn nhiều thời gian, đặc biệt là quá trình đọc/ghi page vật lý từ đĩa (Disk I/O) lên Buffer Pool (để nhường CPU cho các thread khác chạy trong lúc phần cứng làm việc).
+
+   **3. Read-Writer Latch (Shared/Exclusive Lock)**
+   - **Cơ chế hoạt động**: Cho phép nhiều thread đọc (Shared/Read) truy cập cùng lúc, nhưng chỉ cho phép tối đa 1 thread ghi (Exclusive/Write) truy cập độc quyền.
+   - **Nhược điểm**: Dễ bị "đói" Writer (Writer Starvation). Lỗ hổng lớn nhất là **Read-Contention** - dù nhiều luồng chỉ Đọc (không sửa dữ liệu), chúng vẫn phải cùng tranh nhau tăng/giảm một biến đếm (Reader Counter) ở dưới nền (dựa trên spin/mutex), khiến cache line bị thắt cổ chai $\rightarrow$ Thực chất vẫn không scale mạnh cho Multicore CPU.
+   - **Nơi sử dụng**: Được sử dụng rộng rãi làm khóa tiêu chuẩn trong các CSDL truyền thống, ví dụ bảo vệ các Node cha con trong lúc đi từ trên xuống dưới B+ Tree (kỹ thuật Crabbing lock). 
+
+   **4. Adaptive Spinlock (Hybrid Lock)**
+   - **Cơ chế hoạt động**: Lai ghép giữa Spinlock và Blocking Mutex. Khi khóa đang bận, thread sẽ **spin** (xoay tại chỗ) trong một số vòng lặp cố định hoặc thời gian cực ngắn. Nếu hết lượt spin mà chưa lấy được khóa, nó sẽ lùi bước (fallback) và **đi ngủ** (chuyển qua Blocking Mutex dính tới OS).
+   - **Nơi sử dụng**: **Loại Latch được sử dụng phổ biến nhất** trong CSDL hiện đại. 
+     - PostgreSQL sử dụng cho cơ chế `LWLock` (Lightweight Lock). 
+     - MySQL (InnoDB) sử dụng `Mutex` nội bộ có Spin Wait trước khi nhường luồng (Cấu hình bằng tham số `innodb_spin_wait_delay`).
+
+   **5. Queue-based Spinlock (MCS Lock)**
+   - **Cơ chế hoạt động**: Giải quyết hiện tượng "căng thẳng cache" của Spinlock cơ bản. Thay vì hàng ngàn thread cùng dồn tụ kiểm tra và cố mở **một địa chỉ bộ nhớ duy nhất**, nó cho các thread xếp lại thành một hàng đợi (Queue). Mỗi thread chỉ spin trên **vùng nhớ nội hạt cục bộ riêng của nó** (Local flag). Khi một thread làm xong, nó sẽ qua đánh dấu cờ cho thread tiếp theo trong Queue.
+   - **Nơi sử dụng**: Hiệu quả mạnh mẽ ở vùng có mức độ cạnh tranh siêu cấp trên các hệ thống CPU máy chủ cực lớn kiến trúc NUMA (nơi mà việc ghi bộ nhớ chéo core rất đắt đỏ). Giải pháp này còn đảm bảo tính **công bằng** (Ai đợi trước sẽ lấy khóa trước, không có thread nào bị đợi mãi mãi). MySQL đã bắt đầu áp dụng thay thế cho một phần các Spinlock nặng trĩu.
+
+   **6. Optimistic Lock Coupling (Hardware-assisted Latching)**
+   - **Cơ chế hoạt động**: Đột phá tư duy hoàn toàn: **Thread Read không cần lấy bất kỳ khóa (lock) nào cả**. Mọi object (như Node của Tree) được gắn cho 1 biến `Version counter`. 
+     1. Reader tự động ghi nhận bộ đếm `version` hiện tại.
+     2. Reader thỏa sức Đọc dữ liệu.
+     3. Trước khi Reader dời đi, sẽ **kiểm tra lại** `version` đó. Nếu version thay đổi $\rightarrow$ Có một Writer nào đó vừa làm xáo trộn $\rightarrow$ Thread đọc coi như thất bại và phải bắt đầu **Làm lại (Retry)** từ đầu.
+   - **Nơi sử dụng**: Khuynh hướng chung của các hệ thống **In-Memory DBMS** tương lai (Silo, HyPer, SAP HANA). Phổ biến nhất trong việc duyệt các node gốc của cấu trúc B+ Tree vì ở trên đỉnh root tỷ lệ read gấp hàng triệu lần tỷ lệ write, nếu loại bỏ hoàn toàn quá trình ghi lock Read (tránh được cập nhật Reader Counter vật lý) sẽ đẩy tốc độ duyệt cao phi mã. Nó sửa sai tuyệt đối rào cản từ Read-Writer Latch phía trên.
+
+Hash table latching
+   Các phương án:
+   1. Global latch: single latch để chặn entire of data structure
+
+   2. Page/block latch: Lock theo từng page và block với read-writer lock
+
+   3. Slot latch: lock theo từng slot
+
+B+tree concurrency control
+   Đảm bảo việc truy cập đồng thời vào B+ tree
+   Latch crabbing: latch parent, latch child, unlock parent nếu child là safe mode(Không split or merge node )
