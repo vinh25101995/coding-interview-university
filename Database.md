@@ -810,6 +810,69 @@ Hash table latching
 
    3. Slot latch: lock theo từng slot
 
-B+tree concurrency control
-   Đảm bảo việc truy cập đồng thời vào B+ tree
-   Latch crabbing: latch parent, latch child, unlock parent nếu child là safe mode(Không split or merge node )
+#### 9.3. B+Tree Concurrency Control
+- **Mục tiêu**: Đảm bảo an toàn tính nhất quán khi nhiều threads thao tác vào cây, ngăn cấu trúc phân thân đứt gãy trong các sự kiện biến động (Split/Merge), đồng thời tối ưu hóa thông lượng tải chạy song song.
+
+- **Safe Node (Node an toàn)** — Định nghĩa then chốt cho tất cả kỹ thuật bên dưới:
+    - Một node được coi là **Safe** khi thao tác hiện tại chắc chắn **không lan truyền (propagate)** thay đổi cấu trúc lên node cha.
+    - Điều kiện Safe tuỳ loại thao tác:
+        | Thao tác | Điều kiện Safe |
+        |---|---|
+        | **Read (SELECT)** | Mọi node đều safe → nhả latch cha ngay lập tức |
+        | **Insert** | Node con **chưa đầy** → không thể split → cha không bị ảnh hưởng |
+        | **Delete** | Node con **hơn nửa đầy** → không thể merge/redistribute → cha không bị ảnh hưởng |
+
+- **1. Latch Crabbing (Latch Coupling)**
+    - **Tên gọi**: "Crabbing" (Cua bò) — lấy ý từ hình ảnh con cua di chuyển: **luôn bám ít nhất 1 chân** (giữ latch con) trước khi nhấc chân khác (nhả latch cha). Thread luôn giữ ít nhất 1 latch trên đường đi, đảm bảo không bao giờ "rơi tự do" giữa cây.
+    - **Cơ chế chung**: "Khóa cha → Chụp con → Nhả cha nếu con Safe". Thread duyệt từ đỉnh xuống, chiếm lấy latch của node cha, sau đó lấy latch của node con. Khi xác nhận node con đã **Safe**, thread lập tức **nhả (Unlock)** sớm latch của tất cả tổ tiên (ancestors) phía trên.
+    - **Với Read**: Thread chỉ cần *S-Latch (Shared)* xuyên suốt. Vì mọi node đều safe cho Read nên thread nhả latch cha **ngay khi** lấy được S-Latch con → nhiều luồng Read thoải mái chen chân cùng lúc, tốc độ cực cao.
+    - **Với Insert/Delete**: Thread phải dùng *X-Latch (Exclusive)* trên đường đi xuống:
+        1. Lấy X-Latch Root
+        2. Lấy X-Latch node con
+        3. Nếu node con **Safe** → nhả toàn bộ latch tổ tiên (vì chắc chắn split/merge không lan lên)
+        4. Nếu node con **Unsafe** → giữ nguyên latch cha, tiếp tục xuống
+    - **Phòng ngừa Deadlock**: Bắt buộc chiều khóa 1-way (Top-down). Nếu cho phép khóa ngược (Bottom-up — ví dụ khi split phải sửa cha), hai luồng ngược chiều một lên một xuống có thể ôm kẹt nhau vĩnh viễn. Quy tắc Top-down triệt tiêu hoàn toàn deadlock dọc thân cây.
+    - **Ưu điểm**: Thu hẹp tối đa không gian bị khóa thay vì phong tỏa cả thân cây, "mở hẻm" cho hàng loạt phiên quét khác lách vào các nhánh kế cận.
+    - **Nhược điểm (Thắt cổ chai Root)**: Bất kỳ lệnh Ghi/Xóa (`INSERT`/`DELETE`) nào cũng khởi hành bằng việc lấy *X-Latch* trên Root. Trong lưu lượng Write ác liệt, đỉnh Root chính là nút cổ chai nghiêm trọng — mọi Write phải xếp hàng tuần tự tại đây dù chúng nhắm vào các nhánh con khác nhau.
+
+- **2. Optimistic Latching (Khóa lạc quan)**
+    - **Giả định**: Tuyệt đại đa số thao tác cập nhật (`INSERT`/`DELETE`) sẽ rơi vào những Node Lá còn dư không gian, hiếm khi dẫn tới Split/Merge.
+    - **Cơ chế (Optimistic Crabbing)**:
+        1. **Lướt xuống bằng S-Latch**: Dù mang sứ mệnh Ghi, luồng vẫn chỉ cầm *S-Latch (Shared)* duyệt từ Root xuyên qua các internal node, **nhả ngay** S-Latch cha khi chụp được S-Latch con (y hệt Read crabbing). Điều này buông rộng cửa cho các luồng khác chen chân cùng lúc vượt qua Root và internal nodes.
+        2. **Đến Leaf — đổi sang X-Latch**: Vừa chạm tới Node Lá, thread nhả S-Latch cuối cùng trên internal node và **lấy X-Latch** trên Leaf. Lúc này thread **không giữ bất kỳ latch nào trên internal nodes** — toàn bộ thân cây đã được giải phóng.
+        3. **Phân xử kết quả**:
+           - **Lá Safe** (còn chỗ trống) → Ghi trực tiếp và hoàn tất. Tốc độ tối ưu.
+           - **Lá Unsafe** (thiếu không gian → cần Split/Merge) → Dự đoán lạc quan thất thủ! Thread buộc phải **Hủy bỏ (Abort)** toàn bộ, nhả X-Latch leaf, lùi về Root và **Làm lại từ đầu (Retry)** theo kỹ thuật Latch Crabbing bi quan cổ điển (ôm X-Latch dọc đường xuống).
+    - **Ưu điểm**: Xóa sổ nút cổ chai Root — Writer không còn phải giành X-Latch trên Root trong trường hợp phổ biến (leaf safe). Đẩy mạnh song song Read/Write khi cấu trúc cây ổn định.
+    - **Nhược điểm**: Trả giá cực đắt nếu đoán lầm — đội chi phí CPU qua nhiều vòng Retry. Thể hiện thê thảm nếu database bị Bulk Import một đợt Insert dữ liệu chưa Sort, liên tục gây Split → retry bất tận.
+
+- **3. Leaf Node Scan (Vấn đề Deadlock trên dãy lá)**
+    - **Bối cảnh**: Trong B+Tree, các leaf node được nối thành **doubly-linked list** để hỗ trợ range scan. Khi một thread cần quét tuần tự (ví dụ `SELECT ... WHERE id BETWEEN 100 AND 500`), nó sẽ latch leaf hiện tại → latch leaf kế tiếp → nhả leaf cũ.
+    - **Nguy cơ Deadlock**: Nếu 2 thread quét **ngược chiều** nhau trên cùng dãy leaf:
+        ```
+        Thread A: giữ Leaf-3, chờ latch Leaf-4 →
+        Thread B: giữ Leaf-4, chờ latch Leaf-3 ← 
+        → Deadlock!
+        ```
+        Latch Crabbing chỉ phòng deadlock theo chiều **dọc** (top-down). Chiều **ngang** (leaf-to-leaf) không được bảo vệ bởi quy tắc này.
+    - **Giải pháp**: Sử dụng **No-Wait protocol** — Nếu thread không lấy được latch sibling ngay lập tức (latch đang bị thread khác giữ), nó **nhả hết** tất cả latch đang giữ, ghi nhớ vị trí hiện tại, rồi **retry** từ đầu (hoặc từ vị trí đã lưu). Không bao giờ chờ đợi → triệt tiêu deadlock.
+    - **Lưu ý thực tế**: Một số hệ thống quy ước quét leaf **luôn 1 chiều** (left-to-right) để tránh hoàn toàn kịch bản ngược chiều.
+
+- **4. B-link Tree (Lehman-Yao Algorithm)**
+    - **Bối cảnh**: Latch Crabbing buộc phải **giữ latch cha** trong suốt quá trình split con → giảm song song. Lehman & Yao (1981) đề xuất B-link Tree để giải phóng cha sớm hơn.
+    - **Ý tưởng cốt lõi**: Mỗi node có thêm **right-link pointer** trỏ sang node anh em bên phải (sibling) cùng tầng, kèm theo một **high-key** (giá trị lớn nhất mà node chịu trách nhiệm).
+    - **Cơ chế Split an toàn** (chỉ cần lock tối đa 3 nodes thay vì cả path):
+        1. **Latch node hiện tại** (node bị đầy cần split)
+        2. **Tạo node mới** (nửa phải), copy nửa trên key sang
+        3. **Cài right-link**: Node cũ trỏ sang node mới, node mới thừa kế right-link cũ
+        4. **Nhả latch node cũ** — lúc này node cũ đã "an toàn" nhờ right-link: nếu ai đó đang duyệt mà key vượt quá high-key của node cũ, họ tự động nhảy sang node mới qua right-link
+        5. **Latch node cha** → chèn key phân cách (separator key) và pointer tới node mới → **Nhả cha**
+    - **Ưu điểm**: Cha không bị giữ latch trong suốt quá trình split → tăng song song đáng kể. Luồng Read/Search khi gặp node đang split vẫn tìm được đúng kết quả nhờ cơ chế right-link + high-key.
+    - **Ứng dụng thực tế**: **PostgreSQL** sử dụng B-link Tree (thuật toán Lehman-Yao) làm chiến lược concurrency chính cho B+Tree index (`nbtree`). Đây là lý do PostgreSQL có thể handle write-heavy workload trên index hiệu quả.
+
+
+
+    ### 10. Sorting
+    
+    Khi mọi thứ không được lưu trữ trên ram mà trên disk thì tối ưu I/O đôi khi lại quan trọng hơn là tốc độ thuật toán
+    Việc lấy data: tuple hay chỉ record id()
