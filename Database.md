@@ -874,5 +874,259 @@ Hash table latching
 
     ### 10. Sorting
     
-    Khi mọi thứ không được lưu trữ trên ram mà trên disk thì tối ưu I/O đôi khi lại quan trọng hơn là tốc độ thuật toán
-    Việc lấy data: tuple hay chỉ record id()
+    Khi mọi thứ không được lưu trữ trên RAM mà trên disk thì tối ưu I/O đôi khi lại quan trọng hơn là tốc độ thuật toán
+    Việc lấy data: tuple hay chỉ record id
+
+    - Khi query chứa LIMIT thì chỉ cần dùng thuật toán Top-N (min heap / max heap)
+    - Khi không biết trước số lượng kết quả, ta dùng thuật toán để chia nhỏ data và combine lại:
+        - Phase 1: Sorting — chia nhỏ data fit trong RAM, sort từng phần, sau đó lưu lại trong disk thành các sorted runs
+        - Phase 2: Merge — gộp các sorted runs lại với nhau
+        - Công thức (với B buffer pages, N data pages):
+            - Tổng quát: số pass = 1 + ⌈log_{B-1}(⌈N/B⌉)⌉
+            - Trường hợp 2-way merge (B=3, 2 input + 1 output buffer): số pass = 1 + ⌈log2(N)⌉
+            - Total I/O = 2N × số pass (mỗi pass đọc N page + ghi N page)
+        2-pass merge sort:
+            - Yêu cầu: B ≥ √N buffer pages (Phase 1 tạo ⌈N/B⌉ sorted runs, Phase 2 merge tất cả cùng lúc → cần ít nhất ⌈N/B⌉ + 1 buffer pages)
+
+        Double buffering:
+            Thay vì sử dụng toàn bộ buffer pool, ta chia chúng thành 2 nửa
+            Khi 1 phần hoàn thành và thực thi ghi vào disk, ta thực hiện sort data tại nửa thứ 2
+            Việc này giúp ta overlap I/O và CPU (tối ưu tài nguyên CPU), nhưng giảm hiệu quả của buffer pool đi 1 nửa
+
+    Phân bổ tài nguyên: 
+        - Postgres khá cứng nhắc việc cung cấp tài nguyên: Ví dụ 1GB RAM, mỗi query chỉ có thể dùng 100MB (work_mem)
+        - Các DB doanh nghiệp (Oracle, SQL Server) thực hiện tốt hơn khi có cơ chế memory grant linh hoạt — mượn thêm từ các query không sử dụng
+
+    Tối ưu compare:
+        Kĩ thuật 1: Code specialization / JIT — thay vì gọi function pointer cho comparator, generate code cụ thể (inline function) để giảm overhead gọi hàm
+        Kĩ thuật 2: Suffix truncation — compare binary prefix có độ dài cố định của varchar trước, chỉ khi prefix bằng nhau mới compare full string (giảm cache miss)
+        Kĩ thuật 3: Đưa các variable leng thành fixed length và dùng thuật toán để so sánh??
+
+    Aggregate:
+       - Tổng hợp data ta cần dùng thuật toán sorting hoặc hashing
+       - Tùy theo phần cứng mà sorting hoặc hash có thể nhanh hơn, nhưng trong đại bộ phận các trường hợp thì hashing nhanh hơn
+       - Tương tự như sort, nếu data > memory thì ta cần chiến lược chia nhỏ
+
+       External Hashing Aggregate (khi data không fit trong RAM):
+           Vấn đề: Tại sao không chia nhỏ data thành chunk rồi hash lần lượt?
+               → Các key giống nhau (cùng group) bị PHÂN TÁN khắp các chunk
+               → Ví dụ: key "Vietnam" có thể xuất hiện ở chunk 1, chunk 5, chunk 99...
+               → Khi merge partial results, phải tìm và gộp lại tất cả entry cùng key → chi phí merge rất lớn
+
+           Giải pháp: Dùng hash function để đảm bảo các key giống nhau luôn rơi vào CÙNG 1 partition
+               → Mỗi partition là độc lập, aggregate xong là xong, KHÔNG CẦN MERGE
+
+           Phase 1 — Partition (dùng hash function h1):
+               - Duyệt toàn bộ data, với mỗi tuple: bucket_id = h1(key) % B (B = số partition)
+               - Ghi tuple vào buffer của bucket tương ứng
+               - Khi buffer đầy → flush bucket ra disk
+               - Kết quả: tất cả tuple có cùng key nằm trong cùng 1 partition trên disk
+
+           Phase 2 — ReHash (dùng hash function h2 ≠ h1):
+               - Với mỗi partition:
+                   1. Load partition vào RAM
+                   2. Build hash table bằng h2 (khác h1 để tránh cùng collision pattern)
+                   3. Tính aggregate (SUM, COUNT, AVG...) trực tiếp trên hash table
+                   4. Output kết quả
+               - Tại sao dùng h2 ≠ h1? Vì h1 chỉ đảm bảo cùng key → cùng partition.
+                 Trong partition, cần h2 để build hash table hiệu quả (tránh clustering)
+
+           Yêu cầu bộ nhớ:
+               - Cần B ≤ (số buffer pages - 1) partitions
+               - Mỗi partition phải fit trong RAM ở Phase 2 → cần B ≈ √N partitions
+               - Nếu 1 partition vẫn quá lớn → recursive partitioning: hash lại partition đó bằng h3 để chia nhỏ hơn
+
+           So sánh:
+               | Naive (chia chunk tuần tự)           | External Hash Aggregate              |
+               | Key giống nhau phân tán khắp chunks  | Key giống nhau tập trung 1 partition |
+               | Phải merge tất cả partial results    | Không cần merge — partition độc lập  |
+               | I/O cao do merge                     | I/O = 3N (read + write + read lại)   |
+    
+
+    ### 11. Join
+    #### 11.1. Join Algorithm
+    ##### 11.1.1. Nested Loop Join
+        Thuật toán đơn giản nhất: duyệt qua từng tuple của R, với mỗi tuple, duyệt qua từng tuple của S và so sánh
+        Tốn I/O: O(N*M) nếu không có buffer, O(N*M/B) nếu có buffer
+        
+    ##### 11.1.2. Block Nested Loop Join
+        Tương tự như nested loop join nhưng thay vì duyệt từng tuple của S, ta duyệt từng block của S
+        Tốn I/O: O(N*M/B) nếu có buffer
+        
+    ##### 11.1.3. Sort-Merge Join
+        Tốn I/O cho sort và join nhưng nhanh hơn rất nhiều so với nested loop join
+    
+    ##### 11.1.4. Hash Join
+        Sử dụng hash table để join
+        Cải tiến: Dùng bloom filter trước khi check hash table
+        Khi data > memory ta cần tối ưu lại
+        11.4.1. Partitioned Hash Join
+            Đôi khi còn được gọi là grace hash join
+            Tương tự: Thực hiện hash R và S thành các partition
+            Phase 1: Partition
+                - Dùng hash function h1 để hash R và S thành các partition
+                - Ghi partition vào disk
+            Phase 2: Join
+                - Với mỗi partition:
+                    1. Load partition vào RAM
+                    2. Build hash table bằng h2 (khác h1 để tránh cùng collision pattern)
+                    3. Tính join trực tiếp trên hash table
+                    4. Output kết quả
+            Yêu cầu bộ nhớ:
+                - Cần B ≤ (số buffer pages - 1) partitions
+                - Mỗi partition phải fit trong RAM ở Phase 2 → cần B ≈ √N partitions
+                - Nếu 1 partition vẫn quá lớn → recursive partitioning: hash lại partition đó bằng h3 để chia nhỏ hơn
+            I/O: 3 * (N+M)
+            So sánh:
+                | Naive (chia chunk tuần tự)           | Partitioned Hash Join              |
+                | Key giống nhau phân tán khắp chunks  | Key giống nhau tập trung 1 partition |
+                | Phải merge tất cả partial results    | Không cần merge — partition độc lập  |
+                | I/O cao do merge                     | I/O = 3N (read + write + read lại)   |
+        11.4.2. Hybrid Hash Join
+            Là sự kết hợp giữa Simple Hash Join (toàn bộ trên RAM) và Grace Hash Join (toàn bộ trên Disk).
+            Được sử dụng chủ yếu trong PostgreSQL, SQL Server, MySQL...
+            Ý tưởng: Tận dụng tối đa bộ nhớ RAM còn thừa thay vì ép tất cả xuống Disk.
+            Cách hoạt động:
+                - Phase 1 (Partitioning): 
+                    + Cố ý chia thành 1 phân vùng đặc biệt (Partition 0) vừa khít với lượng RAM đang có và giữ TẤT CẢ data của nó trên RAM (xây luôn Hash Table).
+                    + Các phân vùng còn lại (Partition 1...k) được stream ghi xuống Disk.
+                    + Khi quét bảng S, nếu tuple rơi vào Partition 0 -> Join và trả kết quả ngay lập tức (không chạm Disk). Rơi vào Partition 1...k -> Ghi xuống Disk.
+                - Phase 2 (Grace Hash Join): 
+                    + Chỉ thực hiện Grace Hash Join (đọc lên RAM, build & probe) cho các phân vùng từ 1..k đã lưu dưới Disk.
+            Tối ưu I/O: 
+                - Cực kỳ tiết kiệm I/O do Partition 0 hoàn toàn không sinh ra tác vụ Read/Write xuống Disk nào (tiết kiệm được 2*size(Partition 0) chi phí I/O).
+    
+    
+        #### 11.2. Tổng kết IO Cost của các thuật toán Join
+    | Algorithm | IO Cost | Example |
+    | :--- | :--- | :--- |
+    | Naïve Nested Loop Join | $M + (m \times N)$ | 1.3 hours |
+    | Block Nested Loop Join | $M + (\lceil M / (B-2) \rceil \times N)$ | 0.55 seconds |
+    | Index Nested Loop Join | $M + (m \times C)$ | Variable |
+    | Sort-Merge Join | $M + N + \text{(sort cost)}$ | 0.75 seconds |
+    | Hash Join | $3 \times (M + N)$ | 0.45 seconds |
+
+
+    #### 11.3. Vấn đề kích thước của Hash Table
+    Vấn đề chung với Hash Table trong DB là **Rất khó đánh giá chính xác số lượng Unique Keys (Cardinality)** từ ban đầu để cấp phát cho đúng kích thước RAM.
+    Khi cấp phát sai (nhỏ hơn thực tế), Hash Table bị đầy, dẫn tới va chạm (collision) cực cao. Có các hướng giải quyết:
+      1. Tình huống tĩnh (Static Hash Table): Chấp nhận lưu dồn bằng **Overflow Pages (Ghi tràn xuống đĩa bằng bucket chaining)**. Tác hại là làm mất độ truy xuất O(1) và sinh ra I/O random làm hệ thống kẹt cứng.
+      2. Tình huống động (Dynamic Hash Table): Sử dụng **Extendible Hashing** hoặc **Linear Hashing** để tự dãn nở mảng mà không cần phải re-hash lại toàn bộ giá trị. Đánh đổi lại là mất thêm chi phí tính toán thu dọn khi resize.
+      3. Ở Hash Join (Grace Hash Join): Xử lý bằng **Recursive Partitioning** (Dùng hàm hash mới chia lại cái phân vùng tràn đó thành các file nhỏ hơn ghi xuống đĩa tiếp).
+
+
+    ### 12.Query plan
+    Query plan là 1 DAG of operators
+
+    Pineline là 1 chuỗi các operators được thực thi tuần tự mà các tuple được xử lý liên tục từ operator này sang operator khác mà không cần phải lưu toàn bộ kết quả vào bộ nhớ.
+    
+    Pineline breaker là operator không thể hoàn thành cho đến khi toàn bộ các con của nó emit
+    -> join, aggregate, sort
+
+    #### 12.1. Processing model
+    Định nghĩa cách dbms thực thi data hoặc chuyển data giữa các operator
+    - Control flow: cách các operator giao tiếp với nhau
+    - Data flow: cách data được truyền giữa các operator
+
+    #### 12.1.1. Iterator model (Volcano Model / Pipeline Model)
+    - next(): return next tuple -> Các tuple được trả về và xử lý lần lượt
+    - open()/close(): Khởi tạo và dọn dẹp state của operator.
+    - Đây là model phổ biến nhất trong các hệ quản trị CSDL truyền thống (MySQL, PostgreSQL, SQLite...).
+    - **Ưu điểm**: Bộ nhớ sử dụng (Memory footprint) rất nhỏ, do dòng dữ liệu được truyền luân phiên (pipeline) lên trên mà không cần chờ toàn bộ (trừ các Pipeline Breaker operator như Sort, Hash Join).
+    - **Nhược điểm lớn nhất**: Chi phí gọi hàm `next()` liên tục (function call overhead) rất cao giữa hàng triệu/tỷ bản ghi, gây lãng phí CPU. 
+    Lưu ý: Tại sao khi học ta thấy query theo các page nhưng bản chất lại xử lí lần lượt theo từng tuple?
+    Nó là việc tách biệt giữa tầng thực thi (Execution Engine) và tầng lưu trữ (Storage Engine).
+    Khi ta học, ta thường tập trung vào tầng lưu trữ (Storage Engine) để hiểu cách đọc dữ liệu từ đĩa.
+    Nhưng khi thực thi query, ta lại tập trung vào tầng thực thi (Execution Engine) để hiểu cách xử lý dữ liệu.
+    Do đó mới nảy sinh sự khác biệt giữa việc exuctation và storage.
+
+
+    #### 12.1.2. Materialization model
+    - Thực thi ý tưởng: Thay vì xử lý trên từng tuple được trả về, child operator sẽ trả về toàn bộ kết quả (một mảng/list) cho parent cùng một lúc.
+    - Parent sẽ nhận và xử lý toàn bộ cục kết quả đó.
+    - **Ứng dụng**: Phù hợp với hệ thống **In-memory Database** hoặc workload **OLTP** (giao dịch, tải nhẹ). OLTP query thường chỉ truy xuất/update 1 vài bản ghi nên trả về 1 mảng kết quả cuối cùng không tốn nhiều memory, lại tránh được overhead của hàm `next()` như Iterator model.
+    - **Nhược điểm**: Không có nhiều DB dùng cho truy vấn lớn/phân tích (OLAP) vì cần phải allocate bộ nhớ khổng lồ để lưu toàn bộ kết quả trung gian, dễ dẫn tới tràn RAM/Disk I/O thảm hoạ.
+
+    #### 12.1.3. Vectorized model / Batch model
+    - Kết hợp giữa 2 model trên: Cân bằng hoàn hảo.
+    - Thay vì gọi hàm `next()` trả 1 tuple (Iterator) hay xả toàn bộ về 1 cục khổng lồ (Materialization), thì gọi `next()` trả về **từng batch (mảng)** của tuple (VD: batch 1000 - 10000 tuples, hoặc kích thước dữ liệu vừa khít lọt vào L1/L2 Cache của CPU).
+    - **Ưu điểm**: 
+      - Cực kỳ tối ưu: Giảm tải overhead của việc gọi hàm `next()`.
+      - Tận dụng được Cache của CPU hiệu quả không phải xuống RAM đọc đi đọc lại.
+      - Phát huy trọn vẹn sức mạnh của tập lệnh xử lý song song **SIMD (Single Instruction, Multiple Data)** chíp hiện đại.
+    - **Nhược điểm**: Vẫn tốn nhiều bộ nhớ hơn một chút so với Iterator truyền thống, và code implementation cực kỳ phức tạp.
+    - **Ứng dụng**: Thống trị mảng phân tích dữ liệu **OLAP / Data Warehouse** hiện đại. Hầu hết DB phân tích dùng mô hình này (ClickHouse, Snowflake, Presto, DuckDB...).
+
+    
+    #### 12.2. Plan processing model (Pull vs Push)
+    - Trong tất cả các model trên (Iterator, Materialization, Vectorized), ta đều thấy có 1 điểm chung là luồng điều khiển đi từ trên xuống dưới, nhưng luồng dữ liệu lại được "kéo" từ dưới lên (Pull) thông qua hàm `next()`.
+    - Có 2 kiến trúc chính về luồng điều khiển (Control Flow):
+        1. **Pull-based (Mô hình Kéo)**:
+            - Parent operator sẽ gọi hàm `next()` để kéo dữ liệu từ child operator.
+            - Phần lớn các RDBMS truyền thống (như MySQL, PostgreSQL) sử dụng kiến trúc này.
+        2. **Push-based (Mô hình Đẩy / Data-centric)**:
+            - Đảo ngược luồng điều khiển: Các child operator (như Scan) sẽ chủ động "đẩy" (push) dữ liệu lên cho parent operator ngay khi nó đọc được.
+            - Thay vì gọi hàm `next()` tốn kém, hệ thống sẽ "gộp" (**Operator Fusion**) các toán tử lại với nhau vào chung một vòng lặp `for`.
+            - Được sử dụng trong các hệ thống hiện đại, đặc biệt là In-memory DB (HyPer, DuckDB).
+
+    **Ví dụ minh họa Operator Fusion trong Push Model:**
+    > Truy vấn: `SELECT B.val FROM A JOIN B ON A.id = B.id WHERE A.val > 100`
+
+    *1. Vấn đề của Pull Model (Mô hình Kéo)*
+    - Trong mô hình Iterator (Pull), dữ liệu truyền qua các lời gọi hàm `next()`. Mỗi khi lấy một tuple, CPU phải nhảy từ `Join.next()` -> `Filter.next()` -> `Scan.next()`. 
+    - Việc gọi hàm ảo (virtual function calls) hàng triệu lần tạo ra độ trễ (overhead) khổng lồ và **phá hỏng CPU Cache** do ngữ cảnh thực thi (code path) liên tục bị chuyển đổi qua lại giữa các operator.
+
+    *2. Giải pháp của Push Model: "Gộp" toán tử (Operator Fusion)*
+    - Kiến trúc Push (Data-centric) để node Scan chủ động đọc và đẩy thẳng dữ liệu qua các bước xử lý tiếp theo ngay trong cùng một vòng lặp.
+    - Dưới đây là mã giả minh hoạ cách Push Model "Fuse" (gộp) các toán tử `Scan`, `Filter` và `Join`:
+
+    ```cpp
+    // --- PIPELINE 1: Đẩy dữ liệu bảng A (Build Phase) ---
+    // Toán tử Scan A chủ động quét dữ liệu
+    for (Tuple a : tableA) { 
+        // Toán tử Filter được GỘP (fused) thẳng vào vòng lặp này
+        if (a.val > 100) { 
+            // Đẩy thẳng dữ liệu thoả mãn vào Hash Table của toán tử Join
+            // (Đây là Pipeline Breaker, luồng dữ liệu của 1 tuple tàm dừng ở đây)
+            hashTable.put(a.id, a); 
+        }
+    }
+
+    // --- PIPELINE 2: Đẩy dữ liệu bảng B (Probe Phase) ---
+    // Sau khi Pipeline 1 xong, toán tử Scan B chủ động quét
+    for (Tuple b : tableB) {
+        // Toán tử Join Probe được gộp thẳng vào vòng lặp
+        Tuple a = hashTable.get(b.id); 
+        
+        if (a != null) {
+            // Toán tử Project/Emit cũng được gộp luôn
+            emit(b.val); 
+        }
+    }
+    ```
+
+    *3. Tại sao Push Model lại nhanh hơn đột phá?*
+    - **Tối đa hoá CPU Cache (Data Locality)**: Khi vòng lặp `for (Tuple a : tableA)` chạy, dòng dữ liệu `a` vừa được lấy từ RAM sẽ nằm ngay trong thanh ghi (register) hoặc L1 Cache siêu tốc của CPU. Nhờ gộp lệnh `if (a.val > 100)`, CPU kiểm tra và nhét nó vào `hashTable` ngay lập tức mà không copy/di chuyển dữ liệu ra vùng nhớ trung gian. Dữ liệu được xử lý triệt để ngay khi nó đang còn "nóng" trong CPU.
+    - **Biên dịch truy vấn (Query Compilation / JIT)**: Để tạo ra được mã vòng lặp lồng nhau tối ưu như trên thay vì một đồ thị cây (Tree of Objects) rời rạc, hệ quản trị cơ sở dữ liệu hiện đại (như HyPer) sẽ lấy Query Plan Tree đó, sinh ra trực tiếp mã C++ hoặc mã máy (LLVM IR), rồi dùng cơ chế biên dịch JIT (Just-In-Time) để chuyển thành file thực thi chạy thẳng dưới nhân CPU. Việc này giúp tiết kiệm tối đa tài nguyên I/O và CPU so với việc thông dịch (interpret) đồ thị cây.
+
+
+    #### 12.3. Access method
+    Là cách thức mà hệ quản trị cơ sở dữ liệu truy cập dữ liệu (scan) trong cấu trúc file vật lý.
+    Có các phương pháp tiếp cận chính:
+        1. **Sequential Scan (Full Table Scan)**: Quét toàn bộ dữ liệu lần lượt từ đầu đến cuối page trên đĩa. Nên hạn chế dùng nhưng nếu bất đắc dĩ phải quét, DB có rất nhiều luồng tối ưu hạng nặng.
+          *Các kĩ thuật tối ưu để giảm thiểu I/O và tăng tốc Sequential Scan:*
+          - **Prefetching (Đọc trước dữ liệu)**: Thay vì đợi CPU yêu cầu từng page rồi mới xuống đĩa lấy (bị I/O block), Storage Manager sẽ đoán trước và tuồn sẵn một loạt các page nối tiếp nhau lên Buffer Pool trước. Giúp CPU chạy mượt không bị khựng lại chờ I/O.
+          - **Buffer Pool Bypass (Đi vòng qua Buffer Pool)**: Khi một query cực lớn cần quét toàn bộ bảng, nếu đẩy data đó xen dòng qua Buffer Pool trung tâm sẽ làm "trôi" sạch (evict) các trang dữ liệu đang được cache nóng của các luồng nhỏ khác. Cấu trúc DB thông minh giải quyết bằng cách cấp vùng memory cục bộ riêng rẽ để chứa dữ liệu, quét xong hủy luôn tránh xả rác vào Buffer chung.
+          - **Scan Sharing / Synchronized Scans**: Đi chung xe. Nếu có nhiều request đòi table scan cùng một bảng khổng lồ, thay vì mỗi người tự đọc đĩa quét lại từ đầu, Request đến sau sẽ "bám" (chu du cùng) với con trỏ I/O của Request đang quét dở dang, đến cuối file quay lại đầu bù lấp khúc thiếu → triệt tiêu lượng đọc Disk.
+          - **Data Skipping / Zone Maps**: Lưu thẻ metadata siêu nhỏ gọn thống kê từng Block chứa gì (ví dụ: ghim `MIN: 10`, `MAX: 50`). Khi Query có câu `WHERE val = 99`, nó đi lướt qua thẻ metadata, thấy không khớp là **nhảy cóc (Skip)** cả Block luôn, hoàn toàn không cần cày I/O load block lên RAM. Bí kíp chí mạng của Snowflake / Parquet file.
+          - **Late Materialization**: Đặc ân của Columnar Database. Quét chập từng mảng Column riêng rẽ để lọc điều kiện ở `WHERE`. Chỗ nào không khớp sẽ bị đánh dấu loại. Phễu rơi xuống màng lọc cuối cùng mới bắt đầu tút những cột cần xuất ra ở `SELECT` rồi gộp mảng dọc (tuple reconstruction). Vừa nhàn I/O, vừa bớt chuyển vị (shuffle) trong RAM.
+          - **Data Encoding & Compression**: RÚT NGẮN độ dài byte mỗi record nằm trong Disk Block thông qua thuật toán nén như RLE, Dictionary → tăng lượng tuple kéo lên trong 1 thao tác I/O.
+          - **Clustering / Sorting**: Định hình vị trí vật lý. DB dồn các record hay xuất hiện chung (Cluster) hoặc Sort theo trường chủ đạo liên tiếp nhau để việc kéo data là Sequential I/O (rẻ hơn nghìn lần Random I/O cày tung xới).
+          - **Parallelization / Vectorization (SIMD)**: 
+            + *Task Parallelization*: Cưa bảng làm 4 khúc nhỏ, gọi 4 Threads vả đồng loạt, nhanh gấp chục lần.
+            + *Data Vectorization*: Dùng SIMD của nhân CPU nạp cả cụm Data vô Cache đo chung điều kiện thay vì check 1v1.
+          
+        2. **Index Scan**: Đột nhập từ cổng Index (B+Tree) truy xuất dãy Target IDs rồi nhảy róc xuống Disk lấy Tuple gốc.
+        3. **Multi Index Scan / Bitmap Scan**: Vận dụng 2 hay nhiều Index cùng lúc giải mã ra 2 mảng tập hợp. Lấy cấu trúc Bitmap dùng Bitwise AND/OR giao hoán tìm ra chân lý ID tập hợp thoả mãn mọi Index → rồi mới thực hiện xuống Disk múc hàng theo list giao hoán. Tránh được việc lookup Disk mù mịt.
+
+            
