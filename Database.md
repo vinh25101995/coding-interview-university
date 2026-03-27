@@ -1114,19 +1114,185 @@ Hash table latching
     Là cách thức mà hệ quản trị cơ sở dữ liệu truy cập dữ liệu (scan) trong cấu trúc file vật lý.
     Có các phương pháp tiếp cận chính:
         1. **Sequential Scan (Full Table Scan)**: Quét toàn bộ dữ liệu lần lượt từ đầu đến cuối page trên đĩa. Nên hạn chế dùng nhưng nếu bất đắc dĩ phải quét, DB có rất nhiều luồng tối ưu hạng nặng.
-          *Các kĩ thuật tối ưu để giảm thiểu I/O và tăng tốc Sequential Scan:*
-          - **Prefetching (Đọc trước dữ liệu)**: Thay vì đợi CPU yêu cầu từng page rồi mới xuống đĩa lấy (bị I/O block), Storage Manager sẽ đoán trước và tuồn sẵn một loạt các page nối tiếp nhau lên Buffer Pool trước. Giúp CPU chạy mượt không bị khựng lại chờ I/O.
-          - **Buffer Pool Bypass (Đi vòng qua Buffer Pool)**: Khi một query cực lớn cần quét toàn bộ bảng, nếu đẩy data đó xen dòng qua Buffer Pool trung tâm sẽ làm "trôi" sạch (evict) các trang dữ liệu đang được cache nóng của các luồng nhỏ khác. Cấu trúc DB thông minh giải quyết bằng cách cấp vùng memory cục bộ riêng rẽ để chứa dữ liệu, quét xong hủy luôn tránh xả rác vào Buffer chung.
-          - **Scan Sharing / Synchronized Scans**: Đi chung xe. Nếu có nhiều request đòi table scan cùng một bảng khổng lồ, thay vì mỗi người tự đọc đĩa quét lại từ đầu, Request đến sau sẽ "bám" (chu du cùng) với con trỏ I/O của Request đang quét dở dang, đến cuối file quay lại đầu bù lấp khúc thiếu → triệt tiêu lượng đọc Disk.
-          - **Data Skipping / Zone Maps**: Lưu thẻ metadata siêu nhỏ gọn thống kê từng Block chứa gì (ví dụ: ghim `MIN: 10`, `MAX: 50`). Khi Query có câu `WHERE val = 99`, nó đi lướt qua thẻ metadata, thấy không khớp là **nhảy cóc (Skip)** cả Block luôn, hoàn toàn không cần cày I/O load block lên RAM. Bí kíp chí mạng của Snowflake / Parquet file.
-          - **Late Materialization**: Đặc ân của Columnar Database. Quét chập từng mảng Column riêng rẽ để lọc điều kiện ở `WHERE`. Chỗ nào không khớp sẽ bị đánh dấu loại. Phễu rơi xuống màng lọc cuối cùng mới bắt đầu tút những cột cần xuất ra ở `SELECT` rồi gộp mảng dọc (tuple reconstruction). Vừa nhàn I/O, vừa bớt chuyển vị (shuffle) trong RAM.
-          - **Data Encoding & Compression**: RÚT NGẮN độ dài byte mỗi record nằm trong Disk Block thông qua thuật toán nén như RLE, Dictionary → tăng lượng tuple kéo lên trong 1 thao tác I/O.
-          - **Clustering / Sorting**: Định hình vị trí vật lý. DB dồn các record hay xuất hiện chung (Cluster) hoặc Sort theo trường chủ đạo liên tiếp nhau để việc kéo data là Sequential I/O (rẻ hơn nghìn lần Random I/O cày tung xới).
-          - **Parallelization / Vectorization (SIMD)**: 
-            + *Task Parallelization*: Cưa bảng làm 4 khúc nhỏ, gọi 4 Threads vả đồng loạt, nhanh gấp chục lần.
-            + *Data Vectorization*: Dùng SIMD của nhân CPU nạp cả cụm Data vô Cache đo chung điều kiện thay vì check 1v1.
-          
-        2. **Index Scan**: Đột nhập từ cổng Index (B+Tree) truy xuất dãy Target IDs rồi nhảy róc xuống Disk lấy Tuple gốc.
-        3. **Multi Index Scan / Bitmap Scan**: Vận dụng 2 hay nhiều Index cùng lúc giải mã ra 2 mảng tập hợp. Lấy cấu trúc Bitmap dùng Bitwise AND/OR giao hoán tìm ra chân lý ID tập hợp thoả mãn mọi Index → rồi mới thực hiện xuống Disk múc hàng theo list giao hoán. Tránh được việc lookup Disk mù mịt.
+            *Các kĩ thuật tối ưu để giảm thiểu I/O và tăng tốc Sequential Scan:*
+            - **Prefetching (Đọc trước dữ liệu)**: Thay vì đợi CPU yêu cầu từng page rồi mới xuống đĩa lấy (bị I/O block), Storage Manager sẽ đoán trước và tuồn sẵn một loạt các page nối tiếp nhau lên Buffer Pool trước. Giúp CPU chạy mượt không bị khựng lại chờ I/O.
+            - **Buffer Pool Bypass (Đi vòng qua Buffer Pool)**: Khi một query cực lớn cần quét toàn bộ bảng, nếu đẩy data đó xen dòng qua Buffer Pool trung tâm sẽ làm "trôi" sạch (evict) các trang dữ liệu đang được cache nóng của các luồng nhỏ khác. Cấu trúc DB thông minh giải quyết bằng cách cấp vùng memory cục bộ riêng rẽ để chứa dữ liệu, quét xong hủy luôn tránh xả rác vào Buffer chung.
+            - **Scan Sharing / Synchronized Scans**: Đi chung xe. Nếu có nhiều request đòi table scan cùng một bảng khổng lồ, thay vì mỗi người tự đọc đĩa quét lại từ đầu, Request đến sau sẽ "bám" (chu du cùng) với con trỏ I/O của Request đang quét dở dang, đến cuối file quay lại đầu bù lấp khúc thiếu → triệt tiêu lượng đọc Disk.
+            - **Data Skipping / Zone Maps**: Lưu thẻ metadata siêu nhỏ gọn thống kê từng Block chứa gì (ví dụ: ghim `MIN: 10`, `MAX: 50`). Khi Query có câu `WHERE val = 99`, nó đi lướt qua thẻ metadata, thấy không khớp là **nhảy cóc (Skip)** cả Block luôn, hoàn toàn không cần cày I/O load block lên RAM. Bí kíp chí mạng của Snowflake / Parquet file.
+            - **Late Materialization**: Đặc ân của Columnar Database. Quét chập từng mảng Column riêng rẽ để lọc điều kiện ở `WHERE`. Chỗ nào không khớp sẽ bị đánh dấu loại. Phễu rơi xuống màng lọc cuối cùng mới bắt đầu tút những cột cần xuất ra ở `SELECT` rồi gộp mảng dọc (tuple reconstruction). Vừa nhàn I/O, vừa bớt chuyển vị (shuffle) trong RAM.
+            - **Data Encoding & Compression**: RÚT NGẮN độ dài byte mỗi record nằm trong Disk Block thông qua thuật toán nén như RLE, Dictionary → tăng lượng tuple kéo lên trong 1 thao tác I/O.
+            - **Clustering / Sorting**: Định hình vị trí vật lý. DB dồn các record hay xuất hiện chung (Cluster) hoặc Sort theo trường chủ đạo liên tiếp nhau để việc kéo data là Sequential I/O (rẻ hơn nghìn lần Random I/O cày tung xới).
+            - **Parallelization / Vectorization (SIMD)**: 
+                + *Task Parallelization*: Cưa bảng làm 4 khúc nhỏ, gọi 4 Threads vả đồng loạt, nhanh gấp chục lần.
+                + *Data Vectorization*: Dùng SIMD của nhân CPU nạp cả cụm Data vô Cache đo chung điều kiện thay vì check 1v1.
 
-            
+        2. **Index Scan**: Truy cập thông qua cổng Index (B+Tree), truy xuất dãy Target IDs rồi xuống Disk lấy Tuple gốc.
+        3. **Multi Index Scan / Bitmap Scan**: Sử dụng 2 hay nhiều Index cùng lúc, mỗi Index trả về một tập hợp IDs. Dùng cấu trúc **Bitmap** kết hợp **Bitwise AND/OR** để tìm ra tập hợp IDs thoả mãn tất cả điều kiện → sau đó mới xuống Disk lấy tuple theo danh sách ID đã giao. Tránh được việc lookup Disk nhiều lần.
+
+    #### 12.4. Modification Query
+
+    - **Update/Delete**:
+        - Child operator chỉ truyền **Record ID** cho parent thay vì truyền toàn bộ tuple.
+        - Cần lưu thông tin các ID đã được xử lý để tránh **Halloween Problem**.
+        - **Halloween Problem**: Xảy ra khi `UPDATE` một bản ghi khiến nó thay đổi vị trí (ví dụ: thay đổi giá trị indexed column) → bản ghi có thể xuất hiện lại trong quá trình scan và bị xử lý lần nữa → cần lưu lại danh sách ID đã xử lý để phát hiện và bỏ qua.
+
+    - **Insert**:
+        1. Tuple được truyền trực tiếp trong toán tử (literal values).
+        2. Tuple được lấy từ child operator.
+            - Ví dụ: `INSERT INTO table1 SELECT * FROM table2`
+
+    #### 12.5. Expression Evaluation
+
+    - **Biểu diễn**: DBMS biểu diễn các biểu thức (WHERE clause, computed columns...) dưới dạng **Expression Tree**.
+
+    - **Các loại node trong Expression Tree**:
+        - **Comparison**: `=`, `>`, `<`, `!=`
+        - **Arithmetic**: `+`, `-`, `*`, `/`
+        - **Function**: các hàm built-in hoặc UDF
+        - **Conjunction / Disjunction**: `AND`, `OR`
+        - **Constant**: giá trị hằng số (100, 200...)
+        - **Tuple Attribute Reference**: tham chiếu cột (`A.x`, `A.y`...)
+
+    - **Cách thực thi**: DBMS duyệt cây theo kiểu **post-order** (từ lá lên gốc). Tại mỗi node, nó gọi một hàm `evaluate()` tương ứng với loại operator đó. Kết quả trả về cho node cha, cứ thế cho đến root. Tương tự như việc ta liên tục phải `switch` để xử lý từng node trong tree vậy.
+
+    - **Vấn đề hiệu năng**: Biểu diễn dạng tree gây chậm do overhead gọi hàm ảo (virtual function call), branch misprediction, và cache miss tại mỗi node — lặp lại cho **mỗi tuple** trong bảng.
+
+    - **Giải pháp — JIT / Inline Function**: Một số DBMS cố gắng đưa expression tree về dạng **inline function** (compiled code) để loại bỏ overhead:
+
+        ```
+        Ví dụ: SELECT * FROM A WHERE A.x > 100 AND A.y = 200
+
+        Biểu diễn dưới dạng tree:
+                             AND
+                            /   \
+                          >       =
+                         / \     / \
+                        x  100  y  200
+
+        Biểu diễn dưới dạng inline function:
+        ```
+        ```cpp
+        bool evaluate(Tuple t) {
+            return t.x > 100 && t.y == 200;
+        }
+        ```
+
+### 13. Parallel Query Engine Architectures
+    - Process model định nghĩa cách hệ thống được tổ chức để support concurrent request/queries.
+        - Dùng từ **concurrent** vì Process model nói về cách **tổ chức** để xử lý nhiều request cùng lúc (concurrency = quản lý nhiều task). **Parallelism** (chạy thật sự song song trên nhiều CPU) chỉ là một *cách triển khai* concurrency. Một DBMS có thể concurrent mà không parallel (ví dụ: single-core dùng time-slicing).
+
+    - Đơn vị triển khai là worker
+        1 worker có thể là 1 process, thread hoặc embedded DBMS
+        Chủ yếu hiện nay các hệ thống DBMS sử dụng thread model
+
+    #### 13.1. Process model
+    Được sử dụng trong PostgreSQL (đến nay vẫn dùng process-per-connection), Oracle, DB2 (hỗ trợ cả process và thread model).
+    Phụ thuộc vào OS dispatcher.
+    Sử dụng shared memory hoặc pipeline để giao tiếp.
+
+    Các thư viện pthread được chuẩn hóa từ những năm 90, do đó các hệ thống từ những năm 90 trở về trước thường sử dụng process model.
+
+    #### 13.2. Thread model
+    Sử dụng trong SQL Server, MySQL. Oracle và DB2 hiện tại hỗ trợ cả hai (hybrid).
+    DBMS tự quản lý thread pool và scheduling thay vì phụ thuộc OS, giúp kiểm soát tốt hơn số lượng concurrent workers, giảm context switch
+
+
+    #### 13.3. Embedded model
+    Chạy trong cùng address space (process) với application (ví dụ: RocksDB, SQLite, LevelDB, DuckDB).
+    Application chịu trách nhiệm cho thread và scheduling.
+
+    #### 13.4. Scheduling
+    - Với mỗi query plan, cần quyết định where, when and how to execute it → Scheduling
+        - **Task assignment**: gán query/operator cho worker nào
+        - **Task priority**: thứ tự ưu tiên thực thi
+    - Các DB doanh nghiệp như DB2, Oracle, SQL Server tự lập lịch (self-scheduling) với thread pool do DBMS quản lý.
+    - PostgreSQL để OS scheduling do dùng process model → OS quyết định process nào chạy khi nào.
+    - MySQL (InnoDB) dùng thread model, bản Enterprise có **Thread Pool Plugin** tự quản lý scheduling. Bản Community vẫn phụ thuộc OS scheduling, nằm giữa PostgreSQL (hoàn toàn OS) và Oracle/DB2 (tự lập lịch hoàn toàn).
+    - **PostgreSQL có chậm hơn vì OS scheduling không?** Có ảnh hưởng nhưng không phải yếu tố chính:
+        - Context switch giữa process đắt hơn thread (~vài μs)
+        - OS không hiểu workload DB nên scheduling không tối ưu (ví dụ: OS có thể preempt process đang giữ latch)
+        - Tuy nhiên bottleneck đọc thường nằm ở **I/O** và **query plan** hơn là scheduling overhead
+
+    #### 13.5. Parallel Execution
+    Các hệ thống DBMS thực thi nhiều task đồng thời để nâng cao hiệu suất sử dụng phần cứng.
+        - Các task được thực thi không nhất thiết thuộc về cùng 1 query
+        - High-level design không phụ thuộc vào kiến trúc thực thi (process/thread hay multi-node)
+
+    ##### 13.5.1. Inter-query Parallelism
+    - Thực thi **nhiều query** cùng lúc (mỗi query trên 1 worker riêng)
+        - Phần lớn sử dụng first-come-first-serve
+        - Nếu các query đều là read-only thì phần lớn không cần explicit coordination (điều phối có chủ đích) giữa những query đó
+        - Nếu có ghi thì việc thực thi đúng trở nên khó khăn (tricky) — cần concurrency control (lock, MVCC...)
+
+    ##### 13.5.2. Intra-query Parallelism
+    - Thực thi **1 query** bằng cách chạy song song các operators của nó
+    - Có 3 dạng parallelism:
+        1. **Intra-operator** (data parallelism)
+        2. **Inter-operator** (pipeline parallelism)
+        3. **Bushy** parallelism
+    - Các kĩ thuật này **không loại trừ lẫn nhau**, và có thể được kết hợp với nhau.
+    - Với mỗi toán tử đều có 1 version chạy song song, nhờ vậy multi-thread có thể sử dụng data tập trung hoặc chia nhỏ ra để xử lý.
+
+    **Ví dụ: Parallel Grace Hash Join**
+        - Mỗi worker thực thi hash và probe trên 1 partition riêng của hash table
+        - Các partition độc lập → không cần coordination giữa các worker
+
+    ###### 13.5.2.1. Intra-operator (Data Parallelism)
+    - Operators được decompose thành các phần riêng lẻ để thực thi **cùng 1 function** trên các **sub-dataset khác nhau**.
+    - Ví dụ: Parallel Seq Scan chia bảng thành N phần, mỗi worker scan 1 phần.
+    - Cần insert thêm 1 **Exchange operator** để chia nhỏ (distribute) và tổng hợp (gather) dữ liệu.
+
+    **Exchange operator — cơ chế chi tiết:**
+    - Exchange operator (Volcano Exchange) là operator đặc biệt được chèn vào query plan để biến plan tuần tự thành plan song song. Nó đóng 2 vai trò: **distribute** (chia data cho worker) và **gather** (gom kết quả từ worker).
+    - Exchange operator có **3 biến thể**, được optimizer chọn tại planning time:
+
+        | Biến thể | Partitioning | Dùng khi |
+        |---|---|---|
+        | **Gather** | Round-robin / FIFO | Sub-plan không cần ordering → Seq Scan |
+        | **Redistribute** | Hash(`key` % N) hoặc Range | Hash Join, Aggregate — cần cùng key về cùng worker |
+        | **Broadcast** | Copy toàn bộ → mọi worker | Build side của Hash Join khi bảng nhỏ |
+
+    - **Ai quyết định dùng loại nào?** → **Query Optimizer**, không phải Exchange tự quyết tại runtime. Optimizer nhìn toàn bộ query plan tree và chèn đúng loại Exchange vào từng ranh giới song song. Sự phụ thuộc vào operator bên dưới (Seq Scan, Hash Join...) được **resolve tại planning time**, lúc chạy Exchange chỉ thực hiện strategy đã gán sẵn.
+
+    - **Pull model hoạt động thế nào với Exchange?**
+        ```
+        Parent thread: gọi exchange.next()
+               ↓
+        Exchange nhìn vào shared tuple queues (mỗi worker 1 queue)
+               ↓
+        ┌─ queue có tuple → dequeue và return cho parent
+        ├─ queue rỗng    → block chờ cho đến khi worker nào push vào
+        └─ tất cả worker xong + queue rỗng → return EOF
+        ```
+        - Các worker **không bị pull từng tuple** bởi parent. Chúng chạy **tự do** trên thread riêng, tự gọi `next()` trên sub-plan riêng và **push kết quả vào queue**. Exchange chỉ là **cầu nối** giữa push (worker → queue) và pull (parent ← queue).
+
+    - **Gather vs Gather Merge (PostgreSQL):**
+
+        | Operator | Cách gom | Đảm bảo thứ tự? |
+        |---|---|---|
+        | **Gather** | Lấy tuple từ bất kỳ worker nào có sẵn trước | ❌ Không |
+        | **Gather Merge** | Merge-sort từ các queue (mỗi worker trả data đã sorted) | ✅ Có — dùng cho `ORDER BY` |
+
+    - **Ví dụ query plan với Exchange (PostgreSQL):**
+        ```
+        Gather (Exchange - round-robin)
+          └── Hash Join
+                ├── Redistribute (hash on A.id)   ← optimizer chèn đúng loại
+                │     └── Parallel Seq Scan A
+                └── Redistribute (hash on B.id)
+                      └── Parallel Seq Scan B
+        ```
+
+    - **Push vs Pull model với Intra-operator parallelism:**
+        - **Pull model** (PostgreSQL): Mỗi worker thread chạy riêng 1 iterator pipeline. Parent gọi `next()` trên Exchange/Gather operator. Gather kéo tuple từ các worker qua **shared queue**. Exchange đóng vai trò điều phối, tập hợp kết quả từ nhiều worker.
+        - **Push model** (HyPer, DuckDB): Mỗi worker chủ động đẩy tuple/batch vào shared output buffer. Gather consume từ các buffer đó. Hiệu quả hơn vì không có overhead gọi hàm `next()` xuyên qua nhiều tầng.
+
+    ###### 13.5.2.2. Inter-operator (Pipeline Parallelism)
+    - Nhiều **operators khác nhau** trong cùng 1 query plan chạy đồng thời, output của operator dưới **stream trực tiếp** lên operator trên.
+    - Ví dụ: Scan → Filter → Join — cả 3 operator chạy cùng lúc trên các threads khác nhau. Scan đẩy tuple lên Filter, Filter đẩy lên Join mà không cần đợi Scan hoàn thành.
+    - Hiệu quả nhất với **Push model** vì data tự nhiên chảy từ dưới lên. Pull model khó tận dụng vì parent phải chủ động kéo.
+
+    ###### 13.5.2.3. Bushy Parallelism
+    - Nhiều **nhánh độc lập** của query plan tree được thực thi song song.
+    - Ví dụ: `SELECT * FROM A JOIN B ON ... JOIN C ON ...` — có thể scan bảng A và scan bảng B **cùng lúc** trước khi join, vì 2 nhánh scan này độc lập với nhau.
+    - Thực chất là sự kết hợp giữa inter-operator parallelism trên các nhánh song song của cây query plan.
