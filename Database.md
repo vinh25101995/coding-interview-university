@@ -1614,12 +1614,25 @@ Tổng: ~37 I/Os
                   - ưu điểm: Dễ implement, debug, dễ hiểu và nhanh cho các query đơn giản
                   - nhược điểm: Không tối ưu cho các query phức tạp, phụ thuộc vào các magic number dự đoán hiệu quả của 1 operator
                - Cost based search:
-                  - Sử dụng cost model để tìm ra plan
-                  - Được sử dụng trong Postgres, MySQL, Oracle, SQL Server
-                  - Ưu điểm, nhược điểm
-                  - Định nghĩa các plan, estimate cost cho tưng plan(dựa trên cost model) và dùng các cost này để định hướng(guide). Nếu có 1 plan quá đắt đỏ nó sẽ chuyển qua plan khác
-                  - Optimizer chọn kế hoạch tốt nhất cho tới khi nó chạm tới điều kiện dừng
-                  - Điều kiện dừng
+                    - Sử dụng cost model để tìm ra plan
+                    - Được sử dụng trong Postgres, MySQL, Oracle, SQL Server
+                    - Ưu điểm, nhược điểm
+                    - Định nghĩa các plan, estimate cost cho tưng plan(dựa trên cost model) và dùng các cost này để định hướng(guide). Nếu có 1 plan quá đắt đỏ nó sẽ chuyển qua plan khác
+                    - Optimizer chọn kế hoạch tốt nhất cho tới khi nó chạm tới điều kiện dừng
+                    - Điều kiện dừng:
+                        - Wall clock time: MYSQL, Postgres
+                        - Cost threshold
+                        - Exhaustion
+                        - Transformation count: stop sau 1 số lượng rule/transformation đã cân nhắc(sql server)
+                 - Access path transformtion: chọn access path cho các table sao ch tổng chi phí là nhỏ nhất
+                    - Chi phí phụ thuộc vào nhiều yếu tố:
+                        - Độ chọn lọc dữ liệu
+                        - Cấu trúc  dữ liệu: B+tree for range, hash for selective
+                        - Sort order
+                        - Data accotrements(bổ sung):
+                           - Include: các cột được đính kèm vào index nhưng không phải khóa
+                           - Zone map: Lưu thông tin của 1 khối như min, max
+                        - Compression/encoding
         - Cost model: Ước lượng chi phí của một plan để chọn plan tối ưu nhất. Có 2 trường phái:
 
             **1. Statistics-based (Cost-Based Optimizer — CBO)**: PostgreSQL, MySQL, Oracle, SQL Server
