@@ -1178,121 +1178,468 @@ Hash table latching
         ```
 
 ### 13. Parallel Query Engine Architectures
-    - Process model định nghĩa cách hệ thống được tổ chức để support concurrent request/queries.
-        - Dùng từ **concurrent** vì Process model nói về cách **tổ chức** để xử lý nhiều request cùng lúc (concurrency = quản lý nhiều task). **Parallelism** (chạy thật sự song song trên nhiều CPU) chỉ là một *cách triển khai* concurrency. Một DBMS có thể concurrent mà không parallel (ví dụ: single-core dùng time-slicing).
 
-    - Đơn vị triển khai là worker
-        1 worker có thể là 1 process, thread hoặc embedded DBMS
-        Chủ yếu hiện nay các hệ thống DBMS sử dụng thread model
+- Process model định nghĩa cách hệ thống được tổ chức để support concurrent request/queries.
+  - Dùng từ **concurrent** vì Process model nói về cách **tổ chức** để xử lý nhiều request cùng lúc (concurrency = quản lý nhiều task). **Parallelism** (chạy thật sự song song trên nhiều CPU) chỉ là một *cách triển khai* concurrency. Một DBMS có thể concurrent mà không parallel (ví dụ: single-core dùng time-slicing).
+- Đơn vị triển khai là worker.
+  - 1 worker có thể là 1 process, thread hoặc embedded DBMS.
+  - Chủ yếu hiện nay các hệ thống DBMS sử dụng thread model.
 
-    #### 13.1. Process model
-    Được sử dụng trong PostgreSQL (đến nay vẫn dùng process-per-connection), Oracle, DB2 (hỗ trợ cả process và thread model).
-    Phụ thuộc vào OS dispatcher.
-    Sử dụng shared memory hoặc pipeline để giao tiếp.
+#### 13.1. Process model
+- Được sử dụng trong PostgreSQL (đến nay vẫn dùng process-per-connection), Oracle, DB2 (hỗ trợ cả process và thread model).
+- Phụ thuộc vào OS dispatcher.
+- Sử dụng shared memory hoặc pipeline để giao tiếp.
+- Các thư viện pthread được chuẩn hóa từ những năm 90, do đó các hệ thống từ những năm 90 trở về trước thường sử dụng process model.
 
-    Các thư viện pthread được chuẩn hóa từ những năm 90, do đó các hệ thống từ những năm 90 trở về trước thường sử dụng process model.
+#### 13.2. Thread model
+- Sử dụng trong SQL Server, MySQL. Oracle và DB2 hiện tại hỗ trợ cả hai (hybrid).
+- DBMS tự quản lý thread pool và scheduling thay vì phụ thuộc OS, giúp kiểm soát tốt hơn số lượng concurrent workers, giảm context switch.
 
-    #### 13.2. Thread model
-    Sử dụng trong SQL Server, MySQL. Oracle và DB2 hiện tại hỗ trợ cả hai (hybrid).
-    DBMS tự quản lý thread pool và scheduling thay vì phụ thuộc OS, giúp kiểm soát tốt hơn số lượng concurrent workers, giảm context switch
+#### 13.3. Embedded model
+- Chạy trong cùng address space (process) với application (ví dụ: RocksDB, SQLite, LevelDB, DuckDB).
+- Application chịu trách nhiệm cho thread và scheduling.
+
+#### 13.4. Scheduling
+- Với mỗi query plan, cần quyết định where, when and how to execute it → Scheduling:
+  - **Task assignment**: Gán query/operator cho worker nào.
+  - **Task priority**: Thứ tự ưu tiên thực thi.
+- Các DB doanh nghiệp như DB2, Oracle, SQL Server tự lập lịch (self-scheduling) với thread pool do DBMS quản lý.
+- PostgreSQL để OS scheduling do dùng process model → OS quyết định process nào chạy khi nào.
+- MySQL (InnoDB) dùng thread model, bản Enterprise có **Thread Pool Plugin** tự quản lý scheduling. Bản Community vẫn phụ thuộc OS scheduling, nằm giữa PostgreSQL (hoàn toàn OS) và Oracle/DB2 (tự lập lịch hoàn toàn).
+- **PostgreSQL có chậm hơn vì OS scheduling không?** Có ảnh hưởng nhưng không phải yếu tố chính:
+  - Context switch giữa process đắt hơn thread (~vài μs).
+  - OS không hiểu workload DB nên scheduling không tối ưu (ví dụ: OS có thể preempt process đang giữ latch).
+  - Tuy nhiên bottleneck đọc thường nằm ở **I/O** và **query plan** hơn là scheduling overhead.
+
+#### 13.5. Parallel Execution
+Các hệ thống DBMS thực thi nhiều task đồng thời để nâng cao hiệu suất sử dụng phần cứng.
+- Các task được thực thi không nhất thiết thuộc về cùng 1 query.
+- High-level design không phụ thuộc vào kiến trúc thực thi (process/thread hay multi-node).
+
+##### 13.5.1. Inter-query Parallelism
+- Thực thi **nhiều query** cùng lúc (mỗi query trên 1 worker riêng).
+- Phần lớn sử dụng first-come-first-serve.
+- Nếu các query đều là read-only thì phần lớn không cần explicit coordination (điều phối có chủ đích) giữa những query đó.
+- Nếu có ghi thì việc thực thi đúng trở nên khó khăn (tricky) — cần concurrency control (lock, MVCC...).
+
+##### 13.5.2. Intra-query Parallelism
+- Thực thi **1 query** bằng cách chạy song song các operators của nó.
+- Có 3 dạng parallelism:
+  1. **Intra-operator** (data parallelism).
+  2. **Inter-operator** (pipeline parallelism).
+  3. **Bushy** parallelism.
+- Các kĩ thuật này **không loại trừ lẫn nhau**, và có thể được kết hợp với nhau.
+- Với mỗi toán tử đều có 1 version chạy song song, nhờ vậy multi-thread có thể sử dụng data tập trung hoặc chia nhỏ ra để xử lý.
+
+**Ví dụ: Parallel Grace Hash Join**
+- Mỗi worker thực thi hash và probe trên 1 partition riêng của hash table.
+- Các partition độc lập → không cần coordination giữa các worker.
+
+###### 13.5.2.1. Intra-operator (Data Parallelism)
+- Operators được decompose thành các phần riêng lẻ để thực thi **cùng 1 function** trên các **sub-dataset khác nhau**.
+- Ví dụ: Parallel Seq Scan chia bảng thành N phần, mỗi worker scan 1 phần.
+- Cần insert thêm 1 **Exchange operator** để chia nhỏ (distribute) và tổng hợp (gather) dữ liệu.
+
+**Exchange operator — cơ chế chi tiết:**
+- Exchange operator (Volcano Exchange) là operator đặc biệt được chèn vào query plan để biến plan tuần tự thành plan song song. Nó đóng 2 vai trò: **distribute** (chia data cho worker) và **gather** (gom kết quả từ worker).
+- Exchange operator có **3 biến thể**, được optimizer chọn tại planning time:
+
+| Biến thể | Partitioning | Dùng khi |
+|---|---|---|
+| **Gather** | Round-robin / FIFO | Sub-plan không cần ordering → Seq Scan |
+| **Redistribute** | Hash(`key` % N) hoặc Range | Hash Join, Aggregate — cần cùng key về cùng worker |
+| **Broadcast** | Copy toàn bộ → mọi worker | Build side của Hash Join khi bảng nhỏ |
+
+- **Ai quyết định dùng loại nào?** → **Query Optimizer**, không phải Exchange tự quyết tại runtime. Optimizer nhìn toàn bộ query plan tree và chèn đúng loại Exchange vào từng ranh giới song song. Sự phụ thuộc vào operator bên dưới (Seq Scan, Hash Join...) được **resolve tại planning time**, lúc chạy Exchange chỉ thực hiện strategy đã gán sẵn.
+
+- **Pull model hoạt động thế nào với Exchange?**
+  ```
+  Parent thread: gọi exchange.next()
+         ↓
+  Exchange nhìn vào shared tuple queues (mỗi worker 1 queue)
+         ↓
+  ┌─ queue có tuple → dequeue và return cho parent
+  ├─ queue rỗng    → block chờ cho đến khi worker nào push vào
+  └─ tất cả worker xong + queue rỗng → return EOF
+  ```
+  - Các worker **không bị pull từng tuple** bởi parent. Chúng chạy **tự do** trên thread riêng, tự gọi `next()` trên sub-plan riêng và **push kết quả vào queue**. Exchange chỉ là **cầu nối** giữa push (worker → queue) và pull (parent ← queue).
+
+- **Gather vs Gather Merge (PostgreSQL):**
+
+  | Operator | Cách gom | Đảm bảo thứ tự? |
+  |---|---|---|
+  | **Gather** | Lấy tuple từ bất kỳ worker nào có sẵn trước | ❌ Không |
+  | **Gather Merge** | Merge-sort từ các queue (mỗi worker trả data đã sorted) | ✅ Có — dùng cho `ORDER BY` |
+
+- **Ví dụ query plan với Exchange (PostgreSQL):**
+  ```
+  Gather (Exchange - round-robin)
+    └── Hash Join
+          ├── Redistribute (hash on A.id)   ← optimizer chèn đúng loại
+          │     └── Parallel Seq Scan A
+          └── Redistribute (hash on B.id)
+                └── Parallel Seq Scan B
+  ```
+
+- **Push vs Pull model với Intra-operator parallelism:**
+  - **Pull model** (PostgreSQL): Mỗi worker thread chạy riêng 1 iterator pipeline. Parent gọi `next()` trên Exchange/Gather operator. Gather kéo tuple từ các worker qua **shared queue**. Exchange đóng vai trò điều phối, tập hợp kết quả từ nhiều worker.
+  - **Push model** (HyPer, DuckDB): Mỗi worker chủ động đẩy tuple/batch vào shared output buffer. Gather consume từ các buffer đó. Hiệu quả hơn vì không có overhead gọi hàm `next()` xuyên qua nhiều tầng.
+
+###### 13.5.2.2. Inter-operator (Pipeline Parallelism)
+- Nhiều **operators khác nhau** trong cùng 1 query plan chạy đồng thời, output của operator dưới **stream trực tiếp** lên operator trên.
+- Ví dụ: Scan → Filter → Join — cả 3 operator chạy cùng lúc trên các threads khác nhau. Scan đẩy tuple lên Filter, Filter đẩy lên Join mà không cần đợi Scan hoàn thành.
+
+- Hiệu quả nhất với **Push model** vì data tự nhiên chảy từ dưới lên. Pull model khó tận dụng vì parent phải chủ động kéo.
+- Sử dụng trong nhiều hệ thống data stream như: kafka, data flink
+
+###### 13.5.2.3. Bushy Parallelism
+- Nhiều **nhánh độc lập** của query plan tree được thực thi song song.
+- Ví dụ: `SELECT * FROM A JOIN B ON ... JOIN C ON ...` — có thể scan bảng A và scan bảng B **cùng lúc** trước khi join, vì 2 nhánh scan này độc lập với nhau.
+- Thực chất là sự kết hợp giữa inter-operator parallelism trên các nhánh song song của cây query plan.
+
+#### 13.6. IO Parallel
+##### 13.6.1. Multi-disk parallelism
+- Lưu trữ dữ liệu trên nhiều đĩa để tăng tốc độ đọc/ghi và tính bền vững
+  - Hardware based: I/O controller giúp multidisk được nhận biết như 1 disk duy nhất (ví dụ: RAID).
+  - Software based: DBMS tự quản lý ở tầng file/object
+
+- Mục tiêu
+  - Performance (Hiệu suất): Đọc/ghi dữ liệu nhanh hơn bằng cách chia nhỏ dữ liệu và thực hiện song song trên nhiều ổ đĩa cùng lúc.
+  - Capacity (Dung lượng): Lưu trữ được khối lượng dữ liệu khổng lồ mà một ổ đĩa đơn lẻ không thể chứa hết.
+  - Durability (Độ bền / Tính an toàn): Nếu một ổ cứng bị hỏng (crash), dữ liệu không bị mất vì đã có bản sao hoặc mã khôi phục ở các ổ khác.
+
+##### 13.6.2. Partitioning
+- Kỹ thuật chia nhỏ dữ liệu thành các khối (block) và ghi xen kẽ (interleave) lên các vùng lưu trữ khác nhau được quản lý độc lập
+- Không cần rewwrite lại application
+- Mục tiêu chính: **Tăng tốc độ đọc/ghi** bằng cách tận dụng băng thông song song của nhiều đĩa.
+- Khi cần đọc một block dữ liệu, hệ thống có thể đọc từ nhiều đĩa cùng lúc, giảm thời gian chờ đợi.
+- Thường được sử dụng trong các hệ thống cơ sở dữ liệu lớn và hệ thống lưu trữ phân tán.
+
+### 13.7. Tổng kết: Parallel Execution
+
+#### 1. Parallel execution is important — Vì vậy hầu hết mọi DBMS lớn đều hỗ trợ nó.
+- **Tầm quan trọng**: Trong thời đại dữ liệu lớn (Big Data), việc xử lý hàng tỷ bản ghi bằng một luồng (single-thread) là không khả thi. Để tận dụng tối đa phần cứng hiện đại (CPU nhiều lõi, hệ thống lưu trữ đa đĩa SSD/NVMe), DBMS bắt buộc phải chia nhỏ công việc và chạy song song.
+- **Sự phổ biến**: Hầu hết các DBMS lớn (PostgreSQL, Oracle, SQL Server, hay các hệ thống phân tán) đều có bộ thực thi song song làm nền tảng cốt lõi.
+
+#### 2. However, it is hard to get right — Tại sao lại khó đến vậy?
+
+Việc cứ ném thêm worker (luồng/tiến trình) vào một truy vấn không phải lúc nào cũng làm nó nhanh hơn. Dưới đây là 4 rào cản lớn nhất:
+
+- **Coordination Overhead** (Chi phí điều phối):
+  - Khi chia một truy vấn cho 10 workers, cần có cơ chế khởi tạo, phân phát dữ liệu, kiểm tra trạng thái và gom kết quả lại (như Exchange Operator).
+  - Nếu truy vấn quá nhỏ hoặc chạy quá nhanh, thời gian setup và điều phối workers có khi còn lâu hơn cả việc để 1 worker tự chạy từ đầu đến cuối.
+
+- **Scheduling** (Lập lịch và Phân bổ):
+  - Bài toán: "Worker nào làm việc gì, vào lúc nào, và làm trên dữ liệu nào?"
+  - **Data Skew** (Lệch dữ liệu): Đây là ác mộng của scheduling. Nếu hash phân vùng bị dồn vào một key phổ biến, Worker 1 phải xử lý 90% khối lượng trong khi 3 workers kia làm xong 10% rồi ngồi chơi → toàn bộ hệ thống vẫn phải đợi Worker 1 xong.
+
+- **Concurrency Issues** (Các vấn đề về đồng thời):
+  - Nhiều workers cùng chạy sẽ tranh nhau truy cập các cấu trúc dùng chung trong RAM của DBMS (Buffer Pool, Hash Tables, System Catalog).
+  - DBMS phải dùng Locks/Latches để đảm bảo tính toàn vẹn. Nếu thiết kế không khéo, các workers sẽ block lẫn nhau → nghẽn cổ chai hoặc Deadlock.
+
+- **Resource Contention** (Tranh chấp tài nguyên):
+  - **CPU Caches**: Các luồng tranh nhau đẩy dữ liệu vào L1/L2/L3, làm trôi mất dữ liệu của luồng khác (Cache trashing).
+  - **Memory Bandwidth**: Băng thông truyền tải từ RAM vào CPU có giới hạn.
+  - **Disk I/O**: Nếu 50 workers cùng đọc ngẫu nhiên từ một HDD, kim đọc phải nhảy liên tục → tốc độ tổng thể giảm thê thảm so với việc để 1 worker đọc tuần tự.
+
+### 14. Query Optimization
+
+#### 14.1. Tại sao cần Query Optimization?
+
+Application → Parser → Binder → **Optimizer** → Executor
+
+Dựa trên thông tin page (catalog), các toán tử ta có thể tính được cost theo từng step.
+
+**Ví dụ minh họa** (`SELECT DISTINCT ename FROM Emp E JOIN Dept D ON E.did = D.did WHERE D.dname = 'Toy'`):
+
+**Catalog thông tin:**
+
+| Bảng | Cấu trúc | Records | Pages | Index |
+|---|---|---|---|---|
+| Emp | (ssn, ename, addr, sal, did) | 10,000 | 1,000 | clustered + unclustered |
+| Dept | (did, dname, floor, mgr) | 500 | 50 | unclustered |
+
+**Query Plan (naive — không tối ưu):**
+
+```
+π_ename                          ← Projection (loại trùng lặp)
+    │
+σ_dname='Toy'                    ← Selection: 2,000 reads + 4 writes
+    │                               (10K/500 = 20 emps per dept)
+σ_Emp.did = Dept.did             ← Selection: 1,000,000 reads + 2,000 writes
+    │                               (FK join, 10k tuples ghi vào temp T₂)
+×  (Cross Product)               ← (50 + 50,000) reads + 1,000,000 writes
+    │                               Ghi temp file T₁ (5 tuples/page)
+   Emp
+```
+
+**Chi tiết từng bước:**
+
+1. **Cross Product (×)**: Kết hợp toàn bộ Emp × Dept
+   - Reads: 1,000 (Emp pages) + 50 (Dept pages) = 1,050 reads
+   - Writes: Emp × Dept = 10,000 × 500 = 5,000,000 tuples → với 5 tuples/page = 1,000,000 pages ghi xuống T₁
+   - Tổng: **(50 + 50,000) reads + 1,000,000 writes**
+
+2. **σ_Emp.did = Dept.did**: Lọc các tuple có điều kiện FK join từ T₁
+   - Reads: 1,000,000 (đọc lại T₁)
+   - Kết quả: 10,000 tuples khớp (vì mỗi Emp có 1 Dept) → ghi vào T₂
+   - Tổng: **1,000,000 reads + 2,000 writes**
+
+3. **σ_dname='Toy'**: Lọc Dept thuộc Toy department từ T₂
+   - Tỷ lệ selectivity: 1/500 Dept → mỗi Dept có 10,000/500 = 20 emps
+   - Reads: 2,000 (đọc T₂) + Writes: 4 pages kết quả
+   - Tổng: **2,000 reads + 4 writes**
+
+4. **π_ename**: Loại bỏ duplicates (DISTINCT)
+
+**Tổng I/O: ≈ 2,003,054 ≈ 2M I/Os** → Cực kỳ tốn kém!
+
+#### 14.1.2. So sánh 4 Query Plan — Tác dụng của Optimizer
+
+Cùng 1 query: `SELECT DISTINCT ename FROM Emp JOIN Dept ON E.did = D.did WHERE D.dname = 'Toy'`
+
+**Tổng quan tiến trình tối ưu:**
+
+```
+ Plan 1              Plan 2a             Plan 2b             Plan 3
+ (Naive)             (Better Join)       (+ Pipeline)        (+ Index)
+                                                           
+ Cross Product   →   Sort-Merge Join →   Sort-Merge Join →   Index NL Join
+ + Seq Scan          + Seq Scan          + Seq Scan           + Index Scan
+                                                           
+ ≈ 2,000,000 I/Os    7,159 I/Os          3,151 I/Os          37 I/Os
+      │                   │                   │                   │
+      └── ÷280x ──────────┘   ÷2.3x ──────────┘   ÷85x ───────────┘
+                                                           
+ Thay đổi:      [Thuật toán join]   [Loại temp T₂]    [Dùng index]
+```
+
+---
+
+**Bảng so sánh chi tiết:**
+
+| | Plan 1 | Plan 2a 🔴 | Plan 2b 🔵 | Plan 3 🟢 |
+|---|---|---|---|---|
+| **Join Algorithm** | Cross Product (×) | Sort-Merge Join | Sort-Merge Join | Index NL Join |
+| **Access Method** | Seq Scan | Seq Scan | Seq Scan | Index Scan (dname, did) |
+| **Processing Model** | Materialization | Materialization | **Pipeline** | Materialization |
+| **Temp T₁** | 1,000,000 pages | 2,000 pages | 2,000 pages | ❌ Không cần |
+| **Temp T₂** | 2,000 pages | 2,000 pages | ❌ Pipeline | ❌ Không cần |
+| **Tối ưu mới** | — | Thuật toán join | Loại temp file | Index + pushdown σ |
+| **Tổng I/Os** | **≈ 2,000,000** | **7,159** | **3,151** | **37** |
+
+---
+
+**Chi tiết từng Plan:**
+
+```
+┌─────────── Plan 1 ───────────┐  ┌─────────── Plan 2a 🔴 ──────────┐
+│ π_ename                      │  │ π_ename                          │
+│   │                          │  │   │  ← 4 reads (đọc T₂)         │
+│ σ_dname='Toy'                │  │ σ_dname='Toy'                    │
+│   │  ← 2,000r+4w (đọc T₁)   │  │   │  ← 2,000r+4w (đọc T₁,ghi T₂│
+│ σ_Emp.did=Dept.did           │  │ ⋈ Sort-Merge Join                │
+│   │  ← 1M reads (đọc T₁)    │  │   │  ← 3,150r+2,000w (ghi T₁)   │
+│ × Cross Product              │  │   ├── Emp  (1,000 pages)         │
+│   │  ← 50K reads+1M writes   │  │   └── Dept (50 pages)            │
+│   ├── Emp                    │  │ Tổng: 7,159 I/Os                 │
+│   └── Dept                   │  │                                  │
+│ Tổng: ~2,000,000 I/Os        │  │                                  │
+└──────────────────────────────┘  └──────────────────────────────────┘
+
+┌─────────── Plan 2b 🔵 ──────────┐  ┌─────────── Plan 3 🟢 ───────────┐
+│ π_ename                         │  │ π_ename                          │
+│   │  ← PIPELINE (không ghi)     │  │   │  ← 4r+1w  (đọc T₂)          │
+│ σ_dname='Toy'                   │  │ ⋈ Index NL Join                  │
+│   │  ← PIPELINE (T₂ bị loại)   │  │   │  ← 24r+4w                    │
+│ ⋈ Sort-Merge Join               │  │   │  (1+3 idx + 20 ptr chase)     │
+│   │  ← 3,150r+2,000w (ghi T₁)  │  │   ├── σ_dname='Toy'              │
+│   ├── Emp  (1,000 pages)        │  │   │    Access: Index(dname)       │
+│   └── Dept (50 pages)           │  │   │    ← 3r+1w                   │
+│ Tổng: 3,151 I/Os                │  │   │    └── Dept                   │
+│ (T₂ không cần ghi nhờ pipeline) │  │   └── Emp                        │
+│                                 │  │ Tổng: ~37 I/Os                   │
+└─────────────────────────────────┘  └──────────────────────────────────┘
+```
+
+> **Bài học của Optimizer**: Cùng 1 query, optimizer tìm plan tốt hơn **~50,000 lần** (2M → 37 I/Os) nhờ 3 kỹ thuật: ① chọn đúng **thuật toán join** → ② tận dụng **pipeline** để loại temp file → ③ **pushdown selection + dùng index** thay seq scan.
+
+---
+
+**🔴 Plan 2a — Sort-Merge Join + Materialization Model (7,159 I/Os)**
+
+```
+π_ename                              ← 4 reads          (đọc T₂)
+    │
+σ_dname='Toy'                        ← 2,000 reads + 4 writes  (đọc T₁, ghi T₂)
+    │
+⋈  Sort-Merge Join                   ← 3,150 reads + 2,000 writes  (ghi T₁)
+(Emp.did = Dept.did, 50 buffers)
+   ├── Emp   (1,000 pages)
+   └── Dept  (50 pages)
+```
+
+Chi phí:
+```
+Sort-Merge Join : 3,150 reads + 2,000 writes   → ghi toàn bộ T₁ ra disk
+σ_dname='Toy'  : 2,000 reads + 4 writes        → đọc T₁, ghi T₂ ra disk (No Pipeline!)
+π_ename        : 4 reads                        → đọc T₂
+─────────────────────────────────────────────────
+Tổng: 7,159 I/Os
+```
+
+---
+
+**🔵 Plan 2b — Sort-Merge Join + Pipeline Model (3,151 I/Os)**
+
+```
+π_ename                              ← pipeline (không ghi disk)
+    │
+σ_dname='Toy'                        ← pipeline (không ghi T₂ ra disk)
+    │
+⋈  Sort-Merge Join                   ← 3,150 reads + 2,000 writes  (ghi T₁)
+(Emp.did = Dept.did, 50 buffers)
+   ├── Emp   (1,000 pages)
+   └── Dept  (50 pages)
+```
+
+Chi phí:
+```
+Sort-Merge Join : 3,150 reads + 2,000 writes   → ghi T₁ ra disk
+σ + π           : ~1 I/O                        → stream trực tiếp, không có T₂
+─────────────────────────────────────────────────
+Tổng: 3,151 I/Os
+```
+
+> **Khác biệt 2a vs 2b**: Pipelining loại bỏ hoàn toàn chi phí đọc/ghi T₂ trung gian (2,004 I/Os).
+
+---
+
+**🟢 Plan 3 — Index Nested-Loop Join + Index Scan (37 I/Os)**
+
+Optimizer nhận ra: `Dept` có index trên `dname`, `Emp` có index trên `did` → dùng index thay vì scan toàn bộ bảng.
+
+```
+π_ename                              ← 4 reads + 1 write  (đọc T₂)
+    │
+⋈  Index Nested-Loop Join            ← 1 + 3(idx) + 20(ptr chase) reads + 4 writes
+   (Emp.did = Dept.did)                 Với mỗi Dept tuple → lookup Emp qua index(did)
+   │
+   ├── σ_dname='Toy'                 ← 3 reads + 1 write
+   │    Access: Index(dname)            Dùng unclustered index trên Dept.dname
+   │    └── Dept
+   │
+   └── Emp
+```
+
+Chi phí:
+```
+σ_dname='Toy' via Index(dname):
+  1 (root) + 2 (leaf) = 3 reads + 1 write (ghi 1 Dept tuple phù hợp)
+
+Index NL Join — với 1 Dept tuple khớp, lookup 20 Emp tương ứng:
+  1 (index root) + 2 (index leaf) + 20 (ptr chase → Emp pages) + 4 writes (ghi T₂)
+  = 24 reads + 4 writes
+
+π_ename (đọc T₂): 4 reads + 1 write
+─────────────────────────────────────────────────
+Tổng: ~37 I/Os
+```
+
+---
+
+**Tổng kết so sánh 4 plan:**
+
+| Plan | Thuật toán | Model | Tổng I/Os |
+|---|---|---|---|
+| **Plan 1** | Cross Product + Filter | Materialization | ≈ 2,000,000 |
+| **Plan 2a** | Sort-Merge Join | Materialization (No Pipeline) | 7,159 |
+| **Plan 2b** | Sort-Merge Join | Vectorization (Pipeline) | 3,151 |
+| **Plan 3** | Index NL Join + Index Scan | Materialization | **37** |
 
 
-    #### 13.3. Embedded model
-    Chạy trong cùng address space (process) với application (ví dụ: RocksDB, SQLite, LevelDB, DuckDB).
-    Application chịu trách nhiệm cho thread và scheduling.
+### 14. Query optimizers
+   - Dựa trên đầu vào là một kế hoạch logic (logical plan) của truy vấn, hãy tạo ra một kế hoạch thực thi vật lý (physical execution plan) tương đương về mặt ngữ nghĩa.
+   - Có thể phải xem xét một không gian tìm kiếm rộng lớn gồm các kế hoạch tiềm năng.
+   - Xác định chính xác liệu một kế hoạch tiềm năng này có tốt hơn kế hoạch khác hay không.
+   - Tìm kiếm hiệu quả trong không gian giải pháp để tìm ra một kế hoạch vật lý có chi phí thấp nhất.
+   - Optimizer chuyển đổi biểu thức đại số(logical) thành 1 biểu thức đại số vật lý tối ưu
+   - Physical operator định nghĩa kế hoạch thực thi thông qua 1 access pass
+    - Chúng có thể phụ thuộc vào format data vật lí
+    - Không phải luôn luôn là map từ 1 logical operator → 1 physical operator
+   - 2 kiến trúc:
+      1. Single query
+         - Tối ưu hóa từng truy vấn một
+         - Không có sự chia sẻ giữa các truy vấn
+         - Kiến trúc chung của đại bộ phận các hệ thống dbms hiện nay
+      2. Multi query
+         - Tối ưu hóa nhiều truy vấn cùng lúc
+         - Có thể chia sẻ kế hoạch giữa các truy vấn
+    - Optimizer được cấu thành dựa trên 3 factor:
+        - Transformations
+            - Liệt kê các lựa chọn/ hình thức khác nhau cho 1 query plan mà vẫn đảm bảo ngữ nghĩa(semantically equivalent) và logic(Dựa trên các mô hình đại số quan hệ)
+            - Đảm bảo kết quả giống kế hoạch gốc(nhờ mô hình đại số quan hệ mà dbms có thể đảm bảo tính đúng đắn của các phép biến đổi, nó cũng là cách các heuristic optimizer xác định query plan mà không cần tới cost model)
+            - Mục tiêu
+               - Giảm chi phí
+               - Sinh ra các biến đổi bổ sung
+            - Sample Các phép biến đổi:
+               - Selection: 
+                   - Thực thi filter sớm nhất có thể
+                   - Tách các điều kiện phức tạp thành các mệnh đề AND, đẩy xuống và thực hiện từ dưới lên
+               - Join
+                   - Có tính giao hoán và kết hợp
+                   - Số lượng phép join của n bảng là n! * c(n-1) -> số lượng cực lớn
+                    c là số catalan
+            - Ta có thể nhận thấy số phương án thực thi có thể là rất lớn, vậy ta cần 1 số quy tắc
+            để giới hạn không gian tìm kiếm
+                - Split conjunctive predicates: Chia các điều kiện thành dạng đơn giản nhất cho optimizer dễ dàng di chuyển chúng trong query plan
+                - Replace Cartesian product: Thay thế bằng các join
+                - Projection pushdown: đưa các phép chiếu xuống sớm nhất có thể để giảm tải materializtion cost
+            - Còn rất nhiều quy tắc khác(Microsoft công bố trong SQL Server có khoản 4 500 quy tắc),  và ngoài ra có các quy tắc mới được thực thi bằng AI
+            - Postgres không có hint mà cần chú thích(pg hint )
 
-    #### 13.4. Scheduling
-    - Với mỗi query plan, cần quyết định where, when and how to execute it → Scheduling
-        - **Task assignment**: gán query/operator cho worker nào
-        - **Task priority**: thứ tự ưu tiên thực thi
-    - Các DB doanh nghiệp như DB2, Oracle, SQL Server tự lập lịch (self-scheduling) với thread pool do DBMS quản lý.
-    - PostgreSQL để OS scheduling do dùng process model → OS quyết định process nào chạy khi nào.
-    - MySQL (InnoDB) dùng thread model, bản Enterprise có **Thread Pool Plugin** tự quản lý scheduling. Bản Community vẫn phụ thuộc OS scheduling, nằm giữa PostgreSQL (hoàn toàn OS) và Oracle/DB2 (tự lập lịch hoàn toàn).
-    - **PostgreSQL có chậm hơn vì OS scheduling không?** Có ảnh hưởng nhưng không phải yếu tố chính:
-        - Context switch giữa process đắt hơn thread (~vài μs)
-        - OS không hiểu workload DB nên scheduling không tối ưu (ví dụ: OS có thể preempt process đang giữ latch)
-        - Tuy nhiên bottleneck đọc thường nằm ở **I/O** và **query plan** hơn là scheduling overhead
+            
+        - Search algo
+            - Với các rules được định nghĩa, optimizer sẽ thực hiện tìm kiếm để tìm ra plan cho query
+               - Không phải lúc nào cũng cần cost model
+            - Trong lúc search, không phải lúc nào optimizer cũng có đủ thông tin query logical plan, ví dụ:
+               - Preparesatement
+               - Thiếu thông tin phân bổ dữ liệu
+            - Kiến trúc:
+               - Heristic based search:
+                  - Sử dụng các heuristic để tìm ra plan
+                  - Không sử dụng cost model
+                  - Tìm ra plan nhanh chóng
+                  - Được sử dụng trong MongoDB và rất nhiêu dbms mới
+                  - ưu điểm: Dễ implement, debug, dễ hiểu và nhanh cho các query đơn giản
+                  - nhược điểm: Không tối ưu cho các query phức tạp, phụ thuộc vào các magic number dự đoán hiệu quả của 1 operator
+               - Cost based search:
+                  - Sử dụng cost model để tìm ra plan
+                  - Được sử dụng trong Postgres, MySQL, Oracle, SQL Server
+                  - Ưu điểm, nhược điểm
+                  - Định nghĩa các plan, estimate cost cho tưng plan(dựa trên cost model) và dùng các cost này để định hướng(guide). Nếu có 1 plan quá đắt đỏ nó sẽ chuyển qua plan khác
+                  - Optimizer chọn kế hoạch tốt nhất cho tới khi nó chạm tới điều kiện dừng
+                  - Điều kiện dừng
+        - Cost model: Ước lượng chi phí của một plan để chọn plan tối ưu nhất. Có 2 trường phái:
 
-    #### 13.5. Parallel Execution
-    Các hệ thống DBMS thực thi nhiều task đồng thời để nâng cao hiệu suất sử dụng phần cứng.
-        - Các task được thực thi không nhất thiết thuộc về cùng 1 query
-        - High-level design không phụ thuộc vào kiến trúc thực thi (process/thread hay multi-node)
+            **1. Statistics-based (Cost-Based Optimizer — CBO)**: PostgreSQL, MySQL, Oracle, SQL Server
+            - Duy trì **statistics** về dữ liệu (histogram, cardinality, data distribution)
+            - Ước lượng cost **trước khi chạy** dựa trên thống kê → chọn plan rẻ nhất
+            - Ưu điểm: Không tốn I/O để chọn plan
+            - Nhược điểm: Statistics bị **stale** khi data thay đổi nhanh → plan sai
+            - Cần chạy `ANALYZE` (PostgreSQL) / `UPDATE STATISTICS` (SQL Server) định kỳ
 
-    ##### 13.5.1. Inter-query Parallelism
-    - Thực thi **nhiều query** cùng lúc (mỗi query trên 1 worker riêng)
-        - Phần lớn sử dụng first-come-first-serve
-        - Nếu các query đều là read-only thì phần lớn không cần explicit coordination (điều phối có chủ đích) giữa những query đó
-        - Nếu có ghi thì việc thực thi đúng trở nên khó khăn (tricky) — cần concurrency control (lock, MVCC...)
-
-    ##### 13.5.2. Intra-query Parallelism
-    - Thực thi **1 query** bằng cách chạy song song các operators của nó
-    - Có 3 dạng parallelism:
-        1. **Intra-operator** (data parallelism)
-        2. **Inter-operator** (pipeline parallelism)
-        3. **Bushy** parallelism
-    - Các kĩ thuật này **không loại trừ lẫn nhau**, và có thể được kết hợp với nhau.
-    - Với mỗi toán tử đều có 1 version chạy song song, nhờ vậy multi-thread có thể sử dụng data tập trung hoặc chia nhỏ ra để xử lý.
-
-    **Ví dụ: Parallel Grace Hash Join**
-        - Mỗi worker thực thi hash và probe trên 1 partition riêng của hash table
-        - Các partition độc lập → không cần coordination giữa các worker
-
-    ###### 13.5.2.1. Intra-operator (Data Parallelism)
-    - Operators được decompose thành các phần riêng lẻ để thực thi **cùng 1 function** trên các **sub-dataset khác nhau**.
-    - Ví dụ: Parallel Seq Scan chia bảng thành N phần, mỗi worker scan 1 phần.
-    - Cần insert thêm 1 **Exchange operator** để chia nhỏ (distribute) và tổng hợp (gather) dữ liệu.
-
-    **Exchange operator — cơ chế chi tiết:**
-    - Exchange operator (Volcano Exchange) là operator đặc biệt được chèn vào query plan để biến plan tuần tự thành plan song song. Nó đóng 2 vai trò: **distribute** (chia data cho worker) và **gather** (gom kết quả từ worker).
-    - Exchange operator có **3 biến thể**, được optimizer chọn tại planning time:
-
-        | Biến thể | Partitioning | Dùng khi |
-        |---|---|---|
-        | **Gather** | Round-robin / FIFO | Sub-plan không cần ordering → Seq Scan |
-        | **Redistribute** | Hash(`key` % N) hoặc Range | Hash Join, Aggregate — cần cùng key về cùng worker |
-        | **Broadcast** | Copy toàn bộ → mọi worker | Build side của Hash Join khi bảng nhỏ |
-
-    - **Ai quyết định dùng loại nào?** → **Query Optimizer**, không phải Exchange tự quyết tại runtime. Optimizer nhìn toàn bộ query plan tree và chèn đúng loại Exchange vào từng ranh giới song song. Sự phụ thuộc vào operator bên dưới (Seq Scan, Hash Join...) được **resolve tại planning time**, lúc chạy Exchange chỉ thực hiện strategy đã gán sẵn.
-
-    - **Pull model hoạt động thế nào với Exchange?**
-        ```
-        Parent thread: gọi exchange.next()
-               ↓
-        Exchange nhìn vào shared tuple queues (mỗi worker 1 queue)
-               ↓
-        ┌─ queue có tuple → dequeue và return cho parent
-        ├─ queue rỗng    → block chờ cho đến khi worker nào push vào
-        └─ tất cả worker xong + queue rỗng → return EOF
-        ```
-        - Các worker **không bị pull từng tuple** bởi parent. Chúng chạy **tự do** trên thread riêng, tự gọi `next()` trên sub-plan riêng và **push kết quả vào queue**. Exchange chỉ là **cầu nối** giữa push (worker → queue) và pull (parent ← queue).
-
-    - **Gather vs Gather Merge (PostgreSQL):**
-
-        | Operator | Cách gom | Đảm bảo thứ tự? |
-        |---|---|---|
-        | **Gather** | Lấy tuple từ bất kỳ worker nào có sẵn trước | ❌ Không |
-        | **Gather Merge** | Merge-sort từ các queue (mỗi worker trả data đã sorted) | ✅ Có — dùng cho `ORDER BY` |
-
-    - **Ví dụ query plan với Exchange (PostgreSQL):**
-        ```
-        Gather (Exchange - round-robin)
-          └── Hash Join
-                ├── Redistribute (hash on A.id)   ← optimizer chèn đúng loại
-                │     └── Parallel Seq Scan A
-                └── Redistribute (hash on B.id)
-                      └── Parallel Seq Scan B
-        ```
-
-    - **Push vs Pull model với Intra-operator parallelism:**
-        - **Pull model** (PostgreSQL): Mỗi worker thread chạy riêng 1 iterator pipeline. Parent gọi `next()` trên Exchange/Gather operator. Gather kéo tuple từ các worker qua **shared queue**. Exchange đóng vai trò điều phối, tập hợp kết quả từ nhiều worker.
-        - **Push model** (HyPer, DuckDB): Mỗi worker chủ động đẩy tuple/batch vào shared output buffer. Gather consume từ các buffer đó. Hiệu quả hơn vì không có overhead gọi hàm `next()` xuyên qua nhiều tầng.
-
-    ###### 13.5.2.2. Inter-operator (Pipeline Parallelism)
-    - Nhiều **operators khác nhau** trong cùng 1 query plan chạy đồng thời, output của operator dưới **stream trực tiếp** lên operator trên.
-    - Ví dụ: Scan → Filter → Join — cả 3 operator chạy cùng lúc trên các threads khác nhau. Scan đẩy tuple lên Filter, Filter đẩy lên Join mà không cần đợi Scan hoàn thành.
-    - Hiệu quả nhất với **Push model** vì data tự nhiên chảy từ dưới lên. Pull model khó tận dụng vì parent phải chủ động kéo.
-
-    ###### 13.5.2.3. Bushy Parallelism
-    - Nhiều **nhánh độc lập** của query plan tree được thực thi song song.
-    - Ví dụ: `SELECT * FROM A JOIN B ON ... JOIN C ON ...` — có thể scan bảng A và scan bảng B **cùng lúc** trước khi join, vì 2 nhánh scan này độc lập với nhau.
-    - Thực chất là sự kết hợp giữa inter-operator parallelism trên các nhánh song song của cây query plan.
+            **2. Empirical / Trial-based**: MongoDB (⚠️ không phải "chạy thử toàn bộ query")
+            - MongoDB **KHÔNG dùng statistics**. Thay vào đó dùng cơ chế **"First Past the Post" (FPTP)**:
+                1. **Candidate Plan Generation**: Sinh ra tất cả possible plans từ các index có sẵn
+                2. **Trial Period (Racing)**: Chạy **song song** tất cả candidate plans trong một khoảng trial ngắn
+                3. **Empirical Measurement**: Đo lường "**Works**" score — proxy metric tính từ: số index key đã scan + số document đã fetch + resource của các stage (sort, etc.)
+                4. **Winner Selection**: Plan nào trả về **101 documents đầu tiên** với ít "Works" nhất → thắng
+                5. **Plan Caching**: Cache winning plan theo **query shape** (cấu trúc query, không phân biệt giá trị cụ thể)
+            - **⚠️ Lưu ý**: Không phải chạy thử **toàn bộ** query — chỉ chạy đến khi đủ 101 documents (trial period rất ngắn)
+            - **Ưu điểm**: Không cần `ANALYZE`, tự thích nghi với data thay đổi, phù hợp với schema-less NoSQL
+            - **Nhược điểm**:
+                - **Preference bias**: Có xu hướng ưu tiên index scan, đôi khi sai với tập dữ liệu nhỏ (collection scan nhanh hơn)
+                - **Plan cache stale**: Cache theo query shape → plan xấu có thể bị cache và dùng lại nhiều lần
+                - **Racing overhead**: Chạy song song N plans mỗi lần gặp query shape mới = tốn tài nguyên
+            - **Cách debug**: Dùng `.explain("allPlansExecution")` để xem "Works" score của tất cả candidate plans
