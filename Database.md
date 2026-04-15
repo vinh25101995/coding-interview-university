@@ -1558,101 +1558,925 @@ Tổng: ~37 I/Os
 | **Plan 3** | Index NL Join + Index Scan | Materialization | **37** |
 
 
-### 14. Query optimizers
-   - Dựa trên đầu vào là một kế hoạch logic (logical plan) của truy vấn, hãy tạo ra một kế hoạch thực thi vật lý (physical execution plan) tương đương về mặt ngữ nghĩa.
-   - Có thể phải xem xét một không gian tìm kiếm rộng lớn gồm các kế hoạch tiềm năng.
-   - Xác định chính xác liệu một kế hoạch tiềm năng này có tốt hơn kế hoạch khác hay không.
-   - Tìm kiếm hiệu quả trong không gian giải pháp để tìm ra một kế hoạch vật lý có chi phí thấp nhất.
-   - Optimizer chuyển đổi biểu thức đại số(logical) thành 1 biểu thức đại số vật lý tối ưu
-   - Physical operator định nghĩa kế hoạch thực thi thông qua 1 access pass
-    - Chúng có thể phụ thuộc vào format data vật lí
-    - Không phải luôn luôn là map từ 1 logical operator → 1 physical operator
-   - 2 kiến trúc:
-      1. Single query
-         - Tối ưu hóa từng truy vấn một
-         - Không có sự chia sẻ giữa các truy vấn
-         - Kiến trúc chung của đại bộ phận các hệ thống dbms hiện nay
-      2. Multi query
-         - Tối ưu hóa nhiều truy vấn cùng lúc
-         - Có thể chia sẻ kế hoạch giữa các truy vấn
-    - Optimizer được cấu thành dựa trên 3 factor:
-        - Transformations
-            - Liệt kê các lựa chọn/ hình thức khác nhau cho 1 query plan mà vẫn đảm bảo ngữ nghĩa(semantically equivalent) và logic(Dựa trên các mô hình đại số quan hệ)
-            - Đảm bảo kết quả giống kế hoạch gốc(nhờ mô hình đại số quan hệ mà dbms có thể đảm bảo tính đúng đắn của các phép biến đổi, nó cũng là cách các heuristic optimizer xác định query plan mà không cần tới cost model)
-            - Mục tiêu
-               - Giảm chi phí
-               - Sinh ra các biến đổi bổ sung
-            - Sample Các phép biến đổi:
-               - Selection: 
-                   - Thực thi filter sớm nhất có thể
-                   - Tách các điều kiện phức tạp thành các mệnh đề AND, đẩy xuống và thực hiện từ dưới lên
-               - Join
-                   - Có tính giao hoán và kết hợp
-                   - Số lượng phép join của n bảng là n! * c(n-1) -> số lượng cực lớn
-                    c là số catalan
-            - Ta có thể nhận thấy số phương án thực thi có thể là rất lớn, vậy ta cần 1 số quy tắc
-            để giới hạn không gian tìm kiếm
-                - Split conjunctive predicates: Chia các điều kiện thành dạng đơn giản nhất cho optimizer dễ dàng di chuyển chúng trong query plan
-                - Replace Cartesian product: Thay thế bằng các join
-                - Projection pushdown: đưa các phép chiếu xuống sớm nhất có thể để giảm tải materializtion cost
-            - Còn rất nhiều quy tắc khác(Microsoft công bố trong SQL Server có khoản 4 500 quy tắc),  và ngoài ra có các quy tắc mới được thực thi bằng AI
-            - Postgres không có hint mà cần chú thích(pg hint )
+#### 14.2. Query Optimizers — Tổng quan
 
-            
-        - Search algo
-            - Với các rules được định nghĩa, optimizer sẽ thực hiện tìm kiếm để tìm ra plan cho query
-               - Không phải lúc nào cũng cần cost model
-            - Trong lúc search, không phải lúc nào optimizer cũng có đủ thông tin query logical plan, ví dụ:
-               - Preparesatement
-               - Thiếu thông tin phân bổ dữ liệu
-            - Kiến trúc:
-               - Heristic based search:
-                  - Sử dụng các heuristic để tìm ra plan
-                  - Không sử dụng cost model
-                  - Tìm ra plan nhanh chóng
-                  - Được sử dụng trong MongoDB và rất nhiêu dbms mới
-                  - ưu điểm: Dễ implement, debug, dễ hiểu và nhanh cho các query đơn giản
-                  - nhược điểm: Không tối ưu cho các query phức tạp, phụ thuộc vào các magic number dự đoán hiệu quả của 1 operator
-               - Cost based search:
-                    - Sử dụng cost model để tìm ra plan
-                    - Được sử dụng trong Postgres, MySQL, Oracle, SQL Server
-                    - Ưu điểm, nhược điểm
-                    - Định nghĩa các plan, estimate cost cho tưng plan(dựa trên cost model) và dùng các cost này để định hướng(guide). Nếu có 1 plan quá đắt đỏ nó sẽ chuyển qua plan khác
-                    - Optimizer chọn kế hoạch tốt nhất cho tới khi nó chạm tới điều kiện dừng
-                    - Điều kiện dừng:
-                        - Wall clock time: MYSQL, Postgres
-                        - Cost threshold
-                        - Exhaustion
-                        - Transformation count: stop sau 1 số lượng rule/transformation đã cân nhắc(sql server)
-                 - Access path transformtion: chọn access path cho các table sao ch tổng chi phí là nhỏ nhất
-                    - Chi phí phụ thuộc vào nhiều yếu tố:
-                        - Độ chọn lọc dữ liệu
-                        - Cấu trúc  dữ liệu: B+tree for range, hash for selective
-                        - Sort order
-                        - Data accotrements(bổ sung):
-                           - Include: các cột được đính kèm vào index nhưng không phải khóa
-                           - Zone map: Lưu thông tin của 1 khối như min, max
-                        - Compression/encoding
-        - Cost model: Ước lượng chi phí của một plan để chọn plan tối ưu nhất. Có 2 trường phái:
+Query Optimizer nhận đầu vào là **Logical Plan** và xuất ra một **Physical Execution Plan** tương đương ngữ nghĩa nhưng có chi phí thấp nhất có thể.
 
-            **1. Statistics-based (Cost-Based Optimizer — CBO)**: PostgreSQL, MySQL, Oracle, SQL Server
-            - Duy trì **statistics** về dữ liệu (histogram, cardinality, data distribution)
-            - Ước lượng cost **trước khi chạy** dựa trên thống kê → chọn plan rẻ nhất
-            - Ưu điểm: Không tốn I/O để chọn plan
-            - Nhược điểm: Statistics bị **stale** khi data thay đổi nhanh → plan sai
-            - Cần chạy `ANALYZE` (PostgreSQL) / `UPDATE STATISTICS` (SQL Server) định kỳ
+```
+Logical Plan (đại số quan hệ)
+        │
+        ▼
+   [Optimizer]   ← 3 thành phần: Transformations + Search Algo + Cost Model
+        │
+        ▼
+Physical Execution Plan (access path cụ thể)
+```
 
-            **2. Empirical / Trial-based**: MongoDB (⚠️ không phải "chạy thử toàn bộ query")
-            - MongoDB **KHÔNG dùng statistics**. Thay vào đó dùng cơ chế **"First Past the Post" (FPTP)**:
-                1. **Candidate Plan Generation**: Sinh ra tất cả possible plans từ các index có sẵn
-                2. **Trial Period (Racing)**: Chạy **song song** tất cả candidate plans trong một khoảng trial ngắn
-                3. **Empirical Measurement**: Đo lường "**Works**" score — proxy metric tính từ: số index key đã scan + số document đã fetch + resource của các stage (sort, etc.)
-                4. **Winner Selection**: Plan nào trả về **101 documents đầu tiên** với ít "Works" nhất → thắng
-                5. **Plan Caching**: Cache winning plan theo **query shape** (cấu trúc query, không phân biệt giá trị cụ thể)
-            - **⚠️ Lưu ý**: Không phải chạy thử **toàn bộ** query — chỉ chạy đến khi đủ 101 documents (trial period rất ngắn)
-            - **Ưu điểm**: Không cần `ANALYZE`, tự thích nghi với data thay đổi, phù hợp với schema-less NoSQL
-            - **Nhược điểm**:
-                - **Preference bias**: Có xu hướng ưu tiên index scan, đôi khi sai với tập dữ liệu nhỏ (collection scan nhanh hơn)
-                - **Plan cache stale**: Cache theo query shape → plan xấu có thể bị cache và dùng lại nhiều lần
-                - **Racing overhead**: Chạy song song N plans mỗi lần gặp query shape mới = tốn tài nguyên
-            - **Cách debug**: Dùng `.explain("allPlansExecution")` để xem "Works" score của tất cả candidate plans
+**Đặc điểm của Physical Operator:**
+- Định nghĩa kế hoạch thực thi thông qua 1 access path cụ thể
+- Có thể phụ thuộc vào format dữ liệu vật lý (row-store vs column-store)
+- **Không phải** 1-to-1 mapping từ logical operator → physical operator (một logical operator có thể có nhiều physical operator tương ứng, ví dụ: Join → Hash Join / Sort-Merge Join / Nested Loop Join)
+
+**2 Kiến trúc Optimizer:**
+
+| Kiến trúc | Mô tả | Ghi chú |
+|---|---|---|
+| **Single Query** | Tối ưu từng truy vấn một, không chia sẻ giữa các query | Phổ biến trong hầu hết DBMS hiện nay |
+| **Multi Query** | Tối ưu hóa nhiều truy vấn cùng lúc, có thể chia sẻ plan | Ít phổ biến hơn, dùng khi workload có nhiều query tương đồng |
+
+---
+
+#### 14.3. 3 Thành phần của Optimizer
+
+Optimizer được xây dựng dựa trên 3 thành phần phối hợp với nhau:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     OPTIMIZER                           │
+│                                                         │
+│  ┌─────────────────┐  ┌──────────────┐  ┌───────────┐  │
+│  │ Transformations │→ │ Search Algo  │→ │ Cost Model│  │
+│  │  (Liệt kê plan) │  │ (Tìm plan)   │  │(Ước lượng)│  │
+│  └─────────────────┘  └──────────────┘  └───────────┘  │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 14.3.1. Transformations (Phép biến đổi)
+
+**Mục tiêu**: Liệt kê tất cả các hình thức khác nhau của một query plan mà vẫn **đảm bảo tính tương đương ngữ nghĩa** (semantically equivalent) dựa trên mô hình đại số quan hệ.
+
+> 💡 Đây cũng là cơ chế mà **Heuristic Optimizer** dùng để xác định query plan mà không cần đến cost model — nhờ đại số quan hệ đảm bảo tính đúng đắn của các phép biến đổi.
+
+**Các phép biến đổi phổ biến:**
+
+| Operator | Phép biến đổi |
+|---|---|
+| **Selection (σ)** | Pushdown filter — thực thi filter sớm nhất có thể; tách điều kiện phức tạp thành các mệnh đề AND riêng lẻ và đẩy xuống từng node |
+| **Join (⋈)** | Có tính **giao hoán** (A⋈B = B⋈A) và **kết hợp** ((A⋈B)⋈C = A⋈(B⋈C)) → số lượng thứ tự join của n bảng = **n! × C(n-1)** (C là số Catalan), không gian tìm kiếm cực lớn |
+
+**Quy tắc giới hạn không gian tìm kiếm:**
+
+| Quy tắc | Mô tả |
+|---|---|
+| **Split conjunctive predicates** | Chia điều kiện phức tạp thành dạng đơn giản nhất để optimizer dễ di chuyển trong plan |
+| **Replace Cartesian product** | Thay thế tích đề-các (×) bằng Join tương ứng |
+| **Projection pushdown** | Đưa phép chiếu (π) xuống sớm nhất có thể để giảm số cột cần materialize ở các bước trung gian |
+
+> 📌 **Thực tế**: SQL Server được cho là có ~4,500 transformation rules (nguồn: bài giảng CMU 15-445/721, con số chính xác không được Microsoft công bố chính thức). Ngoài ra, một số DBMS hiện đại đang thử nghiệm thêm rules mới được học bởi AI.
+> PostgreSQL không hỗ trợ hint trực tiếp — cần dùng extension `pg_hint_plan`.
+
+---
+
+#### 14.3.2. Search Algorithm
+
+**Nhiệm vụ**: Với tập rules đã định nghĩa, optimizer duyệt không gian kế hoạch để tìm ra plan tốt nhất.
+
+**Lưu ý**: Đôi khi optimizer không có đầy đủ thông tin tại thời điểm tối ưu, ví dụ:
+- **Prepared statement**: chưa biết tham số cụ thể
+- **Thiếu thông tin phân bố dữ liệu**: statistics chưa được cập nhật
+
+**Hai kiến trúc Search:**
+
+##### A. Heuristic-based Search
+
+| Đặc điểm | Chi tiết |
+|---|---|
+| Dùng cost model? | ❌ Không |
+| Tốc độ | ✅ Nhanh — áp dụng các rule có sẵn theo thứ tự cố định |
+| Ứng dụng | Nhiều DBMS mới, các hệ thống ưu tiên tốc độ planning |
+| **Ưu điểm** | Dễ implement, dễ debug, dễ hiểu; nhanh với query đơn giản |
+| **Nhược điểm** | Không tối ưu với query phức tạp; phụ thuộc vào "magic number" để đánh giá hiệu quả của một operator |
+
+> ⚠️ **Lưu ý về MongoDB**: MongoDB **không thuộc** heuristic thuần hay cost-based truyền thống. Nó dùng cách tiếp cận **empirical/trial-based** riêng biệt — chạy thử song song các plan rồi chọn plan thắng cuộc (xem chi tiết tại [14.3.3 — Cost Model — Empirical](#2-empirical--trial-based)).
+
+##### B. Cost-based Search
+
+| Đặc điểm | Chi tiết |
+|---|---|
+| Dùng cost model? | ✅ Có |
+| Ứng dụng | PostgreSQL, MySQL, Oracle, SQL Server |
+| Cơ chế | Sinh plan → ước lượng cost (dựa trên cost model) → dùng cost để định hướng tìm kiếm. Nếu một plan quá "đắt", chuyển sang plan khác |
+
+**Điều kiện dừng (Stopping Criteria):**
+
+| Điều kiện | DBMS |
+|---|---|
+| **Wall clock time** | MySQL, PostgreSQL |
+| **Cost threshold** | Khi plan hiện tại đã đủ rẻ |
+| **Exhaustion** | Khi đã xét hết tất cả plan có thể |
+| **Transformation count** | SQL Server — dừng sau N rules đã xem xét |
+
+**Chiến lược duyệt không gian kế hoạch (Search Strategy):**
+
+Trong Cost-based Search, có 2 chiến lược chính để duyệt không gian plan:
+
+##### ① Bottom-Up / Forward Chaining
+
+```
+Xuất phát: các bảng gốc (leaf nodes)
+Hướng:     từ dưới lên ↑
+Duyệt:    Breadth-first Search
+
+              ARTIST ⋈ APPEARS          ← kết quả cuối cùng
+              /          \
+         [Choice 1]  [Choice 2]  [Choice 3]    ← các phương án join
+          /    \        /    \
+     [C1] [C2]  [C1] [C2]  [C1] [C2]          ← các phương án scan
+      │    │      │    │     │    │
+    ARTIST       ARTIST    APPEARS             ← bảng gốc (BẮT ĐẦU TỪ ĐÂY ↑)
+```
+
+- Bắt đầu từ **các bảng gốc** (base relations), áp dụng tất cả rules có thể, tạo ra các plan con.
+- Lưu plan con tốt nhất cho mỗi subset bảng (Dynamic Programming), rồi mở rộng dần lên.
+- Nhờ DP, tránh tính lại các sub-plan đã xét → **tối ưu toàn cục** (global optimal).
+- Framework đại diện: **IBM System R** (1979) — optimizer có ảnh hưởng lớn nhất lịch sử DB.
+
+| Đặc điểm | Chi tiết |
+|---|---|
+| Thuật toán | **Dynamic Programming** — lưu plan tốt nhất cho mỗi subset |
+| Chiến lược duyệt | Breadth-first (mở rộng theo tầng) |
+| DBMS sử dụng | PostgreSQL, MySQL, DB2, SQLite |
+| **Ưu điểm** | Đảm bảo tìm plan tối ưu toàn cục (nếu duyệt hết); dễ hiểu; ổn định |
+| **Nhược điểm** | Tốn bộ nhớ lớn (lưu mọi sub-plan); khó mở rộng khi thêm operator/rule mới; khó cắt nhánh (pruning) sớm |
+
+**Chi tiết cách DP hoạt động trong Bottom-Up Optimizer (System R):**
+
+Ý tưởng cốt lõi: **Bài toán con tối ưu** — plan tốt nhất cho `{A, B, C}` chắc chắn được xây từ plan tốt nhất cho `{A, B}` hoặc `{A, C}` hoặc `{B, C}` kết hợp với bảng còn lại. Nên chỉ cần lưu plan tốt nhất cho mỗi subset, rồi build lên.
+
+```
+Ví dụ: Query JOIN 3 bảng A, B, C
+
+═══════════════════════════════════════════════════════════
+Pass 1 — Xét từng bảng đơn lẻ (subset kích thước 1)
+═══════════════════════════════════════════════════════════
+  Với mỗi bảng, tìm access path tốt nhất:
+
+  best_plan[{A}] = Seq Scan A        (cost: 1000)
+                 vs Index Scan A(idx) (cost: 50)   ← CHỌN ✓
+
+  best_plan[{B}] = Seq Scan B        (cost: 500)   ← CHỌN ✓
+                 vs Index Scan B      (cost: 600)
+
+  best_plan[{C}] = Seq Scan C        (cost: 200)   ← CHỌN ✓
+
+═══════════════════════════════════════════════════════════
+Pass 2 — Xét tất cả cặp 2 bảng (subset kích thước 2)
+═══════════════════════════════════════════════════════════
+  Với mỗi cặp, thử TẤT CẢ cách join + TẤT CẢ thuật toán:
+
+  best_plan[{A,B}] = ?
+    Thử: best_plan[{A}] ⋈ best_plan[{B}]
+         → Hash Join(A,B)           cost: 50+500+200  = 750
+         → Sort-Merge Join(A,B)     cost: 50+500+400  = 950
+         → Nested Loop(A→B)         cost: 50+50×500   = 25050
+    Thử: best_plan[{B}] ⋈ best_plan[{A}]  (đảo thứ tự)
+         → Hash Join(B,A)           cost: 500+50+180  = 730  ← CHỌN ✓
+    ...
+
+  best_plan[{A,C}] = Hash Join(C,A)  (cost: 400)     ← CHỌN ✓
+  best_plan[{B,C}] = Sort-Merge(B,C) (cost: 900)     ← CHỌN ✓
+
+═══════════════════════════════════════════════════════════
+Pass 3 — Xét bộ 3 bảng (subset kích thước 3) → KẾT QUẢ
+═══════════════════════════════════════════════════════════
+  best_plan[{A,B,C}] = ?
+    Thử: best_plan[{A,B}] ⋈ best_plan[{C}]
+         → Hash Join cost: 730+200+X
+    Thử: best_plan[{A,C}] ⋈ best_plan[{B}]
+         → Hash Join cost: 400+500+X              ← CHỌN ✓
+    Thử: best_plan[{B,C}] ⋈ best_plan[{A}]
+         → Hash Join cost: 900+50+X
+
+  → Plan cuối cùng: Hash Join( Hash Join(C,A), B )
+```
+
+**Khái niệm then chốt — "Interesting Orders":**
+
+Nếu chỉ giữ plan rẻ nhất cho mỗi subset thì có thể bỏ lỡ plan tối ưu toàn cục. Ví dụ:
+
+```
+best_plan[{A,B}]:
+  Plan 1: Hash Join(B,A)         cost: 730   output: KHÔNG SORTED
+  Plan 2: Sort-Merge Join(A,B)   cost: 950   output: SORTED theo A.id  ← đắt hơn!
+
+Nếu chỉ giữ Plan 1 (rẻ hơn), nhưng Pass 3 cần ORDER BY A.id:
+  → Plan 1 + Sort  = 730 + 500 = 1230
+  → Plan 2 (no sort) = 950          ← RẺ HƠN NHIỀU!
+```
+
+→ System R giải quyết bằng cách giữ **nhiều plan cho mỗi subset**: một plan rẻ nhất **tuyệt đối**, và thêm plan rẻ nhất cho mỗi **interesting order** (thứ tự output hữu ích cho ORDER BY, GROUP BY, hoặc join condition phía trên).
+
+```
+DP Table mở rộng:
+┌──────────┬───────────────────────────────────────────────┐
+│ Subset   │ Plans được giữ                                │
+├──────────┼───────────────────────────────────────────────┤
+│ {A}      │ cheapest: IdxScan(A) cost=50                  │
+│          │ sorted(A.id): IdxScan(A) cost=50 (miễn phí!)  │
+├──────────┼───────────────────────────────────────────────┤
+│ {A,B}    │ cheapest: Hash Join(B,A) cost=730              │
+│          │ sorted(A.id): SMJ(A,B) cost=950               │
+├──────────┼───────────────────────────────────────────────┤
+│ {A,B,C}  │ cheapest: dùng sorted(A.id) plan → tổng rẻ hơn│
+└──────────┴───────────────────────────────────────────────┘
+```
+
+> 📌 **Tóm lại**: DP trong Bottom-Up = liệt kê plan theo **kích thước subset tăng dần** (1 bảng → 2 bảng → ... → n bảng). Tại mỗi bước, chỉ giữ plan tốt nhất (+ interesting orders) cho mỗi subset. Nhờ vậy Pass k chỉ cần tổ hợp kết quả từ Pass k-1 mà không cần tính lại từ đầu.
+
+##### ② Top-Down / Backward Chaining
+
+```
+Xuất phát: kết quả truy vấn mong muốn (root)
+Hướng:     từ trên xuống ↓
+Duyệt:    Depth-first Search
+
+    ARTIST ⋈ APPEARS             ← BẮT ĐẦU TỪ ĐÂY ↓ (goal)
+         │
+      [Choice 1]                  ← chọn thuật toán join
+         │
+      [Choice 1]  [Choice 2]     ← chọn cách scan bảng trái
+         │
+       ARTIST                     ← đến leaf → quay lại xét nhánh khác
+```
+
+- Bắt đầu từ **kết quả mong muốn** (logical plan gốc), phân rã ngược xuống để xác định operator cần thiết.
+- Dùng **Memoization** (Memo Table) để ghi nhớ các sub-expression đã tối ưu, tránh tính lại.
+- Có thể **cắt nhánh sớm** (branch-and-bound): khi đã có upper bound cost, bỏ qua toàn bộ nhánh đắt hơn → nhanh hơn Bottom-Up trên query phức tạp.
+- Các thuộc tính vật lý được truyền xuống để đưa vào quyết định(khác biệt lớn so với Bottom-Up)
+- Framework đại diện: **Volcano** (1993) → **Cascades** (1995, Goetz Graefe) — nền tảng của SQL Server.
+- Cách SQL server thực hiện được mô tả trong cuốn: Extensible query optimizer in paractive của MS
+
+| Đặc điểm | Chi tiết |
+|---|---|
+| Thuật toán | **Memoization** + Branch-and-bound pruning |
+| Chiến lược duyệt | Depth-first (đi sâu rồi quay lại) |
+| DBMS sử dụng | SQL Server (Cascades), CockroachDB, Greenplum |
+| **Ưu điểm** | Dễ mở rộng (thêm rule/operator mới dễ dàng); cắt nhánh sớm hiệu quả; tiết kiệm bộ nhớ hơn (chỉ lưu nhánh đang xét) |
+| **Nhược điểm** | Cài đặt phức tạp hơn; không đảm bảo tối ưu toàn cục nếu pruning quá mạnh; khó debug |
+
+**So sánh tổng hợp:**
+
+| | Bottom-Up (Forward Chaining) | Top-Down (Backward Chaining) |
+|---|---|---|
+| **Xuất phát** | Bảng gốc (leaf) → build lên | Kết quả (root) → decompose xuống |
+| **Duyệt** | Breadth-first | Depth-first |
+| **Kỹ thuật** | Dynamic Programming | Memoization + Branch-and-bound |
+| **Pruning** | Khó cắt nhánh sớm | ✅ Cắt nhánh hiệu quả nhờ upper/lower bound |
+| **Mở rộng** | Khó — thêm rule cần sửa code DP | ✅ Dễ — chỉ cần thêm rule object |
+| **Đại diện** | System R → PostgreSQL, MySQL | Volcano → Cascades → SQL Server |
+
+---
+
+##### D. Access Path Transformation
+
+Lựa chọn **access path** cho từng table sao cho tổng chi phí là nhỏ nhất. Chi phí phụ thuộc vào:
+
+| Yếu tố | Mô tả |
+|---|---|
+| **Độ chọn lọc (Selectivity)** | Filter càng chọn lọc, index càng có lợi |
+| **Cấu trúc index** | B+Tree cho range query; Hash index cho point lookup (highly selective) |
+| **Sort order** | Index có thể tránh sort bổ sung nếu thứ tự phù hợp ORDER BY |
+| **Data Accoutrements** | **Include columns**: cột đính kèm vào index (không phải khóa) — tránh table lookup; **Zone map**: lưu min/max của block — cho phép block skipping |
+| **Compression/Encoding** | Ảnh hưởng đến số bytes đọc từ disk |
+
+---
+
+#### 14.3.3. Cost Model
+
+**Nhiệm vụ**: Ước lượng chi phí của một plan để optimizer có thể so sánh và chọn plan tốt nhất.
+
+##### A. Hai thành phần của Cost
+
+| Thành phần | Mô tả |
+|---|---|
+| **Physical Cost** | Chi phí thực tế trên phần cứng: I/O, CPU cycles, memory usage. PostgreSQL sử dụng các hằng số có thể tuỳ chỉnh (`seq_page_cost`, `cpu_tuple_cost`...) để ước lượng. Oracle, SQL Server, DB2 sử dụng các kỹ thuật nội bộ riêng |
+| **Logical Cost** | Ước tính **Cardinality** (số lượng dòng/bản ghi) kết quả của mỗi toán tử. Độc lập với thuật toán — chỉ quan tâm đến số lượng bản ghi × trọng số, không quan trọng sử dụng thuật toán nào |
+
+##### B. Hai trường phái Cost Model
+
+###### 1. Statistics-based (Cost-Based Optimizer — CBO)
+
+**Ứng dụng**: PostgreSQL, MySQL, Oracle, SQL Server
+
+| Đặc điểm | Chi tiết |
+|---|---|
+| Cơ chế | Duy trì **statistics** về dữ liệu (histogram, cardinality, data distribution) và ước lượng cost **trước khi chạy** |
+| **Ưu điểm** | Không tốn I/O để chọn plan; nhanh và chính xác khi statistics còn tươi |
+| **Nhược điểm** | Statistics bị **stale** khi data thay đổi nhanh → chọn plan sai; tốn dung lượng lưu trữ |
+| Maintenance | Background task (PostgreSQL auto vacuum) / Schedule (Oracle) / Thresholds / Manual. Cần chạy định kỳ: `ANALYZE` (PostgreSQL) / `UPDATE STATISTICS` (SQL Server) |
+
+**a) Statistic Storage**
+
+- **Table-level statistics**: Thông tin tổng quan về bảng (số dòng, số page, kích thước trung bình tuple...)
+
+- **Column statistics**:
+   - Thông thường DBMS tạo phân tích **độc lập trên từng cột**, điều này đôi khi dẫn đến sai lệch khi thực hiện query trên nhiều cột có sự tương quan (correlated columns)
+   - Một số hệ thống tự động tạo statistics trên **nhiều cột** nếu chúng nằm trong 1 compound index (MySQL)
+   - Một số hệ thống cho phép chỉ định (manual) tạo statistics trên nhiều cột (Oracle, DB2)
+
+**b) Estimation Techniques (Kỹ thuật ước lượng)**
+
+- **Histogram**: Thống kê tần suất xuất hiện của từng giá trị trong 1 column (được sử dụng nhiều nhất)
+   - Để giảm kích thước, sử dụng **Bucket** — nhóm nhiều giá trị thành từng nhóm:
+
+      | Loại Bucket | Mô tả |
+      |---|---|
+      | **Equi-width** | Các bucket có cùng chiều rộng (range) |
+      | **Equi-depth** | Các bucket có số lượng phần tử tương đồng nhau |
+      | **End-biased** | Chỉ lưu riêng các giá trị xuất hiện nhiều nhất (most frequent values), còn lại nhóm hết vào 1 bucket |
+
+- **Sketches**: Cấu trúc dữ liệu xác suất để ước lượng nhanh (được sử dụng nhiều trong các hệ thống phân tán)
+   - Frequent items — **Count-Min Sketch**: Ước lượng tần suất xuất hiện của từng phần tử
+   - Count Distinct — **HyperLogLog**: Ước lượng số giá trị duy nhất (distinct values)
+   - Quantiles — **t-digest**: Ước lượng percentile / phân vị
+
+- **Sampling**: Lấy mẫu dữ liệu để ước lượng cost
+   - **Maintain Read-Only Copy** (Duy trì bản sao chỉ đọc): DBMS lấy ra khoảng 1% các dòng ngẫu nhiên từ bảng chính và tạo thành một bảng phụ gọi là Sample Table
+   - **Sample Real Tables** (Lấy mẫu trực tiếp trên bảng thực): Mỗi khi cần tối ưu hoá, DBMS đọc ngẫu nhiên một vài trang dữ liệu (pages/blocks) trực tiếp từ bảng gốc trên đĩa
+
+- **ML Model**: Sử dụng Machine Learning để dự đoán cost (mới chỉ đang thử nghiệm)
+
+---
+
+##### 2. Empirical / Trial-based
+
+**Ứng dụng**: MongoDB
+
+MongoDB **không dùng statistics**. Thay vào đó dùng cơ chế **"First Past the Post" (FPTP)**:
+
+```
+Bước 1: Candidate Plan Generation
+         → Sinh ra tất cả possible plans từ các index có sẵn
+              ↓
+Bước 2: Trial Period (Racing)
+         → Chạy SONG SONG tất cả candidate plans trong trial ngắn
+              ↓
+Bước 3: Empirical Measurement
+         → Đo "Works" score: số index key scan + số doc fetch + stage resources
+              ↓
+Bước 4: Winner Selection
+         → Plan trả về 101 docs đầu tiên với ít "Works" nhất → THẮNG
+              ↓
+Bước 5: Plan Caching
+         → Cache winning plan theo query shape (không phân biệt giá trị cụ thể)
+```
+
+> ⚠️ **Lưu ý**: Không phải chạy thử **toàn bộ** query — chỉ chạy đến khi đủ 101 documents (trial period rất ngắn).
+
+| | Ưu điểm | Nhược điểm |
+|---|---|---|
+| **Statistics-based** | Không tốn I/O để chọn plan | Statistics stale → plan sai |
+| **Empirical (MongoDB)** | Không cần `ANALYZE`; tự thích nghi với data thay đổi; phù hợp schema-less NoSQL | Preference bias (ưu tiên index scan, sai với dataset nhỏ); plan cache stale; racing overhead khi gặp query shape mới |
+
+> 🔍 **Debug MongoDB plans**: Dùng `.explain("allPlansExecution")` để xem "Works" score của tất cả candidate plans.
+
+---
+
+##### C. Cardinality Estimation
+- Ước lượng số lượng record mà mỗi toán tử sẽ phải thực hiện(select, join, distinct, ...)
+
+Derivable statistic:
+   - Với mỗi relation(R1, R2, ...)
+      - N(R): số lượng tuple
+      - V(A, R): số lượng giá trị duy nhất trong cột A
+      - Selection of A: SC(A,R):  Số lượng trung bình các tuple có cùng giá trị trong cột A = N(R) / V(R, A)
+      - Độ chọn lọc ($sel$) của một vị ngữ $P$ (điều kiện lọc) là tỷ lệ các bản ghi (tuples) thỏa mãn điều kiện đó. 
+        - Vị ngữ so sánh bằng (Equality Predicate): $A = \text{constant}$Công thức: $sel(A = \text{constant}) = \frac{\text{\#occurrences}}{|R|}$
+        - Vị ngữ so sánh nghịch đảo: sel(not P) = 1 - sel(P)
+        - Khi combine nhiều điều kiện thì sao: -> Trong đại bộ phận các mô hình giả định phân phối là độc lập và phân phối đều
+          -Công thức toán học thuần túy giả định các cột độc lập (Independent):$$sel(P1 \wedge P2 \wedge P3 \wedge P4) = sel(P1) \times sel(P2) \times sel(P3) \times sel(P4)$$: càng nhiều điều kiện thì xác suất càng nhỏ
+          - Optimization: Ví dụ trong sql server họ giảm hệ số ở các điều kiện tiếp theo để hệ số không còn quá nhỏ
+      - Join size estimation:
+         Join 2 table R và S -> số lượng tuple trong kết quả join
+         - Giả định: Các giá trị trong cột A của R và cột B của S có giá trị bằng nhau
+         - Công thức: $$N(R \Join S) = \frac{N(R) \times N(S)}{max(|V(A,S)|, |V(A,R|)}$$
+      - Được xây dựng trên các giả định, vì vậy hiện tượng lan truyền lỗi
+      - AQP(adaptive query processing) SQL server: nếu vượt quá giá trị mong đợi, ta sẽ break chúng để lên lại plan mới
+      - 1 bài báo(2015) cho thấy sql server với việc sử dụng sampling cho kết quả estimate tốt nhất
+   - Với mỗi join(R, S)
+      - N(R ⋈ S): số lượng tuple trong kết quả join
+
+### 15. Transaction
+
+#### 15.1. ACID
+
+- **Atomicity** (Tính nguyên tử): Đảm bảo "tất cả hoặc không có gì xảy ra"
+   - Logging: Ghi tất cả các action của transaction vào log (WAL — Write-Ahead Log)
+   - Shadow paging: Tạo 1 bản sao → thành công thì chuyển sang dùng bản sao
+
+- **Consistency** (Tính nhất quán): Đảm bảo transaction đưa database từ trạng thái hợp lệ này sang trạng thái hợp lệ khác
+   - Đảm bảo các ràng buộc (FK, CHECK, UNIQUE, NOT NULL...)
+   - Lưu ý: "Eventual Consistency" là khái niệm của distributed systems (CAP theorem), **không phải** ACID Consistency. ACID Consistency chỉ nói về tính toàn vẹn dữ liệu trong phạm vi 1 database instance.
+
+- **Isolation** (Tính cô lập): Đảm bảo các transaction đồng thời không ảnh hưởng đến nhau
+   - Cơ chế quản lý nhiều transaction cùng lúc
+   - Cần đảm bảo tính tuần tự (serializability)
+   - **Serial Schedule** (Lịch trình nối tiếp): Chạy lần lượt từng transaction, luôn đúng nhưng kém hiệu năng
+   - **Equivalent Schedule** (Lịch trình tương đương):
+      - Chạy song song nhiều transaction
+      - Đảm bảo kết quả tương đương với việc chạy tuần tự
+   - **Conflict serializability**: Để đảm bảo tính tuần tự, ta cần xác định conflict
+      - 2 operation được gọi là **conflict** nếu chúng cùng truy cập vào 1 tài nguyên và ít nhất 1 trong 2 là write
+      - Xác định conflict bằng **dependency graph**:
+         - Nếu có cycle → **không phải** conflict serializable
+         - Nếu không có cycle → **là** conflict serializable
+   - **Concurrency Anomalies** (Các hiện tượng bất thường khi chạy đồng thời):
+      - **Dirty read**: T1 đọc dữ liệu mà T2 đã write nhưng chưa commit. Nếu T2 rollback, T1 đang dùng dữ liệu không bao giờ tồn tại.
+      - **Unrepeatable read** (Non-repeatable read): T1 đọc một dòng, rồi T2 update/delete dòng đó và commit, sau đó T1 đọc lại và nhận được giá trị khác.
+      - **Lost update**: T1 đọc dữ liệu, T2 đọc cùng dữ liệu, T1 update, T2 update → cập nhật của T1 bị mất.
+      - **Phantom read**: T1 đọc một tập kết quả (range scan), T2 insert dòng mới vào range đó, T1 đọc lại → nhận được thêm dòng mới.
+      - **Write-skew**: T1 và T2 cùng đọc một điều kiện chung, mỗi transaction write vào dòng khác nhau (nên không bị conflict trực tiếp), nhưng tổng thể vi phạm invariant của hệ thống.
+        - **Đặc điểm**: Row-level lock và Snapshot Isolation **KHÔNG** bắt được — vì 2 txn ghi vào 2 row khác nhau → không có write-write conflict. Chỉ **Serializable** mới ngăn được.
+
+        **Ví dụ 1 — Marble Color Swap (CMU 15-445):**
+        ```
+        Ban đầu: 2 viên đen (⚫⚫), 2 viên trắng (⚪⚪)
+
+        Txn #1: "Đổi tất cả viên TRẮNG → ĐEN"
+        Txn #2: "Đổi tất cả viên ĐEN → TRẮNG"
+
+        Nếu chạy tuần tự (serial):
+          T1 trước → ⚫⚫⚫⚫ → T2 sau → ⚪⚪⚪⚪  (hoặc ngược lại)
+          → Kết quả: tất cả cùng 1 màu ✅
+
+        Nếu chạy Snapshot Isolation (cả 2 đọc cùng snapshot ban đầu):
+          T1 đọc snapshot: thấy ⚪⚪ → đổi thành ⚫⚫  (ghi vào row 3, 4)
+          T2 đọc snapshot: thấy ⚫⚫ → đổi thành ⚪⚪  (ghi vào row 1, 2)
+          → Cả 2 commit thành công (ghi vào row khác nhau, không conflict)
+          → Kết quả: ⚪⚪⚫⚫ — 2 màu bị HOÁN ĐỔI thay vì cùng 1 màu 💥
+          → Không tương đương bất kỳ serial schedule nào → WRITE SKEW!
+        ```
+
+        **Ví dụ 2 — Bác sĩ trực ca:**
+        ```
+        Invariant: Luôn phải có ≥ 1 bác sĩ trực ca
+        Ban đầu: Alice (on_call=true), Bob (on_call=true) → 2 người trực
+
+        T1 (Alice muốn nghỉ):                   T2 (Bob muốn nghỉ):
+        ──────────────────────────────────────────────────────────────
+        BEGIN                                     BEGIN
+        SELECT COUNT(*) WHERE on_call=true        SELECT COUNT(*) WHERE on_call=true
+        → Đếm được 2 (≥1, OK để nghỉ)           → Đếm được 2 (≥1, OK để nghỉ)
+
+        UPDATE SET on_call=false                  UPDATE SET on_call=false
+          WHERE doctor='Alice'                      WHERE doctor='Bob'
+          ↑ ghi row ALICE                           ↑ ghi row BOB (khác row!)
+
+        COMMIT ✅                                 COMMIT ✅
+        → 0 bác sĩ trực → VI PHẠM INVARIANT! 💥
+        ```
+
+- **Durability** (Tính bền vững): Đảm bảo kết quả của transaction đã commit được lưu trữ vĩnh viễn, kể cả khi hệ thống crash.
+
+---
+
+#### 15.2. Concurrency Control
+
+Các transaction liên tục xảy ra, schedule cần đảm bảo tính tuần tự (serializability) theo thời gian thực.
+
+##### 15.2.1. Two-Phase Locking (2PL)
+
+- 2PL là kỹ thuật quản lý concurrency control bằng cách sử dụng lock
+- 2PL chia transaction thành 2 phase:
+   - **Growing phase** (Expanding phase): Transaction **chỉ được acquire lock**, không được release bất kỳ lock nào
+   - **Shrinking phase**: Transaction **chỉ được release lock**, không được acquire thêm lock mới
+   - **Lock point**: Thời điểm transaction acquire lock cuối cùng (đỉnh của growing phase) — thứ tự các lock point xác định thứ tự serial tương đương
+- 2PL đảm bảo tính tuần tự (serializability) nhưng có thể gây ra **deadlock** và **dirty read** (khi rollback trong shrinking phase)
+
+**Biến thể:**
+- **Strict 2PL (S2PL)**: Chỉ release **write lock** sau khi transaction kết thúc (commit/abort) → ngăn dirty read
+- **Rigorous 2PL**: Chỉ release **tất cả lock** sau khi transaction kết thúc → đơn giản hơn cho implementation
+
+---
+
+###### A. Deadlock Detection
+
+- Sử dụng **wait-for graph**: Mỗi node là 1 transaction, edge T1→T2 nghĩa là T1 đang chờ lock mà T2 đang giữ
+- Nếu có cycle → deadlock → Kill 1 victim để loại bỏ deadlock
+   - **Victim selection**:
+      - By age (transaction trẻ nhất)
+      - By progress (ít progress nhất)
+      - By the # of items already locked
+      - By the # of transactions that will need to rollback
+   - **Rollback length** — how far to rollback the txn changes:
+      - Toàn bộ (Complete rollback)
+      - Partial rollback: Chỉ rollback đến savepoint gần nhất đủ để phá cycle, giữ lại phần đã làm trước đó
+- Tần suất check và thời gian chờ là trade-off
+
+###### B. Deadlock Prevention
+
+- Khi 1 txn request tài nguyên đã bị lock bởi txn khác → kill 1 trong 2 để ngăn deadlock (không cần wait-for graph hay thuật toán detect)
+- Độ ưu tiên: **Older = Higher priority**
+- **Wait-Die** (non-preemptive): Nếu T1 request tài nguyên bị lock bởi T2:
+   - T1 cũ hơn T2 → T1 **chờ**
+   - T1 trẻ hơn T2 → T1 **rollback** (die)
+- **Wound-Wait** (preemptive): Nếu T1 request tài nguyên bị lock bởi T2:
+   - T1 **cũ hơn** T2 → T1 "wounds" T2: **T2 bị abort/rollback**, T1 tiếp tục
+   - T1 **trẻ hơn** T2 → T1 **chờ** (wait)
+- Tóm tắt so sánh:
+
+| | T1 cũ hơn T2 | T1 trẻ hơn T2 |
+|---|---|---|
+| **Wait-Die** | T1 chờ | T1 abort (die) |
+| **Wound-Wait** | T2 abort (bị T1 wound) | T1 chờ |
+
+---
+
+###### C. Lock Granularity (Mức độ chi tiết của lock)
+
+- Bản thân việc lock tốn tài nguyên hơn nhiều so với latch
+- **Scopes**: Attribute, tuple, page, table, database
+- Ví dụ: MongoDB trước v3.0 (engine MMAPv1) chỉ có database-level lock. Từ MongoDB 3.0+ (WiredTiger engine) đã hỗ trợ **document-level concurrency control** (dùng intention lock ở collection/database level).
+
+###### D. Intention Lock
+
+Intention lock cho phép lock ở mức cao (table) mà vẫn biết có lock ở mức thấp (tuple):
+
+- **IS** (Intention Shared): Tôi sẽ đặt S lock ở node con
+- **IX** (Intention Exclusive): Tôi sẽ đặt X lock ở node con
+- **SIX** (Shared + Intention Exclusive): Đọc toàn bộ node hiện tại (S) + sẽ ghi vào một số node con (IX)
+
+###### E. Lock Hint
+
+Đôi khi application cần kiểm soát locking thủ công:
+
+- `SELECT ... FOR UPDATE`: Acquire exclusive lock trên các row được select
+- `SELECT ... FOR SHARE` / `LOCK IN SHARE MODE`: Acquire shared lock
+- `SELECT ... FOR UPDATE SKIP LOCKED`: Skip qua các bản ghi đang bị lock — hữu dụng khi implement **job queue** trong DBMS (worker chỉ lấy row chưa bị lock, tránh chờ đợi)
+
+---
+
+##### 15.2.2. Optimistic Concurrency Control (OCC)
+
+- **Giả định**: Xung đột hiếm khi xảy ra → không cần lock
+- **3 giai đoạn**:
+   1. **Read Phase**: Đọc dữ liệu, tính toán, ghi vào local workspace (private copy)
+   2. **Validate Phase**: Kiểm tra xem có xung đột với transaction khác không
+   3. **Write Phase**: Nếu validate thành công → ghi dữ liệu vào database
+- **Ưu điểm**: Không cần lock, hiệu năng cao khi xung đột thấp
+- **Nhược điểm**: Khi xung đột cao, nhiều transaction bị abort → lãng phí tài nguyên (copy data, chỉ abort khi đã hoàn thành gần xong)
+- **Cơ chế validate**:
+   1. **Backward validation**: Kiểm tra xung đột với các transaction đã commit
+   2. **Forward validation**: Kiểm tra xung đột với các transaction đang chạy
+      - Khi transaction bắt đầu, nó ghi lại tất cả các item đọc vào **ReadSet**
+      - Khi chuẩn bị commit, kiểm tra xem bất kỳ item nào trong ReadSet đã bị thay đổi bởi transaction khác (chưa commit) hay không
+      - Nếu có sự thay đổi → xung đột → transaction bị abort
+      - Nếu không → transaction được commit
+
+---
+
+##### 15.2.3. Timestamp Ordering (T/O)
+
+- Mỗi transaction được gán 1 **timestamp** khi bắt đầu
+- Mỗi data item lưu 2 timestamp: **W-TS** (write timestamp) và **R-TS** (read timestamp)
+- Khi transaction đọc/ghi, hệ thống kiểm tra timestamp để đảm bảo thứ tự tương đương serial
+- Ưu điểm: Không cần lock, không deadlock
+- Nhược điểm: Có thể phải cascade abort khi vi phạm thứ tự timestamp
+
+---
+
+##### 15.2.4. Phantom Read Prevention
+
+Cả 2PL và OCC mặc định chỉ lock trên **1 đối tượng cụ thể** (tuple, page, table) → phantom read vẫn xảy ra khi có range scan.
+
+**Giải pháp:**
+
+1. **Re-scan**: Thực hiện lại scan để phát hiện phantom
+   - Ví dụ: DynamoDB, Hekaton (SQL Server In-Memory OLTP)
+
+2. **Predicate locking**: Khóa theo mệnh đề điều kiện (predicate)
+   - Acquire shared/exclusive lock trên predicate (ví dụ: `age > 18`)
+   - Các giao dịch khác phải kiểm tra xem operation của mình có conflict với predicate lock hay không
+   - Nhược điểm: Khó implement vì cần kiểm tra overlap giữa các predicate
+
+3. **Index locking**: Khóa dựa trên cấu trúc index
+   - **Key locking**: Lock theo key cụ thể trên index
+   - **Gap lock**: Lock khoảng trống giữa 2 key liên tiếp: ví dụ key 5 và 10 → lock gap (5, 10)
+   - **Key-range locking** (Next-key lock): Lock cả gap và 1 key kế tiếp — cần virtual key để lock infinity
+      - Ví dụ: lock [5, 10) → lock key 5 và gap giữa 5 và 10
+   - **Hierarchical locking**: Cho phép lock trong range với nhiều mức lock khác nhau (IX lock)
+
+---
+
+##### 15.2.5. Isolation Levels
+
+Phần lớn các DBMS hiện tại **không đảm bảo Serializable** mặc định do chi phí quá đắt đỏ. Thay vào đó, cung cấp nhiều mức isolation level:
+
+| Isolation Level | Dirty Read | Unrepeatable Read | Phantom Read | Lost Update |
+|---|---|---|---|---|
+| **Read Uncommitted** | ⚠️ Có thể | ⚠️ Có thể | ⚠️ Có thể | ⚠️ Có thể |
+| **Read Committed** | ✅ Không | ⚠️ Có thể | ⚠️ Có thể | ⚠️ Có thể |
+| **Repeatable Read** | ✅ Không | ✅ Không | ⚠️ Có thể | ✅ Không |
+| **Serializable** | ✅ Không | ✅ Không | ✅ Không | ✅ Không |
+
+> 📌 Mặc định: PostgreSQL = **Read Committed**, MySQL (InnoDB) = **Repeatable Read**, SQL Server = **Read Committed**, Oracle = **Read Committed**.
+
+**Chi tiết từng Isolation Level:**
+
+###### 1. Read Uncommitted
+
+- Mức cô lập **thấp nhất**: Transaction có thể đọc dữ liệu mà transaction khác đã write nhưng **chưa commit**.
+- Hầu như không dùng lock khi đọc → hiệu năng cao nhất nhưng rủi ro lớn nhất.
+- **Dirty read xảy ra**:
+
+```
+T1: BEGIN
+T1: UPDATE accounts SET balance = 500 WHERE id = 1  -- (ban đầu balance = 1000)
+                    T2: BEGIN
+                    T2: SELECT balance FROM accounts WHERE id = 1
+                    T2: → Đọc được 500 (dữ liệu CHƯA commit của T1)  ← DIRTY READ
+T1: ROLLBACK       -- T1 hủy, balance trở về 1000
+                    T2: -- Nhưng T2 đã dùng giá trị 500 → SAI!
+```
+
+- Ứng dụng: Rất hiếm khi dùng. Chỉ phù hợp cho các truy vấn thống kê xấp xỉ (approximate analytics) nơi sai lệch nhỏ chấp nhận được.
+
+###### 2. Read Committed
+
+- Transaction **chỉ đọc được dữ liệu đã commit** → ngăn dirty read.
+- Cơ chế phổ biến:
+   - **Lock-based**: Acquire shared lock khi đọc, release ngay sau khi đọc xong (không giữ đến cuối transaction)
+   - **MVCC-based** (PostgreSQL, Oracle): Đọc **snapshot tại thời điểm câu lệnh** (statement-level snapshot) — mỗi câu SELECT thấy dữ liệu đã commit tính đến thời điểm câu SELECT đó bắt đầu
+- **Dirty read KHÔNG xảy ra**, nhưng **Unrepeatable read vẫn xảy ra**:
+
+```
+T1: BEGIN
+T1: SELECT balance FROM accounts WHERE id = 1
+T1: → Đọc được 1000
+                    T2: BEGIN
+                    T2: UPDATE accounts SET balance = 500 WHERE id = 1
+                    T2: COMMIT  -- T2 đã commit thành công
+T1: SELECT balance FROM accounts WHERE id = 1
+T1: → Đọc được 500 (khác lần đọc trước!)  ← UNREPEATABLE READ
+T1: COMMIT
+```
+
+- Ứng dụng: Phù hợp cho hầu hết ứng dụng web thông thường nơi mỗi request là 1 transaction ngắn. Đây là mức mặc định của PostgreSQL, Oracle, SQL Server.
+
+###### 3. Repeatable Read
+
+- Đảm bảo **cùng 1 câu SELECT trong cùng 1 transaction luôn trả về cùng kết quả** cho các row đã đọc → ngăn unrepeatable read.
+- Cơ chế phổ biến:
+   - **Lock-based**: Giữ shared lock trên các row đã đọc cho đến khi transaction kết thúc
+   - **MVCC-based** (MySQL InnoDB, PostgreSQL): Đọc **snapshot tại thời điểm transaction bắt đầu** (transaction-level snapshot) — toàn bộ các câu SELECT trong transaction đều thấy cùng 1 snapshot
+- **Unrepeatable read KHÔNG xảy ra**, nhưng **Phantom read vẫn có thể xảy ra**:
+
+```
+T1: BEGIN
+T1: SELECT * FROM employees WHERE dept = 'Engineering'
+T1: → Trả về 10 rows
+                    T2: BEGIN
+                    T2: INSERT INTO employees (name, dept) VALUES ('New Guy', 'Engineering')
+                    T2: COMMIT
+T1: SELECT * FROM employees WHERE dept = 'Engineering'
+T1: → Trả về 11 rows (xuất hiện thêm 1 row mới!)  ← PHANTOM READ
+T1: -- 10 rows cũ vẫn giữ nguyên giá trị (no unrepeatable read)
+T1: -- Nhưng có thêm 1 row "phantom" xuất hiện
+T1: COMMIT
+```
+
+> ⚠️ **Lưu ý MySQL InnoDB**: Nhờ MVCC + gap lock, InnoDB ở Repeatable Read thực tế **ngăn được cả phantom read** trong hầu hết các trường hợp — đây là điểm khác biệt so với tiêu chuẩn SQL. Tuy nhiên, phantom vẫn có thể xảy ra trong một số edge case (ví dụ: `SELECT ... FOR UPDATE` thấy row mới mà `SELECT` thường không thấy).
+
+- Ứng dụng: Phù hợp cho các transaction cần đọc nhiều lần và yêu cầu tính nhất quán cao (báo cáo tài chính, kiểm tra số dư trước khi chuyển tiền).
+
+###### 4. Serializable
+
+- Mức cô lập **cao nhất**: Đảm bảo kết quả tương đương với việc chạy các transaction tuần tự.
+- Ngăn chặn **tất cả** anomalies: dirty read, unrepeatable read, phantom read, write-skew.
+- Cơ chế:
+   - **Lock-based** (SQL Server `SERIALIZABLE`): Dùng range lock / predicate lock để khóa cả khoảng giá trị, ngăn insert/update/delete vào range đã đọc
+   - **SSI — Serializable Snapshot Isolation** (PostgreSQL): Dựa trên MVCC + phát hiện dependency cycle tại thời điểm commit. Nếu phát hiện vi phạm → abort transaction
+   - **2PL + Index locking** (MySQL `SERIALIZABLE`): Tự động convert tất cả `SELECT` thành `SELECT ... FOR SHARE`
+- **Trade-off**: Hiệu năng thấp nhất vì lock/check nhiều nhất. Throughput giảm đáng kể khi có nhiều transaction đồng thời.
+- Ứng dụng: Giao dịch tài chính quan trọng, booking vé máy bay, bất kỳ nghiệp vụ nào mà consistency quan trọng hơn performance.
+
+
+##### 15.2.6. MVCC
+
+- **Multi-Version Concurrency Control**: quản lý nhiều physical version của 1 logical object
+- **Nguyên tắc cốt lõi**: Writer tạo version mới thay vì ghi đè → Reader đọc version phù hợp với snapshot của mình
+- **Lợi ích**: Reader không block Writer, Writer không block Reader (nhưng Writer **vẫn cần lock/latch** để tránh write-write conflict)
+- Được sử dụng rộng rãi: PostgreSQL, MySQL InnoDB, Oracle, SQL Server (Snapshot Isolation)
+
+###### A. Cơ chế Timestamp (Begin-TS / End-TS)
+
+Mỗi **version** của 1 row (tuple) được gắn 2 timestamp:
+
+| Trường | Ý nghĩa |
+|---|---|
+| **Begin-TS** | Thời điểm version này **bắt đầu có hiệu lực** (= commit timestamp của transaction tạo ra nó) |
+| **End-TS** | Thời điểm version này **hết hiệu lực** (= commit timestamp của transaction thay thế nó). Mặc định = **∞** (INF) nếu chưa bị thay thế |
+
+> 📌 **Lưu ý**: Trong quá trình transaction chưa commit, Begin-TS/End-TS có thể tạm lưu **txn_id** thay vì timestamp thực. Khi commit, hệ thống thay txn_id bằng commit timestamp chính thức.
+
+**Visibility Check** — Transaction T (với snapshot timestamp `ts`) thấy version V nếu:
+```
+Begin-TS(V) <= ts < End-TS(V)
+```
+Tức là: version đã bắt đầu hiệu lực trước hoặc tại `ts`, VÀ chưa hết hiệu lực tại `ts`.
+
+**Ví dụ minh họa Version Chain:**
+
+```
+Row X (logical object)
+
+Version Chain:
+┌─────────────────────────────────────────────────────────────┐
+│ V1: value=100, Begin-TS=10, End-TS=20                       │  ← đã bị thay thế bởi V2
+│ V2: value=200, Begin-TS=20, End-TS=50                       │  ← đã bị thay thế bởi V3
+│ V3: value=300, Begin-TS=50, End-TS=∞                        │  ← version hiện tại
+└─────────────────────────────────────────────────────────────┘
+
+Transaction với ts=25 → thấy V2 (vì 20 <= 25 < 50)
+Transaction với ts=55 → thấy V3 (vì 50 <= 55 < ∞)
+Transaction với ts=5  → không thấy row nào (chưa tồn tại)
+```
+
+###### B. Các thao tác trong MVCC
+
+| Thao tác | Hành vi |
+|---|---|
+| **INSERT** | Tạo version mới: `Begin-TS = txn_id`, `End-TS = ∞` |
+| **UPDATE** | ① Set `End-TS` của version cũ = `txn_id` (đánh dấu hết hiệu lực) → ② Tạo version mới: `Begin-TS = txn_id`, `End-TS = ∞` |
+| **DELETE** | Set `End-TS` của version hiện tại = `txn_id` (một số hệ thống tạo thêm **tombstone marker**) |
+| **READ** | Duyệt version chain, tìm version thỏa `Begin-TS <= snapshot_ts < End-TS` |
+| **COMMIT** | Thay tất cả `txn_id` trong Begin-TS/End-TS bằng **commit timestamp** chính thức → version trở nên visible cho các transaction khác |
+| **ABORT** | Xóa (hoặc đánh dấu invalid) tất cả version mới mà transaction đã tạo; khôi phục `End-TS` của version cũ về giá trị ban đầu |
+
+> ⚠️ **Quan trọng**: ABORT **KHÔNG** phải là set `End-TS = current time`. Các version do transaction tạo ra phải bị **loại bỏ hoàn toàn** (hoặc đánh dấu aborted để GC dọn dẹp sau), và version cũ phải được khôi phục lại trạng thái ban đầu.
+
+###### C. Write-Write Conflict — Khi nhiều Transaction cùng UPDATE
+
+MVCC **không** loại bỏ xung đột giữa writer-writer. Khi 2 transaction cùng muốn update 1 row, cần cơ chế giải quyết:
+
+
+###### D. Snap isolation
+- Khi transaction bắt đầu, nó sẽ lấy 1 snapshot timestamp
+- Tất cả các transaction sau khi snapshot timestamp được tạo ra sẽ không ảnh hưởng đến transaction này
+- Nếu nhiều txn cùng update 1 row, nó sẽ dùng First-Writer-Wins
+- Không tránh đc write skew anomaly
+
+**Nguyên tắc: First-Writer-Wins**
+
+Khi transaction T2 muốn update row X mà T1 đang sửa (T1 chưa commit):
+1. T2 phát hiện version hiện tại có `End-TS = T1_txn_id` (đã bị T1 đánh dấu)
+2. T2 **phải chờ** T1 kết thúc (commit hoặc abort)
+3. Nếu T1 **commit** → T2 bị **abort** (T1 thắng — first-writer-wins)
+4. Nếu T1 **abort** → T2 được tiếp tục (T1 đã hủy, row trở về trạng thái ban đầu)
+
+```
+Ví dụ: T1 và T2 cùng UPDATE row X (value=100)
+
+Thời điểm    T1 (ts=10)                    T2 (ts=15)                    Row X
+─────────────────────────────────────────────────────────────────────────────────────
+  t₀         BEGIN                                                       V1: value=100
+                                                                         Begin-TS=5, End-TS=∞
+
+  t₁         UPDATE X SET value=200                                      V1: End-TS=T1  (đánh dấu)
+             → Tạo V2                                                    V2: value=200
+                                                                         Begin-TS=T1, End-TS=∞
+
+  t₂                                       BEGIN
+                                            UPDATE X SET value=300
+                                            → Thấy V1.End-TS=T1 (≠ ∞)
+                                            → T1 chưa commit → ⏳ WAIT
+
+  t₃         COMMIT (ts=10)                                             V1: End-TS=10 (finalized)
+                                                                         V2: Begin-TS=10, End-TS=∞
+
+  t₄                                       T1 đã commit → T2 bị ABORT   (First-Writer-Wins)
+                                            ❌ T2 phải retry toàn bộ
+
+─── Kết quả cuối cùng: V2 value=200 (của T1) ───
+```
+
+**Trường hợp T1 abort:**
+
+```
+  t₃'        ABORT                                                       V2 bị xóa
+                                                                         V1: End-TS=∞ (khôi phục)
+
+  t₄'                                      T1 đã abort → T2 được tiếp tục
+                                            UPDATE X SET value=300
+                                            → V1: End-TS=T2
+                                            → V3: value=300
+                                               Begin-TS=T2, End-TS=∞
+
+─── Kết quả cuối cùng: V3 value=300 (của T2) ───
+```
+
+> 📌 **So sánh cách xử lý write-write conflict theo từng DBMS:**
+>
+> | DBMS | Cơ chế |
+> |---|---|
+> | **PostgreSQL** | First-Writer-Wins: T2 chờ T1 → nếu T1 commit thì T2 nhận lỗi `could not serialize access` (ở Repeatable Read) hoặc re-evaluate điều kiện WHERE (ở Read Committed) |
+> | **MySQL InnoDB** | Row-level lock: T2 bị block tại row lock cho đến khi T1 kết thúc. Nếu timeout → deadlock error |
+> | **Oracle** | Row-level lock tương tự MySQL. T2 chờ tại lock, không dùng First-Writer-Wins |
+> | **SQL Server (SI)** | Update conflict detection: Nếu T2 cố commit sau T1 đã commit → T2 abort với `snapshot isolation conflict` |
+
+#### 15.2.7. Version Storage
+
+MVCC tạo version mới mỗi khi UPDATE/DELETE → **lưu các version ở đâu?** Đây là bài toán Version Storage.
+
+Có 3 chiến lược chính:
+
+##### A. Append-Only Storage
+
+Tất cả version (cũ + mới) được lưu **trong cùng 1 table**. Mỗi tuple có pointer trỏ đến version tiếp theo, tạo thành **version chain**.
+
+```
+Main Table (chứa TẤT CẢ versions):
+┌──────────────────────────────────────────────────────┐
+│ V1: value=100, Begin-TS=10, End-TS=20  → next: V2   │
+│ V2: value=200, Begin-TS=20, End-TS=50  → next: V3   │
+│ V3: value=300, Begin-TS=50, End-TS=∞   → next: NULL  │
+│ ... (các tuple khác cũng nằm ở đây)                  │
+└──────────────────────────────────────────────────────┘
+```
+
+**2 cách sắp xếp chain:**
+
+| Approach | Mô tả | Read | Write |
+|---|---|---|---|
+| **Oldest-to-Newest (O2N)** | Head = version cũ nhất, append version mới vào cuối chain | **O(n)** — phải duyệt từ đầu đến cuối để tìm version mới nhất | **O(1)** — chỉ cần append |
+| **Newest-to-Oldest (N2O)** | Head = version mới nhất, version cũ bị đẩy xuống | **O(1)** — head luôn là version mới nhất | **O(1)** — nhưng cần update index pointer về head mới |
+
+> 📌 **PostgreSQL** dùng Append-Only (O2N). Đây **không phải là "tệ"** — nó đơn giản và tránh overhead cập nhật index khi write. Trade-off là cần **VACUUM** thường xuyên để dọn dead tuples tích tụ trong main table (vì version cũ nằm chung table → table bị phình to — gọi là **table bloat**).
+
+##### B. Time-Travel Storage
+
+Version **hiện tại** nằm trong **main table**. Khi có UPDATE, version **cũ** bị copy sang **time-travel table** (bảng lịch sử riêng).
+
+```
+Main Table (chỉ chứa version MỚI NHẤT):
+┌──────────────────────────────────────────┐
+│ Row X: value=300, Begin-TS=50, End-TS=∞  │  ← luôn là version hiện tại
+└──────────────────────────────────────────┘
+        │ pointer
+        ▼
+Time-Travel Table (chứa version CŨ):
+┌──────────────────────────────────────────┐
+│ V2: value=200, Begin-TS=20, End-TS=50    │
+│ V1: value=100, Begin-TS=10, End-TS=20    │
+└──────────────────────────────────────────┘
+```
+
+| Ưu điểm | Nhược điểm |
+|---|---|
+| Main table luôn gọn (chỉ chứa version mới nhất) → scan nhanh | Mỗi UPDATE phải copy **toàn bộ tuple** sang time-travel table (kể cả cột không thay đổi) |
+| Không bị table bloat như Append-Only | Write overhead cao hơn |
+
+##### C. Delta Storage
+
+Chỉ lưu **sự thay đổi** (delta) thay vì copy toàn bộ tuple. Main table chứa version hiện tại, **delta segment** chứa giá trị gốc của các cột bị thay đổi.
+
+```
+Main Table:
+┌──────────────────────────────────────────────────────┐
+│ Row X: name="Bob", age=30, salary=5000               │  ← version hiện tại (đầy đủ)
+└──────────────────────────────────────────────────────┘
+        │ pointer
+        ▼
+Delta Segment:
+┌──────────────────────────────────────────────────────┐
+│ Δ2: salary=4000  (chỉ lưu cột thay đổi, TS=20→50)  │  ← muốn xem V2: apply Δ2
+│ Δ1: salary=3000, age=25  (TS=10→20)                 │  ← muốn xem V1: apply Δ2+Δ1
+└──────────────────────────────────────────────────────┘
+
+Rebuild V2: lấy main → apply Δ2 → salary=4000, name="Bob", age=30
+Rebuild V1: lấy main → apply Δ2 → apply Δ1 → salary=3000, age=25
+```
+
+| Ưu điểm | Nhược điểm |
+|---|---|
+| Tiết kiệm disk nhất — chỉ lưu cột thay đổi | Rebuild version cũ tốn CPU (phải apply nhiều delta) |
+| Write nhanh — chỉ ghi delta nhỏ | Read version cũ = **O(n)** delta applications |
+
+##### So sánh tổng hợp
+
+| | Append-Only | Time-Travel | Delta |
+|---|---|---|---|
+| **Version cũ ở đâu** | Cùng main table | Table riêng | Segment riêng (chỉ delta) |
+| **Disk usage** | Cao (full tuple × n versions) | Trung bình (full tuple copy) | **Thấp nhất** (chỉ lưu thay đổi) |
+| **Write overhead** | Thấp (append) | Cao (full copy) | Thấp (ghi delta nhỏ) |
+| **Read version cũ** | Duyệt chain | Duyệt chain | Apply delta ngược |
+| **Table bloat** | ⚠️ Có (cần VACUUM) | ✅ Không | ✅ Không |
+| **DBMS** | **PostgreSQL** | — | **MySQL InnoDB** (undo log), **Oracle** (undo tablespace) |
+
+**Fact**:
+  - PostgreSQL không support Read Uncommitted — nó tự động nâng lên Read Committed (vì kiến trúc MVCC của PG luôn đọc committed version)
+
+
+#### 15.2.8. Garbage collection
+   - Cẩn remove các physical version không còn được sử dụng hoặc aboort
+   - Approach 1: Tuple level
+      - Background vacumn:
+         - thread định kì quét table và remove các version không còn được sử dụng
+         - Dirty block bitmap: đánh dấu các block chứa version không còn được sử dụng thay vì modify
+       - Cooperative cleaning
+          - Chính các luồng đang thực thi truy vấn (worker threads) sẽ kiêm luôn việc dọn rác. Khi một query duyệt qua một version chain để tìm dữ liệu, nếu nó vô tình phát hiện các phiên bản đã quá cũ (nhỏ hơn Watermark), nó sẽ "tiện tay" cắt bỏ và giải phóng chúng luôn.
+          - Chỉ hoạt động với O2N(Old to new)
+
+   - Approach 2: Transaction level level
