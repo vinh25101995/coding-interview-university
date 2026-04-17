@@ -2532,3 +2532,101 @@ Nghĩa là gì: Khi hệ thống (worker) chạy lệnh SELECT * FROM table WHER
             - Logic thì là Xóa, nhưng thực tế dung lượng Database lại phình to ra (Table Bloat) vì phải chứa thêm hàng loạt bản Tombstone rỗng.
             - Phức tạp hóa luồng dọn dẹp Garbage Collection sau này.
          - **Mẹo tối ưu (Reduce Overhead)**: Thay vì lưu 1 bản ghi Tombstone to, Database có thể (1) thiết kế một khu riêng biệt (Separate Pool) dành cho Tombstone hoặc (2) tận dụng 1 chuỗi bit đặc biệt (special bit pattern) nhúng thẳng vào trong cấu trúc con trỏ (Version Chain Pointer) -> Cực kỳ tiết kiệm dung lượng.
+
+
+### 16. WAL + Shadow Paging
+
+#### 16.1. Buffer Pool Policies
+
+Quản lý Buffer Pool liên quan đến việc quyết định **khi nào** một page dữ liệu bị sửa đổi (dirty page) có thể hoặc bắt buộc phải được đẩy (flush) từ bộ nhớ (RAM) xuống đĩa cứng (Disk).
+
+##### 16.1.1. Steal Policy (Chính sách thay thế)
+Quy định liệu DBMS có thể đẩy (evict) một "dirty page" của một transaction **chưa commit** xuống ổ đĩa để lấy khoảng trống cho page khác hay không.
+- **Steal** (Cho phép): Có thể đẩy dirty page của uncommitted transaction xuống đĩa. Giúp bảo vệ hệ thống không bị tràn bộ nhớ khi transaction sửa quá nhiều dữ liệu. Cách này yêu cầu DBMS phải có khả năng **UNDO** (khôi phục trạng thái cũ) nếu transaction đó bị abort.
+- **No-Steal** (Không cho phép): Phải giữ dirty page trên RAM cho đến khi transaction kết thúc (commit/abort). Không cần UNDO file (chỉ cần xóa dữ liệu trên RAM) nhưng giới hạn dung lượng thay đổi của 1 transaction bằng với kích thước của Buffer Pool.
+
+##### 16.1.2. Force Policy (Chính sách bắt buộc)
+Quy định liệu DBMS có bắt buộc phải đẩy (flush) toàn bộ các dirty page của một transaction xuống đĩa ngay **vào lúc nó commit** hay không.
+- **Force** (Bắt buộc): Mọi thay đổi phải được ghi đầy đủ xuống đĩa trước khi commit thành công. Đảm bảo dữ liệu không bị mất nếu crash (Durability), hệ thống không cần cơ chế **REDO**.
+- **No-Force** (Không bắt buộc): Giao dịch có thể trả về commit thành công ngay cả khi dữ liệu (data pages) vẫn đang nằm trên RAM (chưa ghi xuống đĩa). Giúp tăng hiệu năng đáng kể (giảm thời gian chờ I/O ghi ngẫu nhiên đối với dữ liệu phân mảnh) nhưng buộc hệ thống phải lưu trữ các sự kiện thay đổi vào file log để có thể **REDO** khôi phục nếu xảy ra crash.
+
+**Tổng hợp 4 trường hợp dựa trên Steal/Force Policy:**
+
+| Policy | UNDO | REDO | Đặc điểm |
+|---|---|---|---|
+| **No-Steal + Force** | Không | Không | Phục hồi rất nhanh (không cần log), nhưng hiệu năng rất thấp vì Random I/O nặng nề. (Ví dụ: Shadow Paging) |
+| **Steal + Force** | Có | Không | Ít dùng trong thực tế. |
+| **No-Steal + No-Force** | Không | Có | Transaction bị giới hạn dung lượng thay đổi bởi bộ nhớ RAM. |
+| **Steal + No-Force** | Có | Có | I/O tối ưu nhất, hiệu năng cao nhất nhưng kiến trúc phục hồi phức tạp nhất. Hầu hết các DBMS hiện nay (Hệ thống **ARIES** như PostgreSQL, MySQL, SQL Server) dùng cách này kết hợp với **WAL**. |
+
+---
+
+#### 16.2. Shadow Paging
+
+Dựa trên nguyên tắc thiết kế **No-Steal + Force**. Hầu như tránh được việc phải duy trì các file Log khổng lồ cho việc UNDO/REDO. Phổ biến trong bản thiết kế đời đầu hoặc các db nhúng như (LMDB, SQLite trước đây).
+
+- **Cơ chế hoạt động**:
+  - DBMS quản lý dữ liệu qua một cây (VD: B+Tree Page Table).
+  - Có một **Master Pointer** (Con trỏ gốc) nằm ở vị trí an toàn trên đĩa, luôn trỏ vào Root của cấu trúc Page Table hiện tại (chứa data thật sự đã commit).
+  - Khi transaction cập nhật một page (VD: Leaf node 4), hệ thống **tuyệt đối không ghi đè** lên bản cứng. Thay vào đó, nó thiết lập 1 bản copy của page đó (Shadow Page) ra khoảng trống ổ đĩa và thao tác thay đổi ở đó.
+  - Quá trình này leo dần lên đến Root (Path copying). Tức là bất kỳ node nào trên đường đi từ page thay đổi lên Root cũng sẽ được copy tương ứng.
+  - Khi chuẩn bị **commit**, DBMS chỉ cần tráo đổi cái **Master Pointer** trỏ sang phiên bản Root Copy bằng duy nhất *một thao tác atomic* (Ghi đè 1 giá trị pointer). Sau lúc này, toàn bộ nhánh con mới sẽ trở thành data chính thức, các phiên bản page cũ coi như mồ côi (chờ dọn dẹp).
+- **Ưu điểm**:
+  - Khôi phục (Recovery) cực nhanh, gần như tức thì sau Crash. Không cần Undo hay Redo Log. Quá trình chỉ dừng ở nhánh trỏ chưa hoàn thiện do Master Pointer vẫn nằm y nguyên ở cây đời trước.
+- **Nhược điểm (Overhead cực kì đắt):**
+  - **Overhead bộ nhớ Copy**: Chỉ thay đổi 1 ô dữ liệu trong Page, nhưng hệ thống phải bê toàn bộ Page cùng với 1 mớ Tree-path cồng kềnh tạo bản sao.
+  - **Phân mảnh dữ liệu disk (Data fragmentation)**: Vì thay đổi vị trí Page liên tục lên bộ phận trống trên đĩa, nên vị trí chuỗi logic hoàn toàn nát bét về mặt vật lý -> Làm hẹp trầm trọng khả năng đọc Sequence Scans.
+  - **Tốn chu kỳ Garbage collection** lượm lặt các rác do page cũ đào thải ra.
+  - Thường cực kỳ khó code Concurrency Control hiệu quả.
+
+---
+
+#### 16.3. WAL (Write-Ahead Logging)
+
+Là giải pháp tiêu chuẩn phục vụ cho kiến trúc **Steal + No-Force**. Do DBMS có quyền ghi dở dang uncommitted data xuống đĩa (Steal) hoặc giữ Committed data trên bộ nhớ (No-Force), máy tính bắt buộc phải đẻ ra file Log ghi lại dấu vết để **UNDO** (khi bị abort) và **REDO** (khi bị mất điện crash lúc chưa kịp ghi xuống disk).
+
+**A. Nguyên tắc vàng của WAL (Theo thuật toán chuẩn ARIES):**
+1. Trước khi hệ thống phát hỏa tự động đẩy (flush) 1 dirty page xuống ổ đĩa, toàn bộ "Log Entry" mô tả về sự thay đổi của page này **PHẢI ĐƯỢC ÉP FLUSH** ghi xuống đĩa log trước tiên. (Quy định này để bảo đảm có tài liệu mà UNDO cho trò Steal page).
+2. Một transaction chỉ được chốt lại đóng hồ sơ (return success cho Client) mốc "Commit" khi mà bản **Log Record** của nó (Chứa thông báo trạng thái commit) đã an toàn ghi xong vào disk log. (Quy định để đảm bảo thao tác REDO cho trò No-Force page). Lợi thế là lưu Log là thao tác Sequential I/O rất mượt.
+
+**B. Tối ưu hoá I/O với Group Commit (Cơ chế gộp nhóm)**
+- **Vấn đề**: Mặc dù ghi file log là thao tác ghi tuyến tính tuần tự (Sequential I/O) cực nhanh, nhưng lệnh `fsync()` (tính năng ép hệ điều hành ghi trực tiếp từ cache xuống vật lý đĩa cứng) được gọi mỗi khi transaction báo commit lại có độ trễ lớn. Nếu 10,000 transaction cùng commit độc lập sẽ phát sinh tới 10,000 System Calls `fsync()` gây tắc nghẽn tài nguyên đĩa.
+- **Giải pháp**: DBMS sẽ tự động làm chậm quy trình commit của từng transaction lại một chút xíu (chỉ khoảng vài mili-giây). Trong thời gian "chờ đợi nén" này, nó gom góp các transaction khác cùng lọt vào thời điểm commit để rồi **thực hiện `fsync()` ghi gộp toàn bộ block log của chúng vào disk trong đúng 1 lần I/O System Call duy nhất**.
+- **Hiệu quả**: Loại bỏ triệt để số lượng System Calls bùng nổ, tăng trưởng thông lượng ghi đĩa (throughput) lên theo cấp số nhân đối với hệ thống áp lực cao (hàng ngàn lượt connection cùng thao tác trên giây).
+
+**C. Cấp độ cấu trúc Log (Logging Schemes):**
+
+*(Kịch bản: Bảng T, hiện tại số dư $X=1$. Transaction yêu cầu lệnh cập nhật `X = X + 1`; $X nằm ở Slot 1 trên Page 99)*
+
+1. **Physical Logging (Vật lý 100% - Before/After Image)**
+   - Lưu trữ chính xác giá trị byte bit của "trước" và "sau" tại vị trí khối block/vật lý ổ đĩa đó.
+   ```text
+   <T1, Table=T, Page=99, Offset=1024, Before_bytes=001, After_bytes=002>
+   ```
+   - **Ưu điểm**: Đơn giản nhất, cực kỳ deterministic (cứ bôi đúng vị trí offset lên là phục hồi xong nên an toàn và đáng tin cậy).
+   - **Nhược điểm**: Kích thước log phình to lố bịch. Nếu một query Update thay làm đổi lệch 1 tỷ record, hệ thống phải sinh ra hơn 1 tỉ mục ghi Physical khổng lồ.
+
+2. **Logical Logging (Logic 100%)**
+   - Không lưu vào disk vị trí mà chỉ gom giữ rặt cú pháp mệnh lệnh truy vấn nghiệp vụ cấp cao.
+   ```text
+   <T1, UPDATE T SET X = X + 1 WHERE ...>
+   ```
+   - **Ưu điểm**: Kích cỡ Log file siêu siêu nhỏ. Cực kỳ tối giản.
+   - **Nhược điểm**: Rất vất vả trong tính huống Crash-Recovery để lập lại môi trường. Đặc biệt tiềm tàng tai họa lớn với hàm tính **non-deterministic (chức năng linh động theo tự nhiên)** (Ví dụ `UPDATE SET timeout_date = NOW()`). Nếu 1 tháng sau ta khôi phục chạy REDO qua file log, biểu thức ảo NOW() sẽ biến chất, lấp giá trị sai thực tiễn chứ không lưu trữ lại dữ liệu timestamp chính xác.
+
+3. **Physiological Logging (Lai tạo tinh giảm - Chuẩn phổ thông)**
+   - *"Physical-to-a-page, logical-within-a-page"*. Lai ghép cả 2 bộ môn trên nhằm hớt ưu điểm (Database System R đi đầu rèn giũa và nay phổ biến đến 90% Relational DBMS).
+   - File log chỉ trỏ cố định tọa độ tìm vào con Page cụ thể (Bản đồ vật lý), rồi ở lớp bên trong thay vì đếm bít nó sẽ gọi chuỗi lệnh (Slot mapping / logic).
+   ```text
+   <T1, Table=T, Page=99, Slot=1, Execute_logic: X_plus_1>
+   <T1, Index=X_PKEY, IndexPage=45, Key(1, Record_1)>
+   ```
+   - **Lợi ích ưu việt**: Log size thu nhỏ xuống cực kì nhiều, và không bị vướng mắc rủi ro giá trị trôi nổi do đã khoanh vị trí rành kẹp cứng Page Slot mà truyền thông điệp hẹp.
+
+**D. Cơ chế REDO & Checkpoint**
+Việc Log liên tục cho phép khôi phục nguyên vẹn, tuy nhiên nếu dồn log từ ngày lập quốc đến hiện tại, khi ứng dụng rớt mạng sẽ mất hàng kỷ nguyên để chiếu lại toàn thể quá trình REDO. Phương án cắt giảm tốt nhất là ứng dụng **Checkpoint** khoép chặng:
+- **Khi Checkpoint chạy qua (Save)**: 
+  - (Theo chu kỳ hoặc dung lượng cấu hình) Hệ quản trị DBMS block hãm các tác vụ lại, tiến hành ép các log WAL chưa ghi và đặc biệt tống hết sạch sẽ các bộ **Dirty Pages** nằm trên RAM dán cứng ngắc vào đĩa.
+  - Ghi 1 cờ Log `Checkpoint` báo chốt để làm chứng thư mốc dữ liệu tin cậy. (Các giao dịch trước điểm mốc được hạch toán đồng bộ hóa lên đĩa an toàn vĩnh cửu).
+- **Khi Crash (Khôi phục)**: 
+  - Hệ quản trị DBMS khởi động vòng máy, đảo ngược dò log để khui ra cờ `checkpoint` có giá trị gần nhất. Toàn bộ sớ log sinh trước mốc đó được ném vô kho (bỏ qua do dirty tablespace đã hòa vô Disk an toàn). Chỉ chạy replay khôi phục quy trình log tồn lại sau Checkpoint đó. Bộ máy vận hành bình thường! 
