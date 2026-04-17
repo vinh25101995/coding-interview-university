@@ -2479,4 +2479,56 @@ Rebuild V1: lấy main → apply Δ2 → apply Δ1 → salary=3000, age=25
           - Chính các luồng đang thực thi truy vấn (worker threads) sẽ kiêm luôn việc dọn rác. Khi một query duyệt qua một version chain để tìm dữ liệu, nếu nó vô tình phát hiện các phiên bản đã quá cũ (nhỏ hơn Watermark), nó sẽ "tiện tay" cắt bỏ và giải phóng chúng luôn.
           - Chỉ hoạt động với O2N(Old to new)
 
-   - Approach 2: Transaction level level
+   - Approach 2: Transaction level GC
+      - Transaction dọn dẹp các version cũ của chính nó sau khi commit
+
+
+#### 15.2.9. Index Management (Trong kiến trúc MVCC)
+
+- **Primary index luôn trỏ tới head of version**:
+  - Khi một bản ghi bị update nhiều lần, nó tạo thành một chuỗi các phiên bản (version chain).
+  - Khóa chính (Primary Index) thường chỉ trỏ duy nhất một lần đến điểm bắt đầu của chuỗi này (Head of Version Chain). 
+
+- **Secondary index cần phải update khi có version mới**:
+  - Khi có bản ghi mới sinh ra do update (vị trí vật lý lưu đổi), các index phụ (Secondary Index) trỏ tới nó theo 2 cách:
+    - **Trỏ tới Logical pointer (Con trỏ logic)**: Secondary Index trỏ đến Primary Key. Khi sinh ra version mới, chỉ Primary Index thay đổi, không cần update lại lượng lớn Secondary Index (Write nhanh). Nhược điểm là tốn thêm 1 bước tra ngược lại về Primary Key (Read chậm thêm 1 chút). *Đại diện: MySQL (InnoDB)*.
+    - **Trỏ tới Physical pointer (Con trỏ vật lý)**: Secondary Index trỏ trực tiếp đến địa chỉ ổ cứng thật (Page ID + Tuple ID). Ưu điểm tra phát ra luôn bản ghi (Read rất nhanh). Nhược điểm là tốn chi phí WRITE nặng: bất kỳ update nào dời vị trí vật lý thì tất cả các Secondary Index hướng đến nó đều phải update lại con trỏ.
+
+- **Phần lớn các dbms không lưu thông tin version của tuple trong keys**:
+  - Thường các thẻ (entry) trong B+Tree Index không nhúng timestamp/version id vào khóa mà chỉ có giá trị và con trỏ. Việc giải quyết xem hiển thị cho transaction nào hoàn toàn dựa vào timestamp lưu dưới Tuple data.
+  - **PostgreSQL là ngoại lệ?** Đúng vậy. Do kiến trúc thiết kế **Append-only storage** (Tất cả version đều được lưu trên cùng một table/Heap space hệt như một row độc lập). Mỗi version là 1 bản ghi có vị trí địa vật lý riêng (CTID) nên PostgreSQL bắt buộc phải ghi trực tiếp số lượng lớn con trỏ vật lý xuống TỪNG VERSION MỘT (chứ không chỉ trỏ Head). Việc này dẫn hệ lụy **Index Bloat** (Index phình to theo thời gian vì chứa quá nhiều con trỏ mồ côi).
+
+- **Support duplicate keys from difference snapshot**:
+  - Ở bề mặt Logic: `UNIQUE INDEX` hoặc `PRIMARY KEY` nghiêm cấm trùng lặp. Tuy nhiên, dưới cấu trúc vật lý của Index (trong MVCC) các DBMS phải thiết kế để support chứa nhiều keys có hệ thống giá trị giống hệt nhau.
+  - Mục đích: Cùng 1 giá trị key nhưng trỏ tới luồng logical tuples theo các thời gian/snapshot độc lập. Ví dụ T1 xóa khóa `A` (nhưng chưa commit), T2 thực hiện chèn khóa `A`. Ở hạ tầng vật lý Index vẫn ghi danh sách Duplicate Key là cả hai chữ `A` này, lớp kiểm soát Constraints sẽ đứng ra ngăn chặn ở trên không để End User nhận các hiển thị sai lệnh.
+  - Vì cấu trúc vật lý ở bước 1 cho phép lưu trùng lặp, nên bản thân cấu trúc này không thể tự động ngăn chặn việc người dùng cố tình chèn 2 khóa chính giống nhau. Database phải tự làm điều này bằng code (logic thực thi bổ sung).
+
+   - Cách hoạt động (Nguyên tử - Atomic): Khi có lệnh INSERT, database không chèn thẳng vào ngay. Nó phải thực hiện một thao tác gộp không thể bị ngắt quãng (atomic): "Tìm xem khóa này đã có phiên bản nào đang active chưa -> Nếu chưa có thì chèn vào". Việc này phải làm nguyên tử để ngăn chặn trường hợp (Race Condition) khi 2 người dùng cùng lúc chèn cùng một ID.
+
+   - Các worker (luồng xử lý) có thể nhận về nhiều kết quả cho một lần lấy dữ liệu. Sau đó, họ phải đi theo các con trỏ để tìm ra phiên bản vật lý chính xác).
+
+Nghĩa là gì: Khi hệ thống (worker) chạy lệnh SELECT * FROM table WHERE id = 5, truy vấn này đi vào index và có thể nhận về nhiều con trỏ (pointers) khác nhau (vì như ở ý 1, đang có 3 phiên bản của id = 5).
+
+#### 15.2.10. MVCC Deletes
+   - DBMS chỉ deletes 1 tuples khi toàn bộ các version logical của nó not visible
+      - Nếu 1 tuple đã bị xóa, không thể có 1 version mới được sinh ra từ nó
+      - No write-write conflics, first wrtiter win
+   - Cần 1 phương án để đánh dấu version đã bị xóa (Có 2 cơ chế chính):
+      - **Phương án 1: Delete flag (Sử dụng cờ đánh dấu)**
+         - **Cách làm**: Sửa trực tiếp version hiện tại bằng cách bật cờ (flag) ở khu vực Header hoặc ở một cột hệ thống riêng để báo rằng "Row này đã bị xóa". (Thường là đánh dấu `End-TS = mã_txn_hiện_tại`).
+         - **Ưu điểm**:
+            - Tiết kiệm dung lượng (không sinh ra bản ghi mới nào trên ổ cứng).
+            - Thu dọn rác (Garbage Collection - GC) dọn dẹp rất nhanh và gọn gàng.
+         - **Nhược điểm**:
+            - Vi phạm nguyên lý "không ghi đè" (Immutable/Append-only) vì phải update trực tiếp vào dữ liệu cũ trên disk (In-place update).
+            - Việc In-place update gây ra Random I/O Write và làm hỏng Cache của database block, đồng thời cần Latch/Lock tinh vi để xử lý xung đột.
+            
+      - **Phương án 2: Tombstone tuple (Tạo bản ghi giả "Bia mộ")**
+         - **Cách làm**: Hoạt động hệt như lệnh UPDATE. Tạo 1 version rỗng (empty version) chèn thêm vào hệ thống. Các Transaction đi sau dọc theo Version Chain đụng phải cái Tombstone này thì biết data logic đã bị xóa.
+         - **Ưu điểm**:
+            - Việc xóa dữ liệu biến thành việc ghi nối thêm (Append/Insert mới). Bản ghi gốc hoàn toàn không bị đụng vào, đảm bảo thông lượng ổ đĩa cực tốt (Sequential Write).
+            - Tái sử dụng được sơ đồ kiến trúc code của luồng UPDATE.
+         - **Nhược điểm**:
+            - Logic thì là Xóa, nhưng thực tế dung lượng Database lại phình to ra (Table Bloat) vì phải chứa thêm hàng loạt bản Tombstone rỗng.
+            - Phức tạp hóa luồng dọn dẹp Garbage Collection sau này.
+         - **Mẹo tối ưu (Reduce Overhead)**: Thay vì lưu 1 bản ghi Tombstone to, Database có thể (1) thiết kế một khu riêng biệt (Separate Pool) dành cho Tombstone hoặc (2) tận dụng 1 chuỗi bit đặc biệt (special bit pattern) nhúng thẳng vào trong cấu trúc con trỏ (Version Chain Pointer) -> Cực kỳ tiết kiệm dung lượng.
