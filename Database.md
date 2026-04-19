@@ -1,4 +1,4 @@
-### 6. Column-Oriented Storage
+﻿### 6. Column-Oriented Storage
 
 #### 6.1 Các dạng Storage
 
@@ -2587,7 +2587,7 @@ Là giải pháp tiêu chuẩn phục vụ cho kiến trúc **Steal + No-Force**
 
 **A. Nguyên tắc vàng của WAL (Theo thuật toán chuẩn ARIES):**
 1. Trước khi hệ thống phát hỏa tự động đẩy (flush) 1 dirty page xuống ổ đĩa, toàn bộ "Log Entry" mô tả về sự thay đổi của page này **PHẢI ĐƯỢC ÉP FLUSH** ghi xuống đĩa log trước tiên. (Quy định này để bảo đảm có tài liệu mà UNDO cho trò Steal page).
-2. Một transaction chỉ được chốt lại đóng hồ sơ (return success cho Client) mốc "Commit" khi mà bản **Log Record** của nó (Chứa thông báo trạng thái commit) đã an toàn ghi xong vào disk log. (Quy định để đảm bảo thao tác REDO cho trò No-Force page). Lợi thế là lưu Log là thao tác Sequential I/O rất mượt.
+2. Một transaction chỉ được chốt lại đóng hồ sơ (return success cho Client) mốc "Commit" khi mà bản **Log Record** của nó (Chứa thông báo trạng thái commit) đã an toàn ghi xong vào disk log. (Quy định để đảm bảo thao tác REDO cho trò No-Force page). Lợi thế là lưu Log là thao tác Sequential I/O rất mượt.   
 
 **B. Tối ưu hoá I/O với Group Commit (Cơ chế gộp nhóm)**
 - **Vấn đề**: Mặc dù ghi file log là thao tác ghi tuyến tính tuần tự (Sequential I/O) cực nhanh, nhưng lệnh `fsync()` (tính năng ép hệ điều hành ghi trực tiếp từ cache xuống vật lý đĩa cứng) được gọi mỗi khi transaction báo commit lại có độ trễ lớn. Nếu 10,000 transaction cùng commit độc lập sẽ phát sinh tới 10,000 System Calls `fsync()` gây tắc nghẽn tài nguyên đĩa.
@@ -2623,6 +2623,11 @@ Là giải pháp tiêu chuẩn phục vụ cho kiến trúc **Steal + No-Force**
    ```
    - **Lợi ích ưu việt**: Log size thu nhỏ xuống cực kì nhiều, và không bị vướng mắc rủi ro giá trị trôi nổi do đã khoanh vị trí rành kẹp cứng Page Slot mà truyền thông điệp hẹp.
 
+**[Thảo luận mở rộng] Câu hỏi: Nếu dùng chính sách STEAL, một Dirty Page chứa data của Transaction CHƯA COMMIT có thể bị đẩy thẳng xuống đĩa (flush). Vậy làm sao để một User khác tình cờ truy cập không bị đọc nhầm cái dirty data (data rác) đó?**
+- **Trả lời:** Việc cho phép đẩy data (RAM/Disk) là quyền quyết định của **Buffer Manager**. Còn việc "Bảo vệ User tránh đọc phải rác" là nhiệm vụ của **Concurrency Control (Trình kiểm soát đồng thời)**. Hai bên phối hợp như sau:
+    1. **Nếu dùng Lock (Strict 2PL)**: Dù data có in hằn xuống đĩa thành bản vật lý, Transaction T1 vẫn đang nắm cục **Exclusive Lock (Write Lock)** của record đó. User 2 nhảy vào đòi truy vấn sẽ đập ngay vào rào chắn Lock, buộc phải đứng đợi tới khi T1 chốt xong (nhả Lock). Do đó, KHÔNG CÓ CƠ HỘI cho User 2 đọc trộm rác.
+    2. **Nếu dùng MVCC (Postgres/MySQL)**: Bản data ghi xuống đĩa có dập luôn con dấu `Begin-TS = TxnId_T1` vào vùng Header. Khi User 2 lục Disk lôi Record này lên bèn thấy dấu tay của T1, hệ thống giám sát báo "T1 vẫn đang Active (Chưa commit) đấy!". Ngay lập tức User 2 chối bỏ mẩu Record đỏ hỏn đó (xem như tàng hình) và tự động lội xuống kho lưu trữ phiên bản cũ (Undo Log) để kiếm cái snapshot hợp lệ trước đó mà đọc.
+
 **D. Cơ chế REDO & Checkpoint**
 Việc Log liên tục cho phép khôi phục nguyên vẹn, tuy nhiên nếu dồn log từ ngày lập quốc đến hiện tại, khi ứng dụng rớt mạng sẽ mất hàng kỷ nguyên để chiếu lại toàn thể quá trình REDO. Phương án cắt giảm tốt nhất là ứng dụng **Checkpoint** khoép chặng:
 - **Khi Checkpoint chạy qua (Save)**: 
@@ -2630,3 +2635,100 @@ Việc Log liên tục cho phép khôi phục nguyên vẹn, tuy nhiên nếu d�
   - Ghi 1 cờ Log `Checkpoint` báo chốt để làm chứng thư mốc dữ liệu tin cậy. (Các giao dịch trước điểm mốc được hạch toán đồng bộ hóa lên đĩa an toàn vĩnh cửu).
 - **Khi Crash (Khôi phục)**: 
   - Hệ quản trị DBMS khởi động vòng máy, đảo ngược dò log để khui ra cờ `checkpoint` có giá trị gần nhất. Toàn bộ sớ log sinh trước mốc đó được ném vô kho (bỏ qua do dirty tablespace đã hòa vô Disk an toàn). Chỉ chạy replay khôi phục quy trình log tồn lại sau Checkpoint đó. Bộ máy vận hành bình thường! 
+
+
+### 17. Database crash recovery
+- Cần đánh dấu điểm cuối trong WAL để biết điểm bứt đầu --> Tất cả các log đềi có 1 unige log -> log sequence number(LSN)
+   - Unique và tăng dần
+   - Mỗi page đều có pageLSN(most recent log record that update this page)
+   - FlushedLSN: LSN max đã được flush
+   - Trước khi page được write: pageLSN <= flushed lsn? Why -> flushed là đã đc flused, update thì có thể chưa flushed mà??? -> Vì nó là log của WAL ko phải của TXN -> Lớn hơn
+   - Trong bài giảng, chúng ta giả định như sau
+     - Kích thước tất cả log record feed trong 1 single page
+     - Thao tác ghi định kỳ vào page là 1 thao tác atomic
+     - Chỉ 1 version tuple với Strong strich 2 PL
+     - Steal/No-Force với WAL
+     - Physical log record schema
+     - Bỏ qua log cho index
+
+     - Khi commit thành công ghi thêm 1 TXN-END để đánh dấu sẽ không còn thao tác nào của TXN này nữa
+     - Không cần flush log này do trong WAL đã có log commit(mang ý nghĩa với application hơn là tính toàn vẹn ở vật lý)
+     - Khi abort (Rollback):
+        - Cần undo lại: Lưu thêm `prevLSN` của txn, hoạt động như 1 linked list ngược để truy xuất lùi lại và undo dễ dàng.
+        - **CLR (Compensation Log Record):**
+           - Khi tiến hành UNDO một thao tác, bản thân việc UNDO cũng làm thay đổi data trên Disk/RAM, do đó **nó bắt buộc cũng phải sinh ra một Log record**. Các log sinh ra trong quá trình UNDO này chính là **CLR**.
+           - **Cấu trúc cực đỉnh của CLR**: Ngoài việc ghi nhận sự thay đổi, CLR có một con trỏ vô cùng quan trọng trỏ lùi đánh dấu: `UndoNextLSN` (Nó trỏ thẳng đến `prevLSN` của cái original log vừa bị undo - tức là chỉ đích danh hành động tiếp theo trong chuỗi cần phải undo).
+           - **Mục đích của CLR**: Đảm bảo toàn bộ quy trình UNDO **không bao giờ bị lặp lại**. Nếu đang undo lỡ dở mà server bị crash, khi khởi động lại, thuật toán Recovery đọc thấy CLR thì nó sẽ túm lấy `UndoNextLSN` để undo tiếp các bước bị bỏ dở, né tránh 100% việc undo lại những thao tác đã được undo trước khi crash. (Vì thao tác UNDO không phải lúc nào cũng idempotent, chạy lại nhiều lần dễ rách việc).
+           - *Ví dụ minh họa luồng ghi của Abort (từ hình ảnh minh họa)*:
+              - LSN `002`: UPDATE A (30->40). (Bản ghi được ghi nhớ `prevLSN=001`)
+              - LSN `003`: UPDATE B (10->24). (Bản ghi được ghi nhớ `prevLSN=002`)
+              - LSN `011`: TXN ABORT (Phát lệnh đập bỏ).
+              - LSN `026`: Thực thi Undo cho LSN 003 -> Bản ghi `CLR-003` sinh ra: Đảo ngược lại cập nhật B (24->10). Lúc này cái `UndoNextLSN` chỉ đến `002` (Ra hiệu hệ thống hãy lui về undo tiếp cái 002 kìa).
+              - LSN `027`: Thực thi Undo cho LSN 002 -> Bản ghi `CLR-002` sinh ra: Đảo ngược cập nhật A (40->30). Lúc này `UndoNextLSN` lại tiếp tục lui về `001` (Chính là điểm BEGIN).
+              - LSN `028`: TXN-END (Chính thức khép lại Transaction sau khi Undo chuỗi thành công rực rỡ).
+        - **Giải đáp: Vì sao cần Hold Lock (Strict 2PL) trong suốt toàn bộ quá trình Rollback?**
+           - Giả sử transaction bị Abort và hệ thống đang lùi lại gọi hàng loạt thao tác UNDO để dọn dẹp, dữ liệu lúc này đang trong tình trạng "ngổn ngang công trường" (nửa thành nửa bại, đang gỡ từng món).
+           - Nếu ta Release Lock cho nó ngay khi vừa phát lệnh Abort: Một Transaction phá bĩnh khác (T2) sẽ lợi dụng nhảy vào đọc hoặc sửa đúng cái dòng đang được khôi phục. -> Dẫn đến hệ luỵ T2 đọc phải cấu trúc rác bầy hầy (Dirty Read) hoặc T2 update xong thì lệnh UNDO chậm trễ của T1 quét qua chép đè luôn thao tác của T2 bẹp dúm (Lost Update).
+           - **Do đó**: Strict 2PL dùng thiết quân luật với Exclusive Lock (Write-Lock), chỉ được nhả còng ra **SAU KHI** Transaction chính thức chấm dứt (Ghi xong dòng `TXN-END` ở LSN 028). Lúc ấy data đã được Restore nguyên vẹn 100%, an toàn cho bá tánh đi qua.
+
+#### 17.2. Fuzy checkpoint
+   - Thay vì block toàn bộ transaction, ta lưu điểm bắt đầu và điểm kết thúc của checkpoint
+   - ATT và PTT: 
+     - ATT(Active Transaction Table): Lưu thông tin transaction hiện tại: R(running), C: Commit, A: Abort
+     - DPT(Dirty page table): Lưu thông tin dirty page
+        - recLSN: Lưu thông tin LSN cũ nhất đã modified page từ thời điểm lần cuối page được write xuống disk
+            - Khác với pageLSN ở chỗ pageLSN là LSN của log record update page, còn recLSN là LSN của log record update page từ thời điểm lần cuối page được write xuống disk
+            - Cung cấp thông tin tại thời điểm bắt đầu và kết thúc của checkpoint
+   - Checkpoint đang lưu các thông tin gì:
+    - Dirty page table
+    - Active transaction table
+    
+#### 17.3. ARIES: Recovery phase
+ARIES thực hiện khôi phục hệ thống qua **3 pha tuần tự (3-Phase Recovery)**:
+
+##### 1. Analysis Phase (Pha phân tích)
+- **Mục đích**: Đọc WAL để tái tạo lại trạng thái của **Active Transaction Table (ATT)** và **Dirty Page Table (DPT)** giống hệt như khoảnh khắc ngay trước khi crash.
+- **Cách thực hiện**: Quét WAL log tiến lên (forward) bắt đầu từ checkpoint thành công cuối cùng (Nếu là Fuzzy Checkpoint, sẽ bắt đầu từ log `CHECKPOINT-BEGIN`).
+- **Cập nhật ATT (Quản lý các Transaction)**:
+   - Gặp log mới của TXN chưa có trong ATT: Thêm vào ATT với status là `U` (Undo - Mặc định cho rằng chưa hoàn thành).
+   - Gặp log `COMMIT`: Chuyển status của TXN trong ATT thành `C` (Commit).
+   - Gặp log `TXN-END`: TXN đã hoàn thành trọn vẹn, xóa nó khỏi ATT.
+- **Cập nhật DPT (Quản lý các Dirty Page)**:
+   - Nếu gặp một log thay đổi dữ liệu (Update) tác động lên một page X:
+      - Nếu X chưa có trong DPT $\rightarrow$ Thêm X vào DPT. Đồng thời gán `recLSN` (Recovery LSN) của page X bằng đúng `LSN` hiện tại của log này.
+- **Kết quả sau Pha 1**:
+   - **ATT**: Chứa danh sách các TXN đang active ngay lúc rớt mạng. Những TXN mang status `U` sẽ bị hoàn tác ở pha 3.
+   - **DPT**: Chứa các page "có nguy cơ" là dirty.
+
+##### 2. Redo Phase (Pha làm lại - Repeating History)
+- **Mục tiêu**: Vạch lại bánh xe lịch sử. Khôi phục (Redo) lại **TẤT CẢ các thao tác**, bao gồm của CẢ giao dịch đã commit LẪN chưa commit để đồng bộ trạng thái Disk khớp 100% với WAL.
+- **Cách thực hiện**: Bắt đầu quét tiến lên (forward) xuất phát từ vị trí có `recLSN` thấp nhất trong bản DPT tìm được ở pha 1 (đây là vị trí xa nhất trong quá khứ mà 1 page chưa được flush an toàn xuống ổ).
+- Khi gặp một Update Record, ta sẽ thực hiện bốc page trên ổ cứng lên để làm lại (Redo), **NGOẠI TRỪ** 3 trường hợp chứng minh page đã an toàn:
+   1. Page không có tên trong DPT (Do Checkpoint đã flush rảnh rang từ trước).
+   2. Page có trong DPT nhưng `recLSN` của nó lại LỚN HƠN mốc `LSN` của bản log này.
+   3. Bốc page lên soi Header thấy `pageLSN >= log_LSN` (Chứng tỏ bản trên đĩa đang xài data đời mới hơn log này).
+- Nếu không thuộc 3 điều trên: Thực thi thay đổi xuống data, cập nhật `pageLSN = log_LSN`.
+
+##### 3. Undo Phase (Pha hoàn tác)
+- **Mục tiêu**: Xóa sổ mọi tàn tích của các transaction CHƯA HOÀN TẤT (Các TXN có status `U` nằm rải rác trong ATT sau Pha 1).
+- **Cách thực hiện**:
+   - Duyệt ngược WAL từ dưới lên trên (Backward) dựa vào sợi xích `prevLSN`.
+   - Với mỗi thao tác tìm được, ta tiến hành thao tác ngược chiều để hủy nó.
+   - **QUAN TRỌNG - Sinh log CLR**: Mỗi khi dọn dẹp thành công một bước, ARIES sẽ nhả ra một bản log **CLR (Compensation Log Record)** đánh dấu "tôi đã undo xong thao tác cũ này bằng hành động kia". CLR có con trỏ `UndoNextLSN` chỉ điểm lùi tiếp về thao tác cần dọn sau đó.
+   - Nhờ CLR, nếu phần mềm dọn dẹp bị crash giữa chừng, quá trình Recovery bật lại sẽ nương vào `UndoNextLSN` của CLR để biết tiến độ, không bao giờ rơi vào bẫy lặp lại việc undo vô hạn.
+   - Diệt cỏ tận gốc về đến LSN đầu tiên (`BEGIN`) của TXN -> Ghi log `TXN-END` chốt hạ -> Xóa sổ TXN khỏi ATT. Quy trình ARIES Recovery hoàn tất.
+
+
+
+### 18. Distributed database
+#### 18.1. System architecture
+- Share everything: 
+- Share nothing: 
+   - Mỗi node có cpu, memory, disk riêng
+   - Better performance và effieciency
+   - Khó mở rộng và đảm bảo tính nhất quán
+   - Phần lớn các hệ thống hiện tại đều sử dụng hệ thống này
+   - Ví dụ: 
+      - 
+- Share disk: 
+- Share memory(No one do this)
