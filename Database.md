@@ -2729,6 +2729,352 @@ ARIES thực hiện khôi phục hệ thống qua **3 pha tuần tự (3-Phase R
    - Khó mở rộng và đảm bảo tính nhất quán
    - Phần lớn các hệ thống hiện tại đều sử dụng hệ thống này
    - Ví dụ: 
-      - 
+      - Khi add thêm 1 node vào, cần rebalance lại data
 - Share disk: 
+   - Đơn giản trong query select
+   - Khi update cần cơ chế notify tới các node khác về thay đổi
 - Share memory(No one do this)
+
+#### 18.2. Distributed query
+##### A. Push query to data
+- Gửi query hoặc 1 phần của query tới node chứa data
+- Thực thi càng nhiều query và process nhất có thể khi data còn ở node đó
+- **Ưu điểm**: Giảm thiểu data di chuyển giữa các node qua mạng (network I/O). Kết quả trả về nhỏ gọn (đã được filter/aggregate sẵn).
+- **Nhược điểm**: Node chứa data cần có đủ CPU/RAM để xử lý query. Nếu data skew (1 node chứa quá nhiều data so với các node khác), node đó trở thành bottleneck. Không phù hợp với các phép tính phức tạp cần dữ liệu từ nhiều node cùng lúc (cross-partition JOIN).
+- **Ví dụ**:
+  - Truy vấn `SELECT SUM(salary) FROM employees WHERE department = 'IT'`. Thay vì kéo toàn bộ bảng `employees` về master node, truy vấn được đẩy tới các worker node. Mỗi worker tự lọc nhân sự phòng 'IT', tính tổng lương cục bộ, rồi chỉ trả về 1 con số tổng cho master node. Master cộng các kết quả lại → chỉ vài con số nhỏ đi qua mạng thay vì hàng nghìn dòng dữ liệu.
+
+##### B. Pull data to query
+- Gửi data tới node thực thi query (kéo dữ liệu về nơi tính toán)
+- Cần thiết khi không còn resource tính toán tại node chứa data hoặc bản chất phép tính phức tạp khó chia nhỏ.
+- **Ưu điểm**: Xử lý được các phép tính phức tạp cần dữ liệu từ nhiều nguồn (cross-partition JOIN, ML training). Tập trung tài nguyên tính toán mạnh tại 1 node chuyên biệt.
+- **Nhược điểm**: Tốn bandwidth mạng lớn, tăng latency. Có thể gây nghẽn mạng (network congestion) khi data volume cao. Node thực thi query cần đủ bộ nhớ để chứa toàn bộ dữ liệu kéo về.
+- **Ví dụ**:
+  - Truy vấn `SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id` — nếu `orders` và `customers` nằm ở node khác nhau và không partition theo `customer_id`, node thực thi JOIN phải kéo data từ cả 2 node về vì dữ liệu cục bộ không đủ thông tin để thực hiện phép JOIN. Tương tự với các phép tính ML phức tạp cần toàn bộ dataset tập trung tại 1 nơi.
+
+##### C. So sánh và Hybrid Approach
+
+| | Push query to data | Pull data to query |
+|---|---|---|
+| **Network I/O** | Thấp (chỉ gửi kết quả) | Cao (gửi raw data) |
+| **Yêu cầu CPU tại data node** | Cao | Thấp |
+| **Phù hợp với** | Filter, Aggregation, simple query | Complex JOIN, ML, cross-partition query |
+| **Ví dụ DBMS** | CockroachDB, TiDB | Spark SQL (shuffle phase) |
+
+> 📌 **Thực tế**: Hầu hết các hệ thống distributed database sử dụng **Hybrid approach** — push được phần nào thì push (filter, partial aggregation tại data node), phần nào buộc phải pull thì pull (cross-node JOIN, final aggregation). Ví dụ: Spark SQL thực hiện predicate pushdown (đẩy điều kiện WHERE xuống data source) nhưng vẫn phải shuffle data giữa các node khi thực hiện JOIN hoặc GROUP BY trên key khác partition key.
+
+
+#### 18.3. Database partitioning
+- **Split database vào multi resource**:
+   - Chia sẻ tải trên nhiều phần cứng: Disk, CPU, RAM.
+   - **Physical partitioning** (Phân mảnh vật lý) và **Logical partitioning** (Phân mảnh logic):
+      - Ví dụ: Kiến trúc **Shared nothing** $\rightarrow$ Thường đi với Physical partitioning: mỗi node tự quản lý partition trên thiết bị lưu trữ riêng của nó. Kiến trúc **Shared disk** $\rightarrow$ Thường đi với Logical partitioning: các node chịu trách nhiệm tính toán xử lý cho từng phần logic khác nhau nhưng dữ liệu vẫn save về chung 1 storage tập trung.
+
+- **Naive table partitioning**
+   - 1 table được assign hoàn toàn cho riêng 1 node.
+   - **Giả định**: Các table có tính độc lập cao, sẽ không xảy ra (hoặc rất hiếm) các câu lệnh JOIN giữa các table nằm ở những node khác nhau.
+
+- **Horizontal partitioning (Sharding - Phân mảnh ngang)**
+   - Chia một data table thành nhiều phần (shard), trong đó mỗi phần chứa một tập hợp các rows khác nhau. Khóa để quyết định việc đưa row vào shard nào gọi là **Partition Key**.
+   - **Các chiến lược cơ bản**:
+      - **Hashing**: Tính hash của partition key (VD: `hash(key) % số_node`).
+      - **Range**: Phân vùng dữ liệu dựa theo dải giá trị (VD: User ID từ 1-1000 $\rightarrow$ Node 1).
+      - **Predicate (List)**: Phân vùng theo một danh sách cụ thể, gán cho mảng biến (VD: Region = 'Asia' $\rightarrow$ Node 1).
+      - **Round Robin**: Chia bài tuần tự, phân bổ đều data vào tuần tự các node một cách vòng tròn.
+   - **Vấn đề Rebalancing**: Khi add thêm hoặc remove node, hàm hashing (`mod N`) hoặc kích cỡ dải range thay đổi nghiêm trọng, dẫn đến phải rải lại/di dời dữ liệu hàng loạt.
+   - **Giải pháp tối ưu quá trình Rebalance**:
+      - **Consistent Hashing**:
+         - **Ý tưởng**: Băm cả Data Key và Node ID lên một vòng tròn băm (hash ring/cycle). Mỗi node sẽ quản lý các data key nằm giữa điểm của nó và node liền kề trước đó.
+         - **Khi add thêm partition (node)**: Tách nhỏ vòng tròn tại vị trí đặt của node mới. Chỉ cần di chuyển phần data từ node cũ kề cận sang node mới, các node khác ngoài vùng không bị ảnh hưởng.
+         - Ứng dụng nổi tiếng: Cassandra, DynamoDB, Riak.
+      - **Rendezvous Hashing (Highest Random Weight Hashing)**:
+         - **Ý tưởng**: Phân bổ key bằng điểm trọng số: `Hash = hash(key + node_identifier)`. Cho mỗi key, node nào có tính ra giá trị lớn nhất (ranking cao nhất) thì key sẽ thuộc về node đó.
+         - **Khi add thêm node mới**: Tính và chấm điểm lại hash của mọi key đối với riêng node mới. Cho từng key, nếu node mới đạt điểm cao hơn node cũ đang chứa key đó (ranking tốt hơn) thì chỉ chuyển các data này sang. Giảm thiểu tối đa sự xáo trộn so với Hash truyền thống.
+
+- **Shared disk partitioning**
+   - Mở rộng từ Share disk architecture.
+   - Tất cả các compute node cùng tiến hành phân vùng logic để chia tải, xử lý dữ liệu từ một hệ thống đĩa chung.
+   - **Đặc điểm**: Giảm gánh nặng tái cấu trúc khi thêm node vì dữ liệu trung tâm không di chuyển. Tuy nhiên, lưu trữ chia sẻ có thể trở thành bottleneck ở điểm Disk I/O nếu truy cập quá dày đặc.
+
+#### 18.4. Database Replication (Cơ chế nhân bản)
+- **Khái niệm**: Là việc lưu trữ các bản sao (copy) của cùng một tập dữ liệu (dataset) trên nhiều nodes (máy chủ) khác nhau thông qua mạng network.
+- **Mục đích cốt lõi**:
+   - **High Availability (Sẵn sàng cao)** & **Fault Tolerance (Chịu lỗi)**: Nếu 1 node bị rãnh rớt mạng hoặc hỏng hóc, hệ thống có thể lập tức fail-over chuyển hướng cung cấp dữ liệu ở các node khác.
+   - **Read Scalability (Mở rộng khả năng đọc)**: Chia sẻ gánh nặng (Load balance) các truy vấn `SELECT` cho nhiều điểm read-only node. Phù hợp với Read-heavy workload.
+   - **Giảm Latency**: Đặt các replica ở nhiều khu vực địa lý khác nhau để người dùng truy cập trực tiếp vào node vật lý gần họ nhất.
+
+##### A. Các mô hình Replication
+1. **Single-Leader (Primary-Replica / Master-Slave)**:
+   - **Cơ chế**: Dành một node duy nhất đóng vai trò Leader (Master) được phép nhận truy cập GHI (Write). Sau khi thay đổi, Leader truyền bản ghi (replication log) tới tất cả các node còn lại (Followers / Replicas). Các truy cập vào Follower bị giới hạn ở ngưỡng ĐỌC (Read-only).
+   - **Đặc điểm**: Rất thông dụng (vd: MySQL, PostgresSQL mặc định). Dễ triển khai, nhất quán cao. Điểm yếu là Leader trở thành điểm chết duy nhất (Single Point of Failure) nếu tiến trình failover tự động cấu hình không vững.
+2. **Multi-Leader (Master-Master)**:
+   - **Cơ chế**: Có lớn hơn 1 node đóng vai trò Leader. Mỗi Leader đều có thể accept data write độc lập và sync chéo qua lại cho cụm Leader/Follower.
+   - **Đặc điểm**: Thích hợp cho môi trường chia tách Multi-Datacenter (Mỗi châu lục có 1 Datacenter với Leader cục bộ riêng) giúp né độ trễ write. **Rủi ro to lớn**: Vấn đề giải quyết xung đột ghi chép (Write Conflict - Khi 2 user sửa cùng 1 row ở 2 Datacenter khác nhau trong cùng 1 mili-giây, dẫn đến chia rẽ dữ liệu).
+3. **Leaderless (Quorum-based)**:
+   - **Cơ chế**: Mọi node đều bình đẳng. Khi Client update, nó trực tiếp đẩy Write song song (broadcast) vào nhiều nodes. Khi cần Read, nó cũng gửi lấy data từ nhiều nodes để vá lỗi.
+   - **Đặc điểm**: Áp dụng quy tắc số đông **Quorum ($W + R > N$)** để đọc dữ liệu chuẩn xác. Ví dụ: Có 3 node ($N=3$), bắt buộc cấu hình ghi vào ít nhất 2 node hoàn thành ($W=2$). Khi đọc, cũng yêu cầu phải tham chiếu đủ ít nhất từ 2 node ($R=2$). Lúc này chắc chắn $W+R=4 > 3$, do đó cụm trả về sẽ có ít nhất 1 node chắp nối thành công bản ghi mới nhất. Cơ chế này đạt tính High Availability cực mạnh trong môi trường chập chờn (Cassandra, DynamoDB sử dụng mô hình này).
+
+##### B. Propagation
+- **Propagation Schema**
+Xác định mức cam kết bảo chứng data giữa Leader và Follower:
+
+- **Synchronous (Đồng bộ hoàn toàn)**:
+   - Leader ghi data tại cục bộ $\rightarrow$ Phải chờ các Follower apply thành công và phản hồi xác nhận $\rightarrow$ Mới return `Success` cho Client.
+   - *Ưu điểm*: An toàn 100%. Data không bao giờ bay màu nếu Leader chết đột ngột. Follower không bao giờ bị lệch nhịp.
+   - *Nhược điểm*: Hiệu năng Write kém nhất. Rất dễ treo ứng dụng (Unavailable) nếu bất kỳ Follower nào bị đứt cáp và nghẽn phản hồi. Thường không ai xài Synchronous toàn phần cả hệ thống.
+- **Asynchronous (Bất đồng bộ - Thông dụng nhất)**:
+   - Leader áp dụng thay đổi tại đĩa cục bộ $\rightarrow$ Lập tức return `Success` ngay cho Client $\rightarrow$ Log thay đổi được Follower pull và apply ngầm ở Background phụ.
+   - *Ưu điểm*: Hiệu năng tuyệt vời không độ trễ. Leader không cần lo Follower sống chết ra sao.
+   - *Nhược điểm*: Khiến dấy lên khái niệm **Replication Lag** (Hành động người dùng sửa profile ở Leader nhưng khi Load tự động nhảy sang Load-balancer của Follower chậm nhịp, khiến người dùng lầm tưởng lệnh save thất bại (Inconsistency)). Nguy cơ Data Loss nếu Leader Crash vĩnh viễn trước khi Log async chạy qua nhánh kia.
+- **Semi-synchronous (Bán đồng bộ - Thỏa hiệp vàng)**:
+   - Pha trộn. Cấu hình yêu cầu Leader phải chờ cho đến khi có **đúng MỘT (hoặc cấu hình mức tối thiểu)** Follower xác nhận ghi nhận thành công, còn mớ Follower khác để chúng nó Asynchronous tự túc.
+   - Vừa bảo toàn được tốc độ hệ thống, vừa cam kết tính High Availability vì ta chắc chắn có một bản gác tạm ở server phái sinh khác ngoài Leader.
+
+- **Propagation Timing**
+  - Continous: Gửi message logs ngay thời điểm nó đượ tạo, cần gửi cả commit/abort message(phần lớn system sử dụng kiến trúc này)
+  - On commi: Chỉ gửi sau khi đã commit, không tốn thời gian gửi các abort txn
+
+
+##### C. K-Safety (Độ an toàn K)
+- **Khái niệm**: K-Safety là một thước đo / tiêu chuẩn cấu hình khả năng **Chịu lỗi (Fault Tolerance)** trong các cơ sở dữ liệu xử lý phân tán (như Vertica, Cassandra). Giá trị **K** đại diện cho số lượng node có thể bị sập (crash) cùng một lúc mà cụm database vẫn hoạt động bình thường, không bị mất mát bất kỳ dữ liệu nào.
+- **Cách thức đạt được**: Để đạt được độ an toàn `K`, hệ thống bắt buộc phải duy trì lưu trữ ít nhất **$K+1$ bản sao (replicas)** của dữ liệu phân tán trên các node độc lập.
+- **Phân loại**:
+   - `K-Safety = 0`: Cấu hình hệ thống không có Replica (tương đương kiến trúc Single Node). Chỉ 1 máy hỏng là tiêu tùng dữ liệu.
+   - `K-Safety = 1`: Hệ thống duy trì ít nhất 2 bản sao phân tán. Chịu được rủi ro mất đột ngột 1 node. Đây là tiêu chuẩn vàng tối thiểu của các môi trường Production.
+   - `K-Safety = 2`: Dữ liệu phân bổ ở 3 node. Dù 2 node chết cùng lúc thì hệ thống vẫn truy xuất được dữ liệu trọn vẹn ở node còn lại.
+- **Đặc trưng**: Nếu số node hỏng **lớn hơn K** được quy định, một số Database (như Vertica) sẽ buộc phải tắt luôn hệ thống (Shutdown an toàn / Read-only) để ngăn chặn phát sinh hiện tượng dữ liệu rác không đồng nhất.
+
+#### 18.5. Transaction coordination
+- Khi txn trên nhiều node, cần cơ chế phối hợp để đảm bảo tính nguyên tử
+- Kiến trúc: 
+    - Centralized: Người điều phối trung tâm thông qua:
+       - Thông báo tới các node
+       - Chỉ commit khi tất cả các node đồng ý
+    - Decentralized: Mỗi node tự quản lý
+       - Leader thông báo tới các node commit
+    - Phần lớn các dbms sử dụng hybrid khi chúng định kì chọn 1 node để làm người điều phối tạm thời
+Federated(Liên bang)
+   - Sử dụng 1 middle ware giữa application và database
+   - Middleware sẽ điều phối transaction
+   - Federated phối hợp nhiều database khác nhau
+
+#### 18.6. Atomic Commit Protocols (Giao thức cam kết nguyên tử)
+- Tiền đề:
+    - Tất cả các node trong 1 distributed DBMS are well-behaved
+    - Nếu không tin tưởng node, bạn cần sử dụng thuật toán ..
+       -> Blockchain là 1 ví dụ tiêu biểu
+**Ngữ cảnh giải quyết**: Khi một hệ thống phân tán thực thi một Transaction (giao dịch) có dữ liệu vắt qua nhiều Nodes (hoặc nhiều Partitions) khác nhau, làm sao để đảm bảo tính chất **Atomicity** của hệ ACID? Nghĩa là lệnh cập nhật phải chốt hạ: **Hoặc TẤT CẢ các nodes cùng commit thành công, hoặc tất cả đều phải Abort (hủy bỏ)**.
+
+##### A. Two-Phase Commit (2PC - Giao thức 2 pha)
+Đây là thuật toán thống trị và phổ biến nhất được các Database hiện tại sử dụng cho giao dịch phân tán. Mô hình chia làm 1 **Coordinator (Người điều phối)** và nhiều **Participants (Các node chứa dữ liệu)**.
+
+- **Phase 1: Prepare (Pha chuẩn bị)**
+   - Coordinator gửi thông điệp `PREPARE` tới tất cả các Participants.
+   - Khi nhận lệnh, Participant phải bắt đầu cố định tài nguyên (tạo các write lock, ép flush ghi WAL xuống đĩa cứng). 
+   - Nếu mọi thứ mượt mà, nó trả lời `YES` (Đồng nghĩa: "Tôi đã rào khóa data, tôi thề nếu anh ra lệnh commit là tôi làm được 100%"). Nếu có bất cứ trục trặc / fail lock nào, nó trả lời `NO`.
+- **Phase 2: Commit / Abort (Pha chốt hạ)**
+   - **Tình huống Abort**: Chỉ cần có **ít nhất 1** Participant trả lời `NO` (hoặc timeout bặt vô âm tín do vấp mạng), Coordinator ra lệnh `ABORT` đồng loạt tới tất cả các node để vứt bỏ transaction, roll-back dữ liệu.
+   - **Tình huống Commit**: Nếu **TẤT CẢ** 100% độ hình trả lời `YES`. Coordinator đưa ra kết luận chốt hạ `COMMIT`. Việc đầu tiên nó làm là tự viết log chứng nhận `COMMIT` xuống đĩa của nó làm bằng chứng, rồi xả lệnh cho tất cả các Participants cùng tiến hành `COMMIT`.
+   - Các Participant thực hiện lệnh thao tác dữ liệu xong, giải phóng Lock và báo `ACK` (Acknowledge) về cho điều phối viên. Kết thúc.
+
+- **Nhược điểm chí mạng của 2PC (The Blocking Problem)**:
+   - Nếu Coordinator chết / sập ngay tại đầu **Pha 2** ở khoảnh khắc nó vừa ra được quyết định trong não là sẽ `COMMIT/ABORT` nhưng *chưa kịp báo* cho toàn hệ thống $\rightarrow$ Mọi Participants rơi vào tình huống **"Tiến thoái lưỡng nan"**: Data đang bị **giữ Lock**, đã lỡ hứa `YES`, lại mất kết nối không phán đoán được anh điều phối viên đã chết thật chưa hay quyết định ra sao nên không dám tự tiện commit cũng chả dám abort. Cả hệ thống có điểm mù, giam tài nguyên khóa cứng ngắc chờ đợi mòn mỏi. Đặc điểm này gọi là biến Coordinator thành **Single Point of Failure**.
+
+##### B. Three-Phase Commit (3PC - Giao thức 3 pha)
+- **Cơ chế**: Sinh ra để khắc phục nhược điểm "Treo cứng" của 2PC. Bằng cách cài thêm quy định về Timeout chặt chẽ hơn và chèn một pha đệm gọi là **Pre-Commit** nằm ở giữa. (Sơ đồ: `CanCommit` $\rightarrow$ `PreCommit` $\rightarrow$ `DoCommit`).
+- **Đặc điểm**: Nhờ có pha đệm pre-commit, khi mạng bị sụp rách Coordinator, các participants có thể dọn dẹp và phân tích thông qua timeout để tự đưa ra quyết định commit/abort tập thể, khắc phục triệt để Blocking state.
+- **Thực tế phũ phàng**: Lượng I/O cost đội lên khổng lồ, số chuyến khứ hồi mạng (Network round-trip) nhiều khiến nó quá trễ, gặp mạng Internet chập chờn thì thảm họa. **Kết luận: Hầu như không có hệ cơ sở dữ liệu thực tiễn nào triển khai xài 3PC**. Thay vào đó, các hệ NewSQL (Spanner, TiDB, CockroachDB) vẫn tiếp tục xài 2PC nhưng gia cố lớp khiên bằng cách đắp giải thuật đồng thuận (Raft / Paxos algorithm) làm **bảo kê cho Coordinator**, biến bộ não điều phối này thành "bất tử". Khắc triệt để Single Point of failure.
+
+
+##### C. Viewstamped replication
+
+##### D. Paxos
+
+
+##### E. ZAB
+
+##### F. Raft
+
+#### 18.6. Parquet File Format
+
+##### A. Parquet là gì?
+
+**Apache Parquet** là một định dạng file lưu trữ dữ liệu theo **cột (columnar storage format)**, được thiết kế đặc biệt để tối ưu cho các hệ thống **OLAP (Online Analytical Processing)** và xử lý dữ liệu lớn (Big Data).
+
+> 📌 **Lưu ý**: "Parquet" đọc là /pɑːrˈkeɪ/ — lấy tên từ sàn gỗ ghép hoa văn (parquet flooring), ám chỉ cách dữ liệu được "ghép" theo cột một cách có cấu trúc.
+
+**Row-based vs Columnar Storage:**
+
+```
+Row-based (CSV, JSON, MySQL row format):
+┌──────┬──────┬────────┬────────┐
+│ id=1 │ name │ age=25 │ sal=50 │  ← Row 1 (lưu liên tiếp)
+│ id=2 │ name │ age=30 │ sal=60 │  ← Row 2 (lưu liên tiếp)
+│ id=3 │ name │ age=28 │ sal=55 │  ← Row 3 (lưu liên tiếp)
+└──────┴──────┴────────┴────────┘
+→ Đọc 1 row = 1 lần I/O (tốt cho OLTP: SELECT * WHERE id=1)
+→ Đọc 1 cột = phải scan TẤT CẢ rows (tệ cho analytics)
+
+Columnar (Parquet):
+┌──────────────────┐
+│ id:  1, 2, 3     │  ← Cột id (lưu liên tiếp)
+│ name: A, B, C    │  ← Cột name (lưu liên tiếp)
+│ age: 25, 30, 28  │  ← Cột age (lưu liên tiếp)
+│ sal: 50, 60, 55  │  ← Cột salary (lưu liên tiếp)
+└──────────────────┘
+→ Đọc 1 cột = 1 lần sequential I/O (tốt cho analytics: SELECT AVG(salary))
+→ Đọc 1 row = phải ghép từ nhiều cột (tệ cho OLTP)
+```
+
+##### B. Tại sao Parquet phổ biến trong OLAP?
+
+| Đặc điểm | Giải thích |
+|---|---|
+| **Column pruning** | Query chỉ cần 3/100 cột? Parquet chỉ đọc 3 cột đó, bỏ qua 97 cột còn lại → giảm I/O cực lớn |
+| **Nén hiệu quả** | Dữ liệu cùng cột có cùng kiểu + pattern lặp → compression ratio cao hơn nhiều so với row-based |
+| **Predicate pushdown** | Metadata chứa min/max → engine bỏ qua cả block dữ liệu không thỏa điều kiện WHERE |
+| **Parallelism** | Row Groups độc lập → nhiều thread/node xử lý song song dễ dàng |
+| **Immutable** | File write 1 lần, đọc nhiều lần — phù hợp với mô hình data lake (append-only) |
+
+> 📌 **DBMS/Engine sử dụng Parquet**: Apache Spark, Apache Hive, Apache Impala, Presto/Trino, DuckDB, Amazon Athena, Google BigQuery (internal format tương tự), Snowflake, Databricks Delta Lake.
+
+##### C. Cấu trúc phân cấp (Hierarchical Structure)
+
+Một file Parquet được tổ chức theo 4 cấp:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        PARQUET FILE                             │
+│                                                                 │
+│  ┌─── Magic Number ("PAR1") ──────────────────────────────┐     │
+│  │                                                        │     │
+│  │  ┌─────────────── Row Group 1 ───────────────────┐     │     │
+│  │  │                                               │     │     │
+│  │  │  ┌─ Column Chunk: id ──┐  ┌─ Column Chunk: name ┐  │     │
+│  │  │  │  ┌── Page 1 ──┐    │  │  ┌── Page 1 ──┐      │  │     │
+│  │  │  │  │ Data values │    │  │  │ Data values │      │  │     │
+│  │  │  │  │ (encoded +  │    │  │  │ (encoded +  │      │  │     │
+│  │  │  │  │ compressed) │    │  │  │ compressed) │      │  │     │
+│  │  │  │  └─────────────┘    │  │  └─────────────┘      │  │     │
+│  │  │  │  ┌── Page 2 ──┐    │  │  ┌── Page 2 ──┐      │  │     │
+│  │  │  │  │ ...         │    │  │  │ ...         │      │  │     │
+│  │  │  │  └─────────────┘    │  │  └─────────────┘      │  │     │
+│  │  │  └─────────────────────┘  └───────────────────────┘  │     │
+│  │  └───────────────────────────────────────────────────┘  │     │
+│  │                                                        │     │
+│  │  ┌─────────────── Row Group 2 ───────────────────┐     │     │
+│  │  │  ...                                          │     │     │
+│  │  └───────────────────────────────────────────────┘     │     │
+│  │                                                        │     │
+│  │  ┌─── Footer (Metadata) ─────────────────────────┐     │     │
+│  │  │  - Schema (tên cột, kiểu dữ liệu)            │     │     │
+│  │  │  - Row Group metadata (offset, size)          │     │     │
+│  │  │  - Column Chunk metadata (min/max, null count)│     │     │
+│  │  │  - Page Index (offset của từng page)          │     │     │
+│  │  └───────────────────────────────────────────────┘     │     │
+│  │                                                        │     │
+│  └─── Magic Number ("PAR1") ──────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Giải thích từng cấp:**
+
+| Cấp | Mô tả |
+|---|---|
+| **File** | Bao gồm Header (magic number `PAR1`), data blocks (Row Groups), và Footer chứa toàn bộ metadata |
+| **Row Group** | Chia ngang tập dữ liệu thành các nhóm hàng (thường 128MB–1GB mỗi group). Là đơn vị chính cho **parallelism** — mỗi Row Group có thể được xử lý độc lập bởi 1 thread/node |
+| **Column Chunk** | Trong mỗi Row Group, dữ liệu được tổ chức theo cột. Mỗi Column Chunk chứa **toàn bộ giá trị của 1 cột** trong Row Group đó |
+| **Page** | Đơn vị nhỏ nhất (atomic unit) của storage (thường ~1MB). Encoding và compression được áp dụng **tại cấp page** |
+
+##### D. Encoding (Mã hóa)
+
+Encoding biến đổi dữ liệu thành dạng compact hơn **trước khi** nén (compression). Vì dữ liệu cùng cột có cùng kiểu và pattern, encoding cực kỳ hiệu quả:
+
+| Encoding | Cơ chế | Hiệu quả khi |
+|---|---|---|
+| **Dictionary Encoding** | Thay giá trị lặp bằng integer key. VD: `["VN","US","VN","JP","VN"]` → Dict: `{0:"VN", 1:"US", 2:"JP"}`, Data: `[0,1,0,2,0]` | Cột có **low cardinality** (ít giá trị unique): country, status, gender |
+| **Run-Length Encoding (RLE)** | Lưu giá trị + số lần lặp liên tiếp. VD: `[1,1,1,1,2,2,3]` → `[(1,4),(2,2),(3,1)]` | Dữ liệu **đã sort** hoặc có nhiều giá trị lặp liên tiếp |
+| **Delta Encoding** | Lưu hiệu số giữa các giá trị liên tiếp. VD: `[1000,1001,1003,1006]` → base=1000, deltas=`[0,1,2,3]` | Cột **số tăng dần**: timestamp, auto-increment ID |
+| **Bit Packing** | Nén integer dùng ít bit hơn. VD: giá trị max=7 chỉ cần 3 bit thay vì 32 bit | Giá trị nhỏ trong phạm vi hẹp |
+
+> 📌 Parquet tự động chọn encoding phù hợp cho từng Column Chunk dựa trên kiểu dữ liệu và thống kê. Dictionary Encoding thường được dùng mặc định, fallback sang PLAIN nếu dictionary quá lớn.
+
+##### E. Compression (Nén)
+
+Sau khi encoding, page được nén tiếp bằng compression algorithm:
+
+| Algorithm | Tốc độ nén | Tốc độ giải nén | Tỷ lệ nén | Ghi chú |
+|---|---|---|---|---|
+| **Snappy** | Nhanh | **Rất nhanh** | Trung bình | Mặc định trong Spark, Hive. Ưu tiên tốc độ đọc |
+| **Gzip** | Chậm | Chậm | **Cao** | Khi cần tiết kiệm dung lượng (cold storage) |
+| **Zstd** | Nhanh | Nhanh | **Cao** | Cân bằng tốt nhất giữa tốc độ và tỷ lệ nén. Ngày càng phổ biến |
+| **LZO** | Nhanh | Nhanh | Trung bình | Legacy, ít dùng trong hệ thống mới |
+| **Uncompressed** | — | — | 1:1 | Khi CPU là bottleneck, không muốn tốn cycle giải nén |
+
+**Tại sao columnar nén tốt hơn row-based?**
+```
+Row-based: [1,"Alice",25,5000], [2,"Bob",30,6000], [3,"Alice",28,5500]
+→ Dữ liệu xen kẽ kiểu: int, string, int, int → compression khó tìm pattern
+
+Columnar:
+  name: ["Alice","Bob","Alice"] → Dictionary: {0:"Alice",1:"Bob"} → [0,1,0] → 3 bytes!
+  age:  [25, 30, 28]           → Delta: base=25, [0,5,3]         → vài bytes
+  sal:  [5000, 6000, 5500]     → Delta: base=5000, [0,1000,500]  → vài bytes
+```
+
+##### F. Metadata & Statistics — Chìa khóa tối ưu query
+
+Footer của file Parquet chứa metadata phong phú giúp query engine **bỏ qua dữ liệu không cần thiết** mà không cần đọc data thực:
+
+```
+Footer Metadata:
+├── Schema: {id: INT64, name: STRING, age: INT32, salary: INT64}
+├── Row Group 0:
+│   ├── num_rows: 1,000,000
+│   ├── Column "age":
+│   │   ├── min: 18,  max: 65
+│   │   ├── null_count: 0
+│   │   └── offset: 0x1000, size: 2MB
+│   └── Column "salary":
+│       ├── min: 30000,  max: 200000
+│       └── null_count: 50
+├── Row Group 1:
+│   ├── Column "age":
+│   │   ├── min: 22,  max: 45
+│   │   └── ...
+```
+
+**Tối ưu query nhờ metadata:**
+
+1. **Column Pruning**: `SELECT name, salary FROM ...` → chỉ đọc 2 Column Chunks, bỏ qua id và age
+2. **Row Group Skipping (Predicate Pushdown)**:
+   ```
+   SELECT * FROM table WHERE age > 50
+   
+   Row Group 0: age min=18, max=65 → CÓ THỂ chứa data → đọc
+   Row Group 1: age min=22, max=45 → CHẮC CHẮN không chứa age>50 → BỎ QUA ✨
+   ```
+3. **Page Index**: Từ Parquet v2, statistics ở cấp **page** cho phép skip chính xác hơn (skip từng page thay vì cả Row Group)
+
+##### G. So sánh Parquet với các format khác
+
+| | **Parquet** | **CSV** | **JSON** | **ORC** | **Avro** |
+|---|---|---|---|---|---|
+| **Lưu trữ** | Columnar | Row | Row (semi-structured) | Columnar | Row |
+| **Schema** | Embedded trong file | Không có | Implicit | Embedded | Embedded |
+| **Compression** | Rất cao (encoding + compression) | Kém | Kém | Rất cao | Trung bình |
+| **Đọc 1 vài cột** | ✅ Cực nhanh (column pruning) | ❌ Phải đọc toàn bộ | ❌ Phải đọc toàn bộ | ✅ Cực nhanh | ❌ Phải đọc toàn bộ |
+| **Predicate pushdown** | ✅ Có (min/max statistics) | ❌ Không | ❌ Không | ✅ Có | ❌ Không |
+| **Phù hợp** | **OLAP**, analytics, data lake | Import/export đơn giản | API, logging | **OLAP** (Hive ecosystem) | Streaming, message queue |
+| **Hệ sinh thái** | Spark, Trino, BigQuery, DuckDB | Universal | Universal | Hive, Presto | Kafka, Hadoop |
+
+> ⚠️ **ORC vs Parquet**: Cả hai đều là columnar format với tính năng tương tự. ORC sinh ra từ hệ sinh thái Hive (Hortonworks), Parquet sinh ra từ Dremel paper của Google (Cloudera + Twitter). Ngày nay, **Parquet chiếm ưu thế** do được Spark và hầu hết cloud data warehouse chọn làm format mặc định.
+
+##### H. Khi nào KHÔNG nên dùng Parquet?
+
+| Tình huống | Lý do | Nên dùng |
+|---|---|---|
+| **OLTP** (INSERT/UPDATE/DELETE thường xuyên) | Parquet là immutable, không hỗ trợ update in-place | Row-based format (MySQL, PostgreSQL native) |
+| **Đọc toàn bộ row** (`SELECT *`) | Columnar phải ghép dữ liệu từ nhiều cột → overhead | Row-based format, Avro |
+| **Streaming data** | Parquet cần biết toàn bộ data trước khi write (để tính statistics) | Avro, JSON, Protobuf |
+| **File rất nhỏ** (< vài MB) | Overhead metadata/footer lớn hơn lợi ích nén | CSV, JSON |
