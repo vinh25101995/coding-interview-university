@@ -1,4 +1,4 @@
-### 6. Column-Oriented Storage
+﻿### 6. Column-Oriented Storage
 
 #### 6.1 Các dạng Storage
 
@@ -3023,6 +3023,7 @@ P2: PREPARE(n=4) → ...
 ##### E. ZAB
 
 ##### F. Raft
+Cải tiến của Paxos
 
 #### 18.7. CAP Theorem
 
@@ -3175,6 +3176,18 @@ N2 so sánh với local (VC=[1,1,0], x=15):
 | **Ví dụ** | HBase, ZooKeeper, etcd, Google Spanner | Cassandra, DynamoDB, CouchDB, Riak |
 
 > 📌 **Lưu ý quan trọng — PACELC Theorem**: CAP chỉ mô tả behavior khi có Partition. **PACELC** (2012) bổ sung: ngay cả khi **không có Partition (PC)**, hệ thống phải trade-off giữa **Latency (L)** và **Consistency (C)**. Ví dụ: Synchronous replication = strong consistency nhưng latency cao; Asynchronous replication = latency thấp nhưng chỉ đạt eventual consistency.
+
+#### 18.8. Join in distributed system
+   - **Broadcast Join (Replication Join):** 
+      - Áp dụng: Khi có 1 bảng đủ nhỏ (có thể fit vừa RAM của các worker node).
+      - Cơ chế: Ta broadcast (sao chép và gửi) toàn bộ data từ bảng nhỏ đó tới tất cả các node đang chứa partition của bảng lớn, sau đó thực hiện join độc lập ở từng node.
+      - Kết quả sau đó được merge lại. Ưu điểm là tránh được hoàn toàn việc xáo trộn dữ liệu qua mạng.
+   - **Shuffle Join (Hash Shuffle Join):**
+      - Áp dụng: Khi cả 2 bảng data đều quá lớn và ban đầu không được partition sẵn theo join key.
+      - Cơ chế: Ta thực hiện xáo trộn (shuffle) lại data qua mạng. Hệ thống sẽ hash (băm) join key của cả 2 bảng, các dòng có cùng hash value sẽ được gửi qua mạng về chung một node. Khi dữ liệu hội tụ đủ, các node mới tiến hành join.
+      - Nhược điểm: Quá trình Shuffle cực kì chậm và tốn kém tài nguyên (chi phí Network I/O để truyền data và Disk I/O để ghi data tạm ra đĩa tránh out of memory).
+      - Tối ưu: Có một số dịch vụ giúp ta tách riêng khâu shuffle data để xử lý độc lập (như *External Shuffle Service*), giúp lưu kết quả trung gian ổn định để các node thực thi step tiếp theo không bị chết chùm nếu gặp lỗi.
+
 
 #### 18.8. Parquet File Format
 
