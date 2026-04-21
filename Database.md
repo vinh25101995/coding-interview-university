@@ -1,4 +1,4 @@
-﻿### 6. Column-Oriented Storage
+### 6. Column-Oriented Storage
 
 #### 6.1 Các dạng Storage
 
@@ -2832,7 +2832,7 @@ Xác định mức cam kết bảo chứng data giữa Leader và Follower:
 
 - **Propagation Timing**
   - Continous: Gửi message logs ngay thời điểm nó đượ tạo, cần gửi cả commit/abort message(phần lớn system sử dụng kiến trúc này)
-  - On commi: Chỉ gửi sau khi đã commit, không tốn thời gian gửi các abort txn
+  - On commit: Chỉ gửi sau khi đã commit, không tốn thời gian gửi các abort txn
 
 
 ##### C. K-Safety (Độ an toàn K)
@@ -2846,6 +2846,7 @@ Xác định mức cam kết bảo chứng data giữa Leader và Follower:
 
 #### 18.5. Transaction coordination
 - Khi txn trên nhiều node, cần cơ chế phối hợp để đảm bảo tính nguyên tử
+   - Data dạng copy replication hay mỗi node có 1 loại data
 - Kiến trúc: 
     - Centralized: Người điều phối trung tâm thông qua:
        - Thông báo tới các node
@@ -2880,6 +2881,9 @@ Federated(Liên bang)
 - **Nhược điểm chí mạng của 2PC (The Blocking Problem)**:
    - Nếu Coordinator chết / sập ngay tại đầu **Pha 2** ở khoảnh khắc nó vừa ra được quyết định trong não là sẽ `COMMIT/ABORT` nhưng *chưa kịp báo* cho toàn hệ thống $\rightarrow$ Mọi Participants rơi vào tình huống **"Tiến thoái lưỡng nan"**: Data đang bị **giữ Lock**, đã lỡ hứa `YES`, lại mất kết nối không phán đoán được anh điều phối viên đã chết thật chưa hay quyết định ra sao nên không dám tự tiện commit cũng chả dám abort. Cả hệ thống có điểm mù, giam tài nguyên khóa cứng ngắc chờ đợi mòn mỏi. Đặc điểm này gọi là biến Coordinator thành **Single Point of Failure**.
 
+- **Optimized**
+   - Early-Prepare voting(rare): 
+   - Early ack after prepare: Send successful ngay sau khi các nốt đều báo ok: Cơ chế ghi log và redo nữa chứ???
 ##### B. Three-Phase Commit (3PC - Giao thức 3 pha)
 - **Cơ chế**: Sinh ra để khắc phục nhược điểm "Treo cứng" của 2PC. Bằng cách cài thêm quy định về Timeout chặt chẽ hơn và chèn một pha đệm gọi là **Pre-Commit** nằm ở giữa. (Sơ đồ: `CanCommit` $\rightarrow$ `PreCommit` $\rightarrow$ `DoCommit`).
 - **Đặc điểm**: Nhờ có pha đệm pre-commit, khi mạng bị sụp rách Coordinator, các participants có thể dọn dẹp và phân tích thông qua timeout để tự đưa ra quyết định commit/abort tập thể, khắc phục triệt để Blocking state.
@@ -2890,12 +2894,289 @@ Federated(Liên bang)
 
 ##### D. Paxos
 
+> 📌 **Giải đáp câu hỏi**: *"Nếu gửi abort thì sao? Data có như nhau trên các node không?"*
+>
+> Paxos **không phải** là Atomic Commit Protocol (như 2PC) nên không có khái niệm "commit/abort transaction" theo nghĩa ACID. Paxos là **Consensus Algorithm** — mục tiêu là để các node **đồng thuận về một giá trị duy nhất**. Một khi consensus đạt được, giá trị đó được ghi nhận vĩnh viễn.
+
+###### Vấn đề Paxos giải quyết
+
+Trong một hệ thống phân tán **(N nodes, có thể crash bất kỳ lúc nào)**, làm sao để đảm bảo:
+- **Safety**: Chỉ **một** giá trị được chọn — không bao giờ có 2 node chọn 2 giá trị khác nhau
+- **Liveness**: Nếu còn **đa số node** (`> N/2`) còn sống, tiến trình cuối cùng phải hoàn thành
+
+###### Các vai trong Paxos
+
+| Vai | Mô tả |
+|---|---|
+| **Proposer** | Đề xuất một giá trị để các node đồng thuận |
+| **Acceptor** | Nhận và phê duyệt/từ chối đề xuất. Là node thực sự bỏ phiếu |
+| **Learner** | Nhận thông báo về giá trị đã được chọn để "học" theo |
+
+> Trong thực tế, 1 node thường đóng cả 3 vai cùng lúc.
+
+###### Cơ chế hoạt động — 2 Phase
+
+**Phase 1: Prepare / Promise**
+
+```
+Proposer                         Acceptors
+   │── PREPARE(n) ──────────────▶│  n là proposal number, phải tăng dần
+   │◀─ PROMISE(n, v_accepted) ───│  hứa không accept proposal nào có number < n
+```
+
+- Proposer chọn **proposal number `n`** (lớn hơn mọi `n` từng dùng trước đó)
+- Gửi `PREPARE(n)` tới tất cả Acceptors
+- Acceptor khi nhận `PREPARE(n)`:
+  - Nếu `n > max_n_seen` → trả lời `PROMISE(n, v_accepted)` kèm giá trị đã accept trước đó (nếu có)
+  - Đồng thời **cam kết** sẽ không bao giờ accept proposal nào có `n' < n` trong tương lai
+  - Nếu `n ≤ max_n_seen` → từ chối (không trả lời hoặc gửi NACK)
+
+**Phase 2: Accept / Accepted**
+
+```
+Proposer                         Acceptors              Learners
+   │── ACCEPT(n, v) ────────────▶│
+   │◀─ ACCEPTED(n, v) ───────────│── ACCEPTED(n, v) ───▶│
+```
+
+- Nếu Proposer nhận đủ `PROMISE` từ **quorum (đa số)** Acceptors:
+  - Nếu có Acceptor nào gửi kèm `v_accepted` → Proposer **PHẢI dùng giá trị đó** (không được tự chọn) ← điểm mấu chốt của Paxos
+  - Nếu không ai có `v_accepted` → Proposer tự chọn giá trị `v` mình muốn
+- Gửi `ACCEPT(n, v)` tới Acceptors
+- Acceptor nhận `ACCEPT(n, v)`:
+  - Nếu chưa hứa với proposal nào lớn hơn → chấp nhận, lưu `(n, v)`, thông báo Learners
+  - Nếu đã hứa với `n' > n` → từ chối
+
+###### Quorum — Chìa khóa của Paxos
+
+**Quorum = bất kỳ tập nào có hơn N/2 nodes.** Hai quorum bất kỳ **luôn có ít nhất 1 node chung** — đây là đảm bảo toán học cốt lõi:
+
+```
+5 nodes: A, B, C, D, E
+
+Quorum Phase 1: {A, B, C} — 3/5 nodes
+Quorum Phase 2: {B, C, D} — 3/5 nodes
+Giao nhau:      {B, C}    ← Luôn có node nhớ về round trước!
+```
+
+Nhờ vậy, nếu round trước đã chọn được giá trị, round mới **không thể chọn giá trị khác** (vì sẽ có node nhắc "round trước đã accept `v` rồi, anh phải dùng `v` đó").
+
+###### Ví dụ cụ thể
+
+```
+Cluster 3 nodes: A (Proposer), B, C (Acceptors)
+
+=== ROUND 1: A đề xuất "X" ===
+1. A → PREPARE(n=1) → B, C
+2. B → PROMISE(n=1, Ø)     (chưa accept ai)
+   C → PROMISE(n=1, Ø)     (chưa accept ai)
+   ✓ Quorum đạt (2/3)
+
+3. Không ai có v_accepted → A chọn v="X"
+4. A → ACCEPT(n=1, v="X") → B, C
+5. B, C → ACCEPTED(n=1, v="X") → Learners
+   ✓ Consensus: "X" được chọn vĩnh viễn!
+
+=== ROUND 2 (đồng thời): D đề xuất "Y" ===
+1. D → PREPARE(n=2) → B, C
+2. B → PROMISE(n=2, v_accepted="X")  ← BÁO CÁO giá trị đã accept!
+   C → PROMISE(n=2, v_accepted="X")
+3. D thấy v_accepted="X" → BUỘC PHẢI dùng v="X", không được chọn "Y"
+4. D → ACCEPT(n=2, v="X")
+   ✓ Safety đảm bảo: "X" luôn là giá trị duy nhất được chọn!
+```
+
+###### Liveness Issue — Dueling Proposers (Livelock)
+
+Paxos có thể bị **livelock** nếu 2 proposers liên tục cạnh tranh nhau:
+
+```
+P1: PREPARE(n=1) → quorum đồng ý
+P2: PREPARE(n=2) → làm n=1 invalid, quorum đồng ý P2
+P1: PREPARE(n=3) → làm n=2 invalid, quorum đồng ý P1
+P2: PREPARE(n=4) → ...
+→ Vô tận, không ai commit được!
+```
+
+**Giải pháp**: Chọn **1 Distinguished Leader** — chỉ 1 proposer được đề xuất tại một thời điểm. Đây là nền tảng của **Multi-Paxos**.
+
+###### Multi-Paxos — Thực tế triển khai
+
+**Basic Paxos** chỉ đồng thuận 1 giá trị duy nhất. **Multi-Paxos** mở rộng để đồng thuận một **chuỗi giá trị (log entries)** liên tiếp:
+
+- Khi Leader ổn định → **bỏ qua Phase 1** cho các round tiếp theo (chỉ chạy Phase 2)
+- Mỗi log slot là 1 instance Paxos độc lập
+- **Raft** (2014) về bản chất là Multi-Paxos được thiết kế lại cho dễ hiểu và implement hơn
+
+###### So sánh Paxos vs 2PC
+
+| | **Paxos (Consensus)** | **2PC (Atomic Commit)** |
+|---|---|---|
+| **Mục tiêu** | Đồng thuận về **một giá trị** trong log | Đảm bảo **ACID** cho transaction phân tán |
+| **Fault tolerance** | Tiếp tục nếu **đa số** còn sống | **Bị block** nếu Coordinator chết |
+| **Khi node fail** | Bầu leader mới, tiếp tục | Hệ thống treo đến khi Coordinator recover |
+| **Dùng khi nào** | Replication log, leader election | Distributed transaction (cross-shard) |
+| **Ứng dụng** | Raft, ZAB (ZooKeeper), etcd | MySQL Cluster, Google Spanner |
+
+> 📌 **Quan hệ thực tế**: **Google Spanner, CockroachDB** dùng **2PC cho Atomic Commit** (đảm bảo ACID), nhưng dùng **Paxos/Raft để làm Coordinator "bất tử"** — giải quyết chính xác điểm yếu Single Point of Failure của 2PC thuần túy.
 
 ##### E. ZAB
 
 ##### F. Raft
 
-#### 18.6. Parquet File Format
+#### 18.7. CAP Theorem
+
+**CAP Theorem** (Brewer's Theorem, 2000) phát biểu rằng một hệ thống phân tán **không thể đảm bảo đồng thời cả 3 thuộc tính** sau cùng một lúc — chỉ có thể đảm bảo tối đa 2 trong 3:
+
+| Thuộc tính | Ký hiệu | Ý nghĩa |
+|---|---|---|
+| **Consistency** | C | Mọi node đều trả về cùng một giá trị dữ liệu mới nhất cho mọi request. Đọc sau ghi luôn thấy bản ghi mới nhất. |
+| **Availability** | A | Mọi request hợp lệ đều nhận được phản hồi (không timeout, không lỗi) — dù dữ liệu có thể không phải mới nhất. |
+| **Partition Tolerance** | P | Hệ thống tiếp tục hoạt động dù mạng bị phân mảnh (một số node mất kết nối với nhau). |
+
+> 📌 **Thực tế**: Partition Tolerance là **BẮT BUỘC** trong mọi hệ phân tán thực tế (mạng luôn có thể bị đứt). Do đó, câu hỏi thực chất là: **Khi xảy ra Network Partition — chọn C hay A?**
+
+##### A. Khi Network Partition xảy ra
+
+```
+Trước Partition:                   Sau khi mạng đứt giữa Node1 và Node2:
+┌─────────┐   ┌─────────┐          ┌─────────┐     ✗     ┌─────────┐
+│  Node1  │◄──►  Node2  │    →     │  Node1  │────────   │  Node2  │
+│ x = 10  │   │ x = 10  │          │ x = 10  │           │ x = 10  │
+└─────────┘   └─────────┘          └─────────┘           └─────────┘
+                                   Client A               Client B
+                                   ghi x = 20             đọc x = ?
+```
+
+Khi `Client A` ghi `x = 20` lên `Node1` và `Client B` đọc từ `Node2` — hệ thống phải **lựa chọn**:
+
+---
+
+##### B. Choice 1: CP — Ưu tiên Consistency (Halt the System)
+
+- **Cơ chế**: Khi xảy ra Network Partition, **dừng nhận Write** ở bất kỳ node nào **không có majority** (đa số quorum). Node thiểu số sẽ từ chối phục vụ hoặc trả về lỗi.
+- **Kết quả**: Không bao giờ trả về dữ liệu stale (cũ). Nhưng hệ thống trở nên **Unavailable** trong thời gian partition.
+- **Ví dụ thực tế**: **HBase, ZooKeeper, etcd (Raft/Paxos)** — các node thiểu số sẽ từ chối đọc/ghi và throw error.
+
+```
+Node1 (majority): Tiếp tục nhận ghi, x = 20
+Node2 (minority): Từ chối phục vụ → Client B nhận lỗi 503
+→ Hệ thống nhất quán nhưng một phần không khả dụng
+```
+
+---
+
+##### C. Choice 2: AP — Ưu tiên Availability (Allow Split)
+
+- **Cơ chế**: Tất cả các node tiếp tục nhận và phục vụ request ngay cả khi bị phân mảnh. Chấp nhận rằng các node có thể có dữ liệu **diverge (phân kỳ)** trong thời gian partition.
+- **Kết quả**: Luôn Available — nhưng có thể đọc **stale data**. Cần cơ chế **conflict resolution** sau khi partition hồi phục.
+- **Ví dụ thực tế**: **Cassandra, DynamoDB, CouchDB, Riak**.
+
+```
+Node1: x = 20  (Client A đã ghi)
+Node2: x = 10  (vẫn giữ giá trị cũ)
+→ Client B đọc từ Node2 → thấy x = 10 (stale data)
+→ Sau khi mạng hồi phục: phải resolve conflict!
+```
+
+---
+
+##### D. Conflict Resolution sau khi Partition kết thúc
+
+Khi 2 node giao tiếp lại, chúng phát hiện ra dữ liệu đã **diverge** — cần cơ chế để quyết định version nào "thắng":
+
+###### 1. Last Write Wins (LWW)
+
+- **Nguyên lý**: Update nào có **timestamp mới nhất** (wall clock time) thì thắng — bản ghi cũ bị ghi đè.
+- **Cài đặt**: Mỗi write đính kèm timestamp theo đồng hồ hệ thống. Khi merge: `pick max(timestamp)`.
+- **Ưu điểm**: Đơn giản, dễ implement.
+- **Nhược điểm nghiêm trọng**:
+  - **Clock skew**: Đồng hồ trên các máy khác nhau không bao giờ đồng bộ hoàn toàn. Node bị lệch giờ có thể "thắng" dù write cũ hơn.
+  - **Data loss ngầm**: Một write hợp lệ bị ghi đè mà không có cảnh báo hay thông báo lỗi nào.
+- **Dùng khi**: Chấp nhận mất một số write, cần simplicity. Ví dụ: Cassandra (mặc định LWW).
+
+```
+Node1: x=20 tại T=100ms
+Node2: x=15 tại T=105ms (đồng hồ lệch +5ms)
+→ LWW chọn x=15 (T lớn hơn) → Mất write x=20 hoàn toàn!
+```
+
+###### 2. Vector Clock (Đồng hồ Vector)
+
+- **Vấn đề cần giải quyết**: LWW dùng thời gian thực (wall clock) rất không đáng tin trong môi trường phân tán. Vector Clock thay bằng **logical clock** để theo dõi quan hệ **nhân quả (causality)** giữa các event — phát hiện chính xác khi nào 2 write thực sự "đồng thời" (concurrent) hay có thứ tự trước sau.
+
+- **Cấu trúc**: Mỗi node duy trì một **vector** gồm các counter — một counter cho mỗi node trong cluster.
+
+```
+Cluster 3 nodes: N1, N2, N3
+Vector Clock của 1 object: [N1=x, N2=y, N3=z]
+
+- Mỗi khi node Ni xử lý 1 write: tăng counter Ni lên 1.
+- Khi nhận message từ node khác: merge bằng cách lấy max từng phần tử.
+  merge([2,1,0], [1,2,0]) → [max(2,1), max(1,2), max(0,0)] = [2,2,0]
+```
+
+- **Ví dụ minh họa**:
+
+```
+Trạng thái ban đầu (Client ghi x=10 vào N1, N1 sync sang N2):
+  N1: VC=[1,0,0], x=10
+  N2: VC=[1,0,0], x=10
+
+=== Network Partition xảy ra ===
+
+Client A ghi x=20 vào N1:
+  N1: VC=[2,0,0], x=20
+
+Client B ghi x=15 vào N2:
+  N2: VC=[1,1,0], x=15
+
+=== Mạng hồi phục — N1 và N2 liên lạc lại ===
+
+N1 gửi (VC=[2,0,0], x=20) tới N2
+N2 so sánh với local (VC=[1,1,0], x=15):
+
+  So sánh từng chiều:
+    - N1 counter: 2 > 1  → VC=[2,0,0] "tiến" hơn ở chiều N1
+    - N2 counter: 0 < 1  → VC=[1,1,0] "tiến" hơn ở chiều N2
+  → Không có VC nào dominates cái còn lại hoàn toàn
+  → ⚠ CONFLICT! Hai write này là ĐỒNG THỜI (concurrent)
+  → Cần ứng dụng hoặc người dùng giải quyết
+```
+
+- **Quy tắc so sánh Vector Clock**:
+
+| Quan hệ | Điều kiện | Ý nghĩa |
+|---|---|---|
+| **A → B** (A trước B) | Mọi `VC_A[i] ≤ VC_B[i]` và tồn tại ít nhất 1 `VC_A[i] < VC_B[i]` | A xảy ra trước B (có quan hệ nhân quả) → B an toàn ghi đè A |
+| **A ← B** (B trước A) | Mọi `VC_B[i] ≤ VC_A[i]` và tồn tại ít nhất 1 `VC_B[i] < VC_A[i]` | B xảy ra trước A → A an toàn ghi đè B |
+| **A ∥ B** (Đồng thời) | Không cái nào dominates cái kia | Không có quan hệ nhân quả → **Conflict thực sự, cần resolve** |
+
+- **Xử lý Conflict khi phát hiện `A ∥ B`**:
+  - **Merge tự động**: Nếu data structure hỗ trợ (VD: Set → Union, Counter → Sum). Ví dụ: **CRDT (Conflict-free Replicated Data Types)** trong Riak, Redis, và các database hiện đại.
+  - **Trả về cả 2 version cho client**: Client application tự quyết định version nào đúng (chiến lược của **Amazon DynamoDB** và **Riak** — trả về "siblings"). Phù hợp với Shopping Cart: merge 2 giỏ hàng bằng Union.
+  - **Last Write Wins as fallback**: Dùng LWW chỉ khi không thể resolve theo cách khác.
+
+- **Nhược điểm của Vector Clock**:
+  - **Vector size tăng theo số node**: Cluster 1000 node → vector 1000 phần tử gắn theo mỗi object → tốn bộ nhớ.
+  - **Phức tạp để implement** đúng cách, đặc biệt khi node join/leave cluster.
+  - **Dotted Version Vectors** (Riak) là phiên bản tối ưu hơn, giải quyết vấn đề false conflict.
+
+---
+
+##### E. Tổng kết: CP vs AP Systems
+
+| | **CP Systems** | **AP Systems** |
+|---|---|---|
+| **Ưu tiên** | Consistency | Availability |
+| **Khi partition** | Reject/lỗi một phần request | Tiếp tục phục vụ, data có thể stale |
+| **Conflict** | Không xảy ra (writes bị block ở minority) | Cần conflict resolution khi partition hồi phục |
+| **Phù hợp** | Financial data, metadata, config, distributed lock | Shopping cart, social feed, DNS, session store |
+| **Ví dụ** | HBase, ZooKeeper, etcd, Google Spanner | Cassandra, DynamoDB, CouchDB, Riak |
+
+> 📌 **Lưu ý quan trọng — PACELC Theorem**: CAP chỉ mô tả behavior khi có Partition. **PACELC** (2012) bổ sung: ngay cả khi **không có Partition (PC)**, hệ thống phải trade-off giữa **Latency (L)** và **Consistency (C)**. Ví dụ: Synchronous replication = strong consistency nhưng latency cao; Asynchronous replication = latency thấp nhưng chỉ đạt eventual consistency.
+
+#### 18.8. Parquet File Format
 
 ##### A. Parquet là gì?
 
