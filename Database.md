@@ -1,4 +1,4 @@
-﻿### 6. Column-Oriented Storage
+### 6. Column-Oriented Storage
 
 #### 6.1 Các dạng Storage
 
@@ -45,8 +45,21 @@
     - Nén theo column
 - **Patching**: Xử lý khi data vượt quá max size đã được nén
 
-> **Khi nào data bị nén?** Data bị nén khi **flush từ memory buffer xuống disk** (write path). Không phải mọi data đều bị nén — phụ thuộc vào cấu hình compression codec của từng column. Column có cardinality thấp (ít giá trị distinct) thường nén được tốt hơn.
-> **Data lưu thành page — nếu nén dạng sort thì lưu kiểu gì?** Trong PAX: data đã được sort bên trong mỗi column chunk theo thứ tự row group. Khi nén dạng **RLE (Run-Length Encoding)**, các giá trị lặp liên tiếp sau khi sort được nén thành cặp `(value, count)`. Khi nén **Dictionary encoding**, mỗi giá trị được thay bằng integer index → toàn bộ column chunk là array của integer → sort giúp các integer gần nhau → **delta encoding** nén thêm một lớp nữa.
+> **Khi nào data bị nén?**
+>
+> Data bị nén khi **flush từ memory buffer xuống disk** (write path).
+> - Không phải mọi data đều bị nén — phụ thuộc vào cấu hình compression codec của từng column
+> - Column có cardinality thấp (ít giá trị distinct) thường nén được tốt hơn
+
+> **Data lưu thành page — nếu nén dạng sort thì lưu kiểu gì?**
+>
+> Trong PAX: data đã được sort bên trong mỗi column chunk theo thứ tự row group.
+>
+> - **RLE (Run-Length Encoding)**: các giá trị lặp liên tiếp sau khi sort được nén thành cặp `(value, count)`
+> - **Dictionary encoding**: mỗi giá trị được thay bằng integer index
+>     → toàn bộ column chunk là array của integer
+>     → sort giúp các integer gần nhau
+>     → **delta encoding** nén thêm một lớp nữa
 
 ---
 
