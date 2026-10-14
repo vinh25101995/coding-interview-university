@@ -1,4 +1,642 @@
+# Database Internals & Interview Guide
+
+Tài liệu ôn tập Database từ nền tảng SQL/thiết kế schema → internals của storage engine (dựa trên lộ trình **CMU 15-445/645 Intro to Database Systems** và 15-721) → hệ phân tán → thực chiến MySQL/PostgreSQL cho phỏng vấn Backend.
+
+> 💡 **Tài liệu liên quan**:
+> - [`SystemDesign.md`](SystemDesign.md): Caching, Message Queue, Sharding ở tầng kiến trúc, Consistent Hashing, các case study.
+> - [`SpringBoot.md`](SpringBoot.md): Spring Data JPA, `@Transactional`, N+1, HikariCP.
+> - [`Java.md`](Java.md): Concurrency, JVM.
+> - [`Networking.md`](Networking.md): TCP/IP, DNS, HTTP, TLS, timeout & lỗi kết nối, troubleshooting mạng.
+
+## 📖 Cách đọc tài liệu này
+
+Mỗi chương được viết theo mạch **Bài toán → Cách giải → Áp dụng**:
+
+| Ký hiệu | Ý nghĩa |
+| :--- | :--- |
+| 🎯 **Bài toán** | Vấn đề thực tế cần giải quyết — vì sao kỹ thuật này tồn tại |
+| ❌ **Cách ngây thơ** | Cách làm "tự nhiên nhất" và lý do nó không đủ — giúp hiểu *vì sao* cần giải pháp phức tạp hơn |
+| 💡 **Ý tưởng giải** | Nguyên lý cốt lõi của giải pháp (phần chi tiết cơ chế nằm ngay bên dưới) |
+| ⚖️ **Các phương án** | Khi có nhiều cách: bảng ưu/nhược điểm |
+| ✅ **Vì sao chọn** | Lý do hệ thống thực tế chọn phương án đó, trong điều kiện nào |
+| 🛠 **Áp dụng** | Dùng kiến thức này vào công việc / thiết kế / debug thế nào |
+| 🧠 **Tự kiểm tra** | Câu hỏi "tại sao" để tự đánh giá đã hiểu bản chất chưa (bấm để xem đáp án) |
+
+### 🗺 Chuỗi bài toán của một hệ quản trị CSDL
+
+Toàn bộ tài liệu là một chuỗi bài toán nối tiếp nhau — giải xong bài này lại sinh ra bài kế tiếp:
+
+```
+ Ứng dụng muốn lưu & truy vấn dữ liệu mà không phải tự viết code duyệt file
+   └─► (1) Relational model + SQL khai báo "muốn gì"  → (2) thiết kế schema để dữ liệu không mâu thuẫn
+ Dữ liệu phải bền vững & lớn hơn RAM, nhưng disk chậm hơn RAM hàng nghìn lần
+   └─► (3) chia file thành PAGE  → (5) BUFFER POOL giữ page nóng trong RAM
+         ├─ ghi quá nhiều, cập nhật tại chỗ thành random I/O → (4) LSM-tree: biến ghi ngẫu nhiên thành ghi tuần tự
+         └─ truy vấn phân tích chỉ đọc vài cột của tỷ dòng      → (6) COLUMN STORE
+ Tìm 1 dòng trong tỷ dòng mà không quét hết bảng
+   └─► INDEX: (7) hash cho "=", (8) B+Tree cho "=", range, ORDER BY, (9) cấu trúc chuyên biệt (bloom, trie, inverted, vector)
+         └─ nhiều thread cùng sửa index → (10) LATCH
+ Thực thi query: sắp xếp, gộp nhóm, ghép bảng, chạy song song, chọn cách chạy rẻ nhất
+   └─► (11) sort/aggregate → (12) join → (13) mô hình thực thi → (14) song song → (15) optimizer
+ Nhiều người cùng đọc/ghi, có thể lỗi giữa chừng
+   └─► (16) TRANSACTION: ACID, isolation, 2PL / OCC / MVCC
+ Mất điện ngay sau khi commit
+   └─► (17) WAL → (18) crash recovery (ARIES)
+ Một máy không đủ (dung lượng, tải, độ sẵn sàng)
+   └─► (19) replication, partitioning, consensus, 2PC, CAP
+ Vận hành MySQL/PostgreSQL thật → (20)      Ôn phỏng vấn → (21)
+```
+
+## Mục lục
+
+**Phần I — Nền tảng**
+1. [Relational Model & SQL nâng cao](#1-relational-model--sql-nâng-cao)
+2. [Thiết kế Schema & Chuẩn hóa (Normalization)](#2-thiết-kế-schema--chuẩn-hóa-normalization)
+
+**Phần II — Storage**
+3. [Disk-Oriented Storage: File, Page & Tuple Layout](#3-disk-oriented-storage-file-page--tuple-layout)
+4. [Log-Structured Storage (LSM-Tree) & So sánh với B+Tree](#4-log-structured-storage-lsm-tree--so-sánh-với-btree)
+5. [Buffer Pool Manager](#5-buffer-pool-manager)
+6. [Column-Oriented Storage](#6-column-oriented-storage)
+
+**Phần III — Access Methods**
+
+7. [Database Hashtable](#7-database-hashtable)
+8. [B+Tree Index](#8-btree-index)
+9. [Filters, Skip List, Trie, Inverted Index & Vector Index](#9-filters-skip-list-trie-inverted-index--vector-index)
+10. [Latching (Index Concurrency Control)](#10-latching-in-database)
+
+**Phần IV — Query Processing**
+
+11. [Sorting & Aggregation](#11-sorting--aggregation)
+12. [Join Algorithms](#12-join-algorithms)
+13. [Query Execution: Processing Models & Access Methods](#13-query-execution-processing-models--access-methods)
+14. [Parallel Query Execution](#14-parallel-query-engine-architectures)
+15. [Query Optimization](#15-query-optimization)
+
+**Phần V — Transaction & Recovery**
+
+16. [Transaction, Concurrency Control & MVCC](#16-transaction)
+17. [WAL & Shadow Paging](#17-wal--shadow-paging)
+18. [Crash Recovery (ARIES)](#18-database-crash-recovery)
+
+**Phần VI — Distributed & Thực chiến**
+
+19. [Distributed Database](#19-distributed-database)
+20. [Database thực chiến: MySQL InnoDB & PostgreSQL](#20-database-thực-chiến-mysql-innodb--postgresql)
+21. [Câu hỏi phỏng vấn Database thường gặp](#21-câu-hỏi-phỏng-vấn-database-thường-gặp)
+
+---
+
+### 1. Relational Model & SQL nâng cao
+
+> 🎯 **Bài toán:** Ứng dụng cần lưu, tìm, sửa dữ liệu. Nếu mỗi ứng dụng tự đọc/ghi file thì đổi cách lưu (thêm index, đổi định dạng) là phải sửa toàn bộ code.
+>
+> ❌ **Cách ngây thơ:** Các DB thế hệ đầu (mô hình phân cấp/mạng — IMS, CODASYL, thập niên 60) bắt ứng dụng **tự đi theo con trỏ** giữa các bản ghi ("lấy khách hàng → đi theo link sang đơn hàng"). Code gắn chặt vào cách dữ liệu được lưu vật lý.
+>
+> 💡 **Ý tưởng giải:** Mô hình quan hệ (Codd, 1970) tách **"muốn gì"** khỏi **"lấy thế nào"**: dữ liệu là các bảng (tập hợp), người dùng viết truy vấn **khai báo** (SQL), còn DBMS tự chọn cách thực thi (index nào, join thế nào — chương 15). Đây là **data independence**: đổi index/cách lưu không phải sửa câu SQL.
+>
+> 👉 Hệ quả cần hiểu để viết SQL đúng: (1) thứ tự *logic* của câu SELECT khác thứ tự *vật lý* DB thực thi; (2) SQL làm việc với **tập hợp** nên tư duy theo tập (set-based) thay vì vòng lặp từng dòng; (3) `NULL` nghĩa là "không biết" nên cần logic 3 giá trị.
+
+
+#### 1.1. Relational Model — các khái niệm nền tảng
+- **Relation** (bảng) = tập **không thứ tự** các **tuple** (dòng); mỗi tuple gồm các **attribute** (cột) có **domain** (kiểu). Mô hình do Edgar F. Codd đề xuất năm 1970 — điểm cốt lõi là **data independence**: người dùng mô tả *muốn gì* (declarative), DBMS tự quyết *làm thế nào* (physical plan).
+- **Các loại key**:
+    - **Super key**: tập cột xác định duy nhất 1 tuple.
+    - **Candidate key**: super key tối thiểu (bỏ bớt cột nào cũng không còn unique).
+    - **Primary key**: candidate key được chọn làm định danh chính (NOT NULL + UNIQUE).
+    - **Alternate key**: candidate key còn lại → thường đặt `UNIQUE` constraint.
+    - **Foreign key**: tham chiếu tới primary/unique key của bảng khác → đảm bảo **referential integrity** (`ON DELETE CASCADE | SET NULL | RESTRICT`).
+    - **Natural key** (có ý nghĩa nghiệp vụ: email, CCCD) vs **Surrogate key** (vô nghĩa, do hệ thống sinh: `BIGINT IDENTITY`, UUID) → nên dùng surrogate làm PK, natural key làm `UNIQUE` vì dữ liệu nghiệp vụ có thể thay đổi.
+- **Relational algebra** — nền tảng để DBMS biến SQL thành plan (chương 13, 15):
+
+| Phép toán | Ký hiệu | SQL tương ứng |
+|---|---|---|
+| Selection | σ | `WHERE` |
+| Projection | π | `SELECT col1, col2` |
+| Union / Intersection / Difference | ∪ ∩ − | `UNION`, `INTERSECT`, `EXCEPT` |
+| Cartesian product | × | `CROSS JOIN` |
+| Join | ⋈ | `JOIN ... ON` |
+| Rename | ρ | `AS` |
+| Aggregation / Grouping | γ | `GROUP BY` + `SUM/COUNT/...` |
+
+> ⚠️ Đại số quan hệ dùng **set semantics** (không trùng), còn SQL dùng **bag semantics** (cho phép trùng) — đó là lý do có `DISTINCT` và sự khác biệt `UNION` (loại trùng, phải sort/hash) vs `UNION ALL` (giữ nguyên, rẻ hơn nhiều).
+
+#### 1.2. Thứ tự thực thi logic của câu SELECT
+
+```
+  (5) SELECT  (5.1) DISTINCT  <cột / biểu thức / window function>
+  (1) FROM    <bảng>  (1.1) JOIN ... ON ...
+  (2) WHERE   <điều kiện trên từng dòng>
+  (3) GROUP BY <cột>
+  (4) HAVING  <điều kiện trên từng nhóm>
+  (6) ORDER BY <cột>
+  (7) LIMIT / OFFSET
+```
+- Vì `WHERE` chạy **trước** `SELECT` → không dùng được alias khai báo trong SELECT ở WHERE (MySQL và PostgreSQL đều báo lỗi). `ORDER BY` chạy **sau** nên dùng được alias.
+- `WHERE` lọc **dòng** trước khi gom nhóm (không chứa aggregate); `HAVING` lọc **nhóm** sau khi gom (chứa aggregate). Điều kiện không chứa aggregate nên đặt ở `WHERE` để giảm dữ liệu sớm.
+- Window function được tính sau `HAVING` → **không** dùng window function trong `WHERE`; phải bọc subquery/CTE rồi lọc ở ngoài.
+- Đây là thứ tự **logic** (ngữ nghĩa). Optimizer được phép thực thi theo thứ tự vật lý khác miễn kết quả tương đương (predicate pushdown, join reorder...).
+
+#### 1.3. JOIN & NULL — những chỗ hay sai
+- **INNER JOIN**: chỉ dòng match ở cả 2 bên. **LEFT/RIGHT JOIN**: giữ mọi dòng bảng trái/phải, phía không match thành `NULL`. **FULL OUTER JOIN**: giữ cả 2 (MySQL không hỗ trợ → `LEFT JOIN ... UNION ... RIGHT JOIN`). **CROSS JOIN**: tích Đề-các. **SELF JOIN**: join bảng với chính nó (vd nhân viên ↔ quản lý).
+- ⚠️ **Điều kiện ở `ON` vs `WHERE` với LEFT JOIN**:
+    ```sql
+    -- Giữ mọi customer, chỉ ghép những order PAID (customer không có order PAID vẫn xuất hiện với NULL)
+    SELECT c.id, o.id FROM customers c LEFT JOIN orders o ON o.customer_id = c.id AND o.status = 'PAID';
+
+    -- Lọc ở WHERE → loại luôn các dòng NULL → LEFT JOIN thành INNER JOIN!
+    SELECT c.id, o.id FROM customers c LEFT JOIN orders o ON o.customer_id = c.id WHERE o.status = 'PAID';
+    ```
+- **NULL & logic 3 giá trị** (`TRUE / FALSE / UNKNOWN`):
+    - `NULL = NULL` → `UNKNOWN` (không phải TRUE) → phải dùng `IS NULL`, `IS DISTINCT FROM` (PG) hoặc `<=>` (MySQL).
+    - `WHERE` chỉ giữ dòng có điều kiện là `TRUE` (loại cả `FALSE` lẫn `UNKNOWN`).
+    - `COUNT(*)` đếm mọi dòng; `COUNT(col)` bỏ qua `NULL`; `SUM/AVG/MIN/MAX` bỏ qua `NULL` (`AVG(col)` ≠ `SUM(col)/COUNT(*)` nếu có NULL). `SUM` của tập rỗng là `NULL` → dùng `COALESCE(SUM(x), 0)`.
+    - ⚠️ `WHERE id NOT IN (SELECT manager_id FROM emp)` → nếu subquery chứa **dù chỉ 1 NULL** thì **không trả dòng nào**. Dùng `NOT EXISTS` thay thế.
+    - `UNIQUE` cho phép nhiều `NULL` (vì NULL ≠ NULL) — PG 15+ có `UNIQUE NULLS NOT DISTINCT` nếu muốn chặn.
+
+#### 1.4. Subquery, CTE & Recursive CTE
+- **Correlated subquery** tham chiếu tới bảng ngoài → về logic chạy lại cho mỗi dòng ngoài (optimizer thường **decorrelate** thành join/semi-join).
+- **CTE (`WITH`)**: đặt tên cho subquery để dễ đọc. PostgreSQL ≤ 11 luôn **materialize** CTE (là "optimization fence"); từ PG 12 tự **inline** nếu CTE chỉ được dùng 1 lần và không có side effect (có thể ép bằng `MATERIALIZED` / `NOT MATERIALIZED`). MySQL hỗ trợ CTE từ 8.0.
+- **Recursive CTE** — duyệt cây/đồ thị (sơ đồ tổ chức, danh mục nhiều cấp, đường đi):
+    ```sql
+    WITH RECURSIVE subordinates AS (
+        SELECT id, name, manager_id, 1 AS depth
+        FROM employees WHERE id = 1                  -- anchor: CEO
+        UNION ALL
+        SELECT e.id, e.name, e.manager_id, s.depth + 1
+        FROM employees e JOIN subordinates s ON e.manager_id = s.id   -- recursive step
+    )
+    SELECT * FROM subordinates;
+    ```
+    → Luôn có điều kiện dừng; với đồ thị có chu trình cần lưu path để tránh lặp vô hạn (PG 14+ có mệnh đề `CYCLE`).
+
+#### 1.5. Window Functions
+Tính toán **trên một "cửa sổ" các dòng liên quan** mà **không gộp** các dòng lại (khác `GROUP BY`).
+
+```sql
+SELECT
+    dept_id, name, salary,
+    ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY salary DESC) AS rn,        -- 1,2,3,4 (không trùng)
+    RANK()       OVER (PARTITION BY dept_id ORDER BY salary DESC) AS rnk,       -- 1,2,2,4 (nhảy số)
+    DENSE_RANK() OVER (PARTITION BY dept_id ORDER BY salary DESC) AS drnk,      -- 1,2,2,3 (không nhảy)
+    LAG(salary)  OVER (PARTITION BY dept_id ORDER BY hired_at)    AS prev_sal,  -- giá trị dòng trước
+    SUM(salary)  OVER (PARTITION BY dept_id)                       AS dept_total,
+    SUM(amount)  OVER (ORDER BY created_at ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+    AVG(amount)  OVER (ORDER BY created_at ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)         AS moving_avg_7
+FROM employees;
+```
+- **Frame**: `ROWS` (đếm theo dòng vật lý) vs `RANGE` (theo giá trị — các dòng cùng giá trị ORDER BY được coi là "peer" và cùng vào frame). ⚠️ Mặc định khi có `ORDER BY` là `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` → running total có thể "nhảy cóc" khi trùng giá trị sắp xếp; nên ghi rõ `ROWS`.
+- Các hàm hay dùng: `NTILE(n)`, `FIRST_VALUE/LAST_VALUE`, `LEAD`, `PERCENT_RANK`, `CUME_DIST`.
+
+#### 1.6. Các bài SQL phỏng vấn kinh điển
+
+```sql
+-- (1) Lương cao thứ N (N = 2). DENSE_RANK để xử lý trùng lương
+SELECT DISTINCT salary FROM (
+    SELECT salary, DENSE_RANK() OVER (ORDER BY salary DESC) AS r FROM employees
+) t WHERE r = 2;
+
+-- (2) Top 3 lương cao nhất MỖI phòng ban (top-N per group)
+SELECT * FROM (
+    SELECT e.*, DENSE_RANK() OVER (PARTITION BY dept_id ORDER BY salary DESC) AS r FROM employees e
+) t WHERE r <= 3;
+
+-- (3) Tìm email bị trùng
+SELECT email, COUNT(*) FROM users GROUP BY email HAVING COUNT(*) > 1;
+
+-- (4) Xóa bản ghi trùng, giữ bản mới nhất (PostgreSQL)
+DELETE FROM users u USING (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY email ORDER BY created_at DESC) AS rn FROM users
+) d WHERE u.id = d.id AND d.rn > 1;
+
+-- (5) Nhân viên lương cao hơn quản lý (self join)
+SELECT e.name FROM employees e JOIN employees m ON e.manager_id = m.id WHERE e.salary > m.salary;
+
+-- (6) Khách hàng chưa từng đặt hàng (anti-join) — dùng NOT EXISTS, không dùng NOT IN
+SELECT c.* FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);
+
+-- (7) Gaps & Islands: các chuỗi ngày đăng nhập liên tiếp của mỗi user
+SELECT user_id, MIN(d) AS start_day, MAX(d) AS end_day, COUNT(*) AS streak
+FROM (
+    SELECT user_id, d, d - (ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY d))::int AS grp  -- ngày liên tiếp có cùng grp
+    FROM (SELECT DISTINCT user_id, login_at::date AS d FROM logins) x
+) y GROUP BY user_id, grp;
+
+-- (8) Pivot bằng conditional aggregation
+SELECT user_id,
+       SUM(CASE WHEN status = 'PAID'     THEN amount ELSE 0 END) AS paid,
+       SUM(CASE WHEN status = 'REFUNDED' THEN amount ELSE 0 END) AS refunded
+FROM orders GROUP BY user_id;            -- PG có cú pháp gọn: SUM(amount) FILTER (WHERE status = 'PAID')
+
+-- (9) Tỷ lệ % doanh thu mỗi sản phẩm trên tổng
+SELECT product_id, SUM(amount) * 100.0 / SUM(SUM(amount)) OVER () AS pct FROM orders GROUP BY product_id;
+
+-- (10) Upsert
+INSERT INTO counters (key, cnt) VALUES ('a', 1)
+ON CONFLICT (key) DO UPDATE SET cnt = counters.cnt + EXCLUDED.cnt;          -- PostgreSQL
+INSERT INTO counters (`key`, cnt) VALUES ('a', 1)
+ON DUPLICATE KEY UPDATE cnt = cnt + VALUES(cnt);                           -- MySQL (8.0.20+ khuyên dùng alias: AS new ... cnt + new.cnt)
+```
+
+#### 1.7. Câu hỏi SQL ngắn hay gặp
+| Câu hỏi | Trả lời ngắn |
+|---|---|
+| `DELETE` vs `TRUNCATE` vs `DROP` | `DELETE`: xóa từng dòng, có WHERE, ghi log từng dòng, kích hoạt trigger, rollback được. `TRUNCATE`: xóa toàn bộ bằng cách cấp phát lại storage, rất nhanh, reset auto-increment; là DDL (MySQL: auto-commit, không rollback; PostgreSQL: **rollback được** trong transaction). `DROP`: xóa cả bảng lẫn định nghĩa |
+| `UNION` vs `UNION ALL` | `UNION` loại trùng (tốn sort/hash), `UNION ALL` giữ nguyên — dùng `UNION ALL` khi biết chắc không trùng |
+| `CHAR` vs `VARCHAR` | `CHAR(n)` cố định, pad khoảng trắng; `VARCHAR(n)` lưu độ dài + dữ liệu. PostgreSQL: `TEXT` và `VARCHAR` hiệu năng như nhau |
+| `EXISTS` vs `IN` | Với optimizer hiện đại thường như nhau (đều thành semi-join); khác biệt quan trọng là `NOT IN` + NULL |
+| `COUNT(*)` vs `COUNT(1)` vs `COUNT(col)` | 2 cái đầu như nhau; `COUNT(col)` bỏ NULL. InnoDB `COUNT(*)` phải quét index nhỏ nhất (không lưu sẵn số dòng do MVCC) |
+| Tại sao không nên `SELECT *` | Đọc thừa dữ liệu/network, phá covering index, vỡ code khi thêm cột, ORM map sai |
+| `FLOAT` cho tiền? | **Không**. Dùng `DECIMAL/NUMERIC(19,4)` hoặc lưu số nguyên đơn vị nhỏ nhất (đồng/cent) vì float nhị phân không biểu diễn chính xác 0.1 |
+
+> 🛠 **Áp dụng:**
+> - Đẩy việc lọc/gộp/ghép xuống DB bằng 1 câu SQL thay vì kéo dữ liệu về app rồi lặp (nguồn gốc của N+1 query và chậm chạp).
+> - Bài toán "top N mỗi nhóm", "running total", "so với dòng trước" → nghĩ ngay tới **window function**, không cần self-join hay xử lý ở app.
+> - Luôn dùng `NOT EXISTS` cho anti-join; cẩn thận điều kiện của bảng bên phải trong `LEFT JOIN` phải nằm ở `ON`.
+> - Khi query chậm, đừng đoán — đọc plan bằng `EXPLAIN ANALYZE` (20.3) để xem DB đã "tự chọn" cách làm gì.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao không dùng được alias đặt trong `SELECT` ở mệnh đề `WHERE`?**
+   → Theo thứ tự logic, `WHERE` được đánh giá **trước** `SELECT`, nên alias chưa tồn tại. `ORDER BY` chạy sau `SELECT` nên dùng được.
+2. **`SELECT * FROM a WHERE id NOT IN (SELECT ref FROM b)` trả về rỗng dù chắc chắn có dòng thỏa — tại sao?**
+   → Nếu `b.ref` có 1 giá trị `NULL`, thì `id NOT IN (..., NULL)` = `... AND id <> NULL` = `UNKNOWN` cho mọi dòng → bị loại hết.
+3. **Window function khác `GROUP BY` ở bản chất gì?**
+   → `GROUP BY` gộp nhiều dòng thành 1; window function tính trên một nhóm dòng liên quan nhưng **giữ nguyên từng dòng**.
+</details>
+
+
+---
+
+### 2. Thiết kế Schema & Chuẩn hóa (Normalization)
+
+> 🎯 **Bài toán:** Dữ liệu được cập nhật liên tục bởi nhiều chức năng. Làm sao để **không bao giờ mâu thuẫn** (cùng một khách hàng có 2 số điện thoại khác nhau ở 2 chỗ) mà vẫn đọc đủ nhanh?
+>
+> ❌ **Cách ngây thơ:** Một bảng "to" chứa mọi thứ cần hiển thị (đơn hàng + thông tin khách + thông tin sản phẩm). Đọc rất tiện, nhưng mỗi sự thật bị lặp ở nhiều dòng → sửa sót là mâu thuẫn (các *dị thường* ở 2.1).
+>
+> 💡 **Ý tưởng giải:** **Mỗi sự thật chỉ lưu đúng một chỗ** — tách bảng theo *phụ thuộc hàm* (cột nào xác định cột nào). Các dạng chuẩn 1NF → 3NF/BCNF là các bước kiểm tra điều đó. Cái giá: đọc phải `JOIN`.
+
+
+#### 2.1. Vì sao phải chuẩn hóa — Các dị thường (anomalies)
+Bảng chưa chuẩn hóa `orders(order_id, customer_id, customer_name, customer_phone, product_id, product_name, qty)`:
+- **Update anomaly**: khách đổi số điện thoại → phải sửa ở mọi đơn hàng; sót 1 dòng → dữ liệu mâu thuẫn.
+- **Insert anomaly**: không thể lưu khách hàng mới khi họ chưa có đơn hàng.
+- **Delete anomaly**: xóa đơn hàng duy nhất của khách → mất luôn thông tin khách.
+
+**Functional dependency (FD)** `X → Y`: biết giá trị X thì xác định duy nhất Y (vd `customer_id → customer_name`). Chuẩn hóa = tách bảng sao cho mọi FD đều "đi ra từ key".
+
+#### 2.2. Các dạng chuẩn
+| Dạng chuẩn | Điều kiện | Ví dụ vi phạm → cách sửa |
+|---|---|---|
+| **1NF** | Giá trị **nguyên tử**, không có nhóm lặp/mảng trong 1 cột; mỗi dòng có key | `phones = "090..., 091..."` → tách bảng `customer_phones` |
+| **2NF** | 1NF + mọi cột không-khóa phụ thuộc **toàn bộ** primary key (không phụ thuộc một phần của composite key) | `order_items(order_id, product_id, qty, product_name)`: `product_name` chỉ phụ thuộc `product_id` → tách bảng `products` |
+| **3NF** | 2NF + không có **phụ thuộc bắc cầu** (cột không-khóa → cột không-khóa) | `orders(order_id, customer_id, customer_name)`: `order_id → customer_id → customer_name` → tách `customers` |
+| **BCNF** | Với mọi FD không tầm thường `X → Y`, X phải là **super key** (chặt hơn 3NF) | `(student, course) → teacher` và `teacher → course` → tách `(teacher, course)` và `(student, teacher)` |
+| 4NF / 5NF | Loại multi-valued dependency / join dependency | Ít gặp trong thực tế |
+
+> Câu thần chú cho 3NF: *"Every non-key attribute must provide a fact about the key, the whole key, and nothing but the key."*
+
+#### 2.3. Denormalization — khi nào phá chuẩn?
+- Chuẩn hóa tối ưu **ghi & tính nhất quán**; phá chuẩn tối ưu **đọc** (bớt JOIN) với cái giá là phải đồng bộ dữ liệu trùng lặp.
+- Các kỹ thuật phổ biến: lưu sẵn cột tổng hợp (`orders.total_amount`, `post.comment_count`), copy giá sản phẩm vào `order_items.unit_price` (đây là **đúng nghiệp vụ** — giá tại thời điểm mua — không phải phá chuẩn sai), materialized view, bảng read-model riêng (CQRS), document DB lưu nested.
+- Cách giữ đồng bộ: cập nhật trong cùng transaction, trigger, CDC → consumer cập nhật read model, job đối soát định kỳ.
+
+#### 2.4. OLTP vs OLAP & mô hình hóa dữ liệu phân tích
+| | OLTP | OLAP |
+|---|---|---|
+| Workload | Nhiều transaction ngắn, đọc/ghi vài dòng theo key | Ít query nhưng quét/aggregate hàng triệu–tỷ dòng |
+| Schema | Chuẩn hóa (3NF) | **Star schema** (1 fact table + nhiều dimension table phi chuẩn) / Snowflake schema (dimension chuẩn hóa thêm) |
+| Storage | Row store (chương 3) | Column store (chương 6) |
+| Ví dụ | MySQL, PostgreSQL, Oracle | ClickHouse, Snowflake, BigQuery, Redshift, DuckDB |
+- **HTAP** (Hybrid): TiDB (TiKV + TiFlash), SingleStore, Oracle In-Memory, PostgreSQL + extension columnar.
+
+#### 2.5. Lựa chọn kiểu dữ liệu & các pattern/anti-pattern
+- **Tiền**: `NUMERIC(19,4)` hoặc `BIGINT` theo đơn vị nhỏ nhất; luôn lưu kèm `currency`.
+- **Thời gian**: PostgreSQL dùng `TIMESTAMPTZ` (lưu UTC, hiển thị theo time zone session); MySQL `DATETIME` (không time zone) vs `TIMESTAMP` (UTC, giới hạn năm 2038) → khuyến nghị lưu UTC.
+- **Primary key**: `BIGINT` auto-increment/identity (nhỏ, tăng dần → insert cuối B+Tree, ít page split) vs **UUIDv4** (ngẫu nhiên → insert rải rác khắp index, page split & cache miss, index to gấp đôi) vs **UUIDv7 / ULID** (có tiền tố thời gian → gần tăng dần, sinh phân tán được — PostgreSQL 18 có sẵn hàm `uuidv7()`). Xem thêm SystemDesign 11.5.
+- **Boolean/trạng thái**: `ENUM` (MySQL lưu 1–2 byte, thêm giá trị phải ALTER) vs bảng lookup + FK vs `VARCHAR` + `CHECK`.
+- **JSON**: PostgreSQL `JSONB` (nhị phân, index được bằng GIN) cho thuộc tính linh hoạt; đừng nhét các cột hay query/join vào JSON.
+- **Anti-pattern hay gặp**:
+    - **EAV** (Entity-Attribute-Value: `(entity_id, attr_name, attr_value)`) → mất kiểu dữ liệu, mất constraint, query pivot cực khổ → cân nhắc JSONB.
+    - **Polymorphic association** (`comments(commentable_type, commentable_id)`) → không có FK thật.
+    - **Lưu danh sách ID trong 1 cột** (`"1,5,9"`) → vi phạm 1NF, không join/index được → dùng bảng nối (junction table) cho quan hệ N-N.
+    - **Soft delete** (`deleted_at`) → mọi query phải nhớ lọc, `UNIQUE` bị vướng bản ghi đã xóa (giải pháp: partial unique index `WHERE deleted_at IS NULL`), bảng phình to.
+- **Ràng buộc ở tầng DB** (`NOT NULL`, `UNIQUE`, `FK`, `CHECK`) là lớp bảo vệ cuối cùng — validate ở application thôi là chưa đủ khi có race condition (2 request cùng kiểm tra "email chưa tồn tại" rồi cùng insert).
+
+**⚖️ Chuẩn hóa vs Phi chuẩn hóa**
+
+| | Chuẩn hóa (3NF) | Phi chuẩn hóa (denormalize) |
+| :--- | :--- | :--- |
+| Ghi / cập nhật | Sửa 1 chỗ, luôn nhất quán | Phải sửa nhiều chỗ, dễ lệch |
+| Đọc | Cần JOIN | Đọc 1 chỗ, nhanh |
+| Dung lượng | Ít trùng lặp | Trùng lặp nhiều |
+| Phù hợp | OLTP — nguồn chân lý (source of truth) | Read model, báo cáo, cache, OLAP (star schema) |
+
+✅ **Vì sao chọn:** Mặc định chuẩn hóa tới **3NF** cho cơ sở dữ liệu nghiệp vụ, vì sai dữ liệu khó sửa hơn nhiều so với query chậm (query chậm còn tối ưu được bằng index/cache). Chỉ phi chuẩn hóa **có chủ đích** ở chỗ đã đo được là chậm, và luôn kèm cơ chế đồng bộ (cùng transaction, trigger, CDC). Hệ OLAP thì ngược lại — chủ yếu đọc/quét nên chọn star schema.
+
+> 🛠 **Áp dụng:**
+> - Thiết kế bắt đầu từ **thực thể & quan hệ** (để đúng), sau đó xem **access pattern** (để nhanh): query nào chạy nhiều nhất, cần index gì.
+> - Đặt ràng buộc ở DB (`NOT NULL`, `UNIQUE`, `FK`, `CHECK`) — đây là lớp bảo vệ duy nhất chống race condition giữa nhiều instance của app.
+> - Chọn kiểu dữ liệu & khóa chính theo 2.5 (tiền dùng `NUMERIC`, PK tăng dần).
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **`order_items` lưu `unit_price` trong khi `products` đã có `price` — có vi phạm chuẩn hóa không?**
+   → Không. Đó là **một sự thật khác**: giá *tại thời điểm mua*. Nếu đọc từ `products.price` thì đổi giá sản phẩm sẽ làm sai lịch sử đơn hàng.
+2. **App đã kiểm tra "email chưa tồn tại" trước khi insert, vì sao vẫn cần `UNIQUE` ở DB?**
+   → Hai request đồng thời cùng kiểm tra thấy "chưa có" rồi cùng insert. Chỉ ràng buộc ở DB mới là nguyên tử.
+</details>
+
+
+---
+
+### 3. Disk-Oriented Storage: File, Page & Tuple Layout
+
+> 🎯 **Bài toán:** Dữ liệu phải **còn nguyên khi tắt máy** và có thể **lớn hơn RAM** rất nhiều. Nhưng disk chậm hơn RAM 1.000–100.000 lần và chỉ đọc/ghi theo **khối (block)**, không theo byte.
+>
+> ❌ **Cách ngây thơ:** Lưu mỗi bảng thành 1 file văn bản (kiểu CSV). Muốn tìm 1 dòng phải đọc cả file; sửa 1 dòng làm độ dài thay đổi → phải ghi lại cả file; không có cách nào biết dòng nằm ở byte thứ mấy.
+>
+> 💡 **Ý tưởng giải:** Chia file thành các **page** kích thước cố định (4–16 KB) — đúng đơn vị mà disk đọc/ghi hiệu quả. Mỗi page có cấu trúc **slotted page** để tuple có thể dịch chuyển bên trong page mà **định danh `(page_id, slot)` không đổi** → index trỏ tới tuple ổn định. Các page nóng được giữ trong RAM bởi buffer pool (chương 5).
+
+
+#### 3.1. Storage hierarchy & kiến trúc disk-oriented
+```
+            ┌─────────────┐  ~1 ns     ▲ Nhanh, nhỏ, đắt
+            │ CPU Register│            │
+            │ L1/L2/L3    │  1–40 ns   │   VOLATILE (mất khi mất điện)
+            │ DRAM        │  ~100 ns   │   truy cập ngẫu nhiên theo byte
+            ├─────────────┤ ─ ─ ─ ─ ─ ─│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+            │ NVMe SSD    │  ~10-100 µs│   NON-VOLATILE
+            │ HDD         │  ~5-10 ms  │   truy cập theo block, tuần tự nhanh hơn ngẫu nhiên nhiều
+            │ Network/S3  │  ~10-100 ms▼ Chậm, lớn, rẻ
+            └─────────────┘
+```
+- DBMS **disk-oriented** giả định dữ liệu chính nằm trên disk; mọi truy cập phải nạp page vào **buffer pool** trong RAM (chương 5).
+- Mục tiêu thiết kế: (1) cho phép quản lý database **lớn hơn RAM**, (2) **giảm thiểu & ưu tiên I/O tuần tự**, (3) che giấu độ trễ disk (prefetch, chạy việc khác trong lúc chờ I/O).
+- Các tầng của storage manager:
+```
+   Query Execution
+         │ get_page(page_id)
+   ┌─────▼──────────┐
+   │  Buffer Pool   │ (RAM: frames chứa page)
+   └─────┬──────────┘
+         │ read/write page
+   ┌─────▼──────────┐
+   │  Disk Manager  │ (file → page)  Database file(s): [header|page 0|page 1|page 2|...]
+   └────────────────┘
+```
+
+#### 3.2. Tại sao DBMS không dùng `mmap` của OS?
+Có thể map file DB vào bộ nhớ ảo và để OS lo việc nạp/đẩy page, nhưng (paper *"Are You Sure You Want to Use MMAP in Your Database Management System?"* — CIDR 2022):
+1. **Transaction safety**: OS có thể flush dirty page xuống disk **bất cứ lúc nào** → vi phạm quy tắc WAL (log phải xuống trước data).
+2. **I/O stall**: DBMS không biết page nào đang ở RAM → một lần truy cập có thể bị page fault chặn thread bất ngờ.
+3. **Error handling**: lỗi I/O trở thành tín hiệu `SIGBUS` khó xử lý; checksum khó kiểm soát.
+4. **Hiệu năng**: page table của OS, TLB shootdown, contention trong kernel khi nhiều thread.
+→ DBMS tự quản lý buffer pool để kiểm soát: thứ tự flush, prefetch, replacement policy, scheduling. (Một số hệ dùng mmap: LMDB, MongoDB MMAPv1 cũ — đã bỏ; SQLite tùy chọn.)
+
+#### 3.3. File & Page
+- **Page** = khối dữ liệu kích thước cố định, có **page id** duy nhất. Kích thước: PostgreSQL **8 KB**, MySQL InnoDB **16 KB**, SQLite **4 KB**, Oracle 8 KB (cấu hình được), SQL Server 8 KB.
+- Phân biệt: **hardware page** (thường 4 KB — đơn vị ghi nguyên tử mà đĩa đảm bảo) vs **OS page** (4 KB) vs **database page** (4–16 KB). Nếu database page lớn hơn hardware page → mất điện giữa chừng có thể chỉ ghi được một nửa page (**torn page**):
+    - **InnoDB**: **doublewrite buffer** — ghi page vào vùng doublewrite trước, rồi mới ghi vào vị trí thật; khi recovery phát hiện page hỏng thì lấy bản trong doublewrite.
+    - **PostgreSQL**: **full_page_writes** — lần đầu page bị sửa sau mỗi checkpoint, ghi **toàn bộ page** vào WAL.
+- **Heap file** = tập page không thứ tự chứa tuple. Tìm page: **page directory** (page đặc biệt lưu vị trí & lượng chỗ trống của các page data) — PostgreSQL có **Free Space Map (FSM)** và **Visibility Map (VM)** cho mục đích tương tự.
+- **Page header** chứa: page size, checksum, version DBMS, thông tin transaction visibility, (với PG) LSN của lần sửa cuối.
+
+#### 3.4. Tuple-Oriented Page Layout: Slotted Page
+```
+┌────────────────────────────────────────────┐
+│ Header │ slot1 │ slot2 │ slot3 │ ...  →    │  slot array mọc từ đầu
+│                                            │
+│                 free space                 │
+│                                            │
+│           ←  ... │ tuple3 │ tuple2 │ tuple1│  tuple data mọc từ cuối
+└────────────────────────────────────────────┘
+```
+- **Slot array** lưu offset (và độ dài) của từng tuple → tuple có thể **di chuyển trong page** (compaction) mà không đổi định danh bên ngoài.
+- **Record ID** = `(page_id, slot_number)` — PostgreSQL gọi là **CTID** (`SELECT ctid, * FROM t;` → `(0,1)`), SQL Server là RID, Oracle là ROWID. ⚠️ Không dùng record id làm định danh ở application vì nó thay đổi sau UPDATE/VACUUM FULL.
+- Insert: tìm page còn chỗ (qua page directory/FSM) → thêm slot + ghi tuple. Delete: đánh dấu slot trống (không cần dời các tuple khác).
+- **Index-organized storage** (InnoDB, SQLite, SQL Server clustered index): không có heap riêng — tuple nằm luôn trong **leaf page của B+Tree** sắp theo primary key (chương 8).
+
+#### 3.5. Tuple Layout
+```
+┌───────────────────────────────────┬─────────────────────────────────────┐
+│ Header: visibility info (MVCC     │ Attribute data: a | b | c | ...     │
+│ xmin/xmax...), NULL bitmap        │ (theo thứ tự khai báo khi CREATE)   │
+└───────────────────────────────────┴─────────────────────────────────────┘
+```
+- **NULL bitmap** trong header đánh dấu cột nào NULL → không tốn chỗ cho giá trị.
+- **Alignment / padding** (PostgreSQL): mỗi cột được căn theo kích thước kiểu (8 byte cho `BIGINT/TIMESTAMP`, 4 cho `INT`...). Thứ tự cột ảnh hưởng dung lượng:
+    ```
+    (a BOOLEAN, b BIGINT, c BOOLEAN, d BIGINT)  → 1 + 7 pad + 8 + 1 + 7 pad + 8 = 32 bytes
+    (b BIGINT, d BIGINT, a BOOLEAN, c BOOLEAN)  → 8 + 8 + 1 + 1             = 18 bytes
+    ```
+    Header tuple PG ~23 bytes → bảng nhiều dòng ít cột có overhead đáng kể.
+- **Denormalized tuple (pre-join)**: một số hệ lưu tuple của 2 bảng liên quan cạnh nhau trong cùng page để giảm I/O khi join (IBM System R, Oracle *table clusters*; Google Spanner *interleaved tables*).
+
+#### 3.6. Biểu diễn dữ liệu & giá trị lớn
+- `INTEGER/BIGINT/SMALLINT`, `FLOAT/REAL/DOUBLE` theo chuẩn C/IEEE-754 → **nhanh nhưng không chính xác** (`0.1 + 0.2 ≠ 0.3`).
+- `NUMERIC/DECIMAL` là **fixed-point có độ chính xác tùy ý**, DBMS tự cài đặt (lưu các chữ số + scale + dấu) → **chính xác nhưng chậm hơn nhiều** → bắt buộc cho tiền tệ.
+- `VARCHAR/TEXT/BLOB`: lưu header độ dài + dữ liệu.
+- **Giá trị lớn hơn page** (hoặc lớn hơn ngưỡng):
+    - **PostgreSQL TOAST**: giá trị > ~2 KB được **nén** (pglz/LZ4 từ PG 14) và/hoặc chuyển sang bảng **TOAST** riêng (chia thành chunk ~2 KB); tuple chính chỉ giữ con trỏ. `SELECT *` kéo theo cột TOAST làm chậm đáng kể.
+    - **InnoDB**: row format `DYNAMIC` (mặc định) — cột `TEXT/BLOB/VARCHAR` dài được lưu **off-page** (overflow pages), trong dòng chỉ còn con trỏ 20 byte.
+    - **External file**: chỉ lưu đường dẫn/URL trong DB, file thật ở filesystem/object storage (S3) → DB không quản lý được transaction/backup của file. Khuyến nghị chung cho ảnh/video lớn.
+- **System catalog**: metadata về bảng, cột, index, user, statistics được lưu **trong chính DBMS** dưới dạng bảng (`information_schema`, `pg_catalog.pg_class`, `mysql.*`).
+
+**⚖️ Ba cách tổ chức dữ liệu trên disk**
+
+| Cách tổ chức | Ưu điểm | Nhược điểm | Ai dùng |
+| :--- | :--- | :--- | :--- |
+| **Heap file + slotted page** (dữ liệu không thứ tự, mọi index trỏ `ctid`) | Insert nhanh (chỗ nào trống ghi chỗ đó), mọi index bình đẳng | Mỗi version mới đổi vị trí → index phải cập nhật; cần dọn rác | PostgreSQL, Oracle (mặc định) |
+| **Index-organized / clustered** (dữ liệu nằm trong leaf B+Tree theo PK) | Tìm theo PK 1 lần, range theo PK tuần tự | PK ngẫu nhiên gây page split; secondary index phải tra 2 lần | MySQL InnoDB, SQL Server (clustered), SQLite |
+| **Log-structured** (chỉ append) | Ghi tuần tự cực nhanh | Đọc phải gộp nhiều file, cần compaction | RocksDB, Cassandra (chương 4) |
+
+✅ **Vì sao page 4–16 KB?** Page nhỏ quá → nhiều lần I/O, index cao hơn; page lớn quá → đọc 1 dòng phải kéo nhiều dữ liệu thừa và tốn RAM buffer pool. 8–16 KB là điểm cân bằng cho OLTP. Vì page lớn hơn đơn vị ghi nguyên tử của disk (4 KB) nên DB phải tự chống **torn page** (doublewrite / full page writes).
+
+> 🛠 **Áp dụng:**
+> - Hiểu vì sao **PK của InnoDB nên tăng dần** (clustered — 20.2) còn PostgreSQL không bị ảnh hưởng nặng bởi PK ngẫu nhiên ở bảng (nhưng index vẫn bị).
+> - Đừng dùng `ctid`/ROWID làm định danh trong app — nó đổi sau UPDATE/VACUUM.
+> - PostgreSQL: sắp cột từ kiểu lớn tới nhỏ để giảm padding; tránh `SELECT *` với cột TOAST lớn.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao record id là `(page, slot)` mà không phải `(page, offset byte)`?**
+   → Để có thể **dồn (compact)** tuple bên trong page khi có chỗ trống — chỉ cần sửa offset trong slot array, còn mọi index trỏ tới `(page, slot)` vẫn đúng.
+2. **Vì sao DBMS không giao hết việc cache cho OS (mmap)?**
+   → OS có thể ghi page bẩn xuống disk bất kỳ lúc nào (phá quy tắc WAL), không biết page nào là hot, và biến lỗi I/O thành signal khó xử lý (3.2).
+</details>
+
+
+---
+
+### 4. Log-Structured Storage (LSM-Tree) & So sánh với B+Tree
+
+> 🎯 **Bài toán:** Workload **ghi rất nhiều** (log, sự kiện IoT, tin nhắn chat, metrics): hàng trăm nghìn lượt ghi/giây rải rác khắp các key.
+>
+> ❌ **Cách ngây thơ:** Cập nhật tại chỗ trong B+Tree/slotted page → mỗi lần ghi là 1 random I/O và ghi lại cả page 8–16 KB để sửa vài chục byte (4.1).
+>
+> 💡 **Ý tưởng giải:** **Không bao giờ sửa tại chỗ**: gom thay đổi trong RAM (MemTable), khi đầy thì ghi **tuần tự** ra một file đã sắp xếp, bất biến (SSTable). Việc dọn dẹp/sắp xếp lại được đẩy sang chạy nền (**compaction**). → Đổi chi phí đọc & dọn dẹp lấy tốc độ ghi.
+
+
+#### 4.1. Vấn đề của slotted page (in-place update)
+1. **Fragmentation**: xóa/cập nhật để lại lỗ trống trong page.
+2. **Useless I/O**: muốn sửa 1 tuple phải đọc và ghi lại **cả page**.
+3. **Random I/O**: cập nhật 20 tuple nằm ở 20 page khác nhau = 20 lần ghi ngẫu nhiên.
+4. Một số storage **không cho ghi đè** (HDFS, S3, SSD ở mức vật lý cũng phải erase-before-write).
+
+→ **Log-structured storage**: thay vì sửa tại chỗ, **chỉ append** các bản ghi thay đổi (`PUT(key, value)`, `DELETE(key)`).
+
+#### 4.2. LSM-Tree (Log-Structured Merge Tree)
+```
+WRITE ──► WAL (append, để durable) + MemTable (cấu trúc sorted in-memory: skip list / red-black tree)
+                                           │ đầy (vd 64 MB)
+                                           ▼ flush (ghi tuần tự)
+          Disk:  L0:  [SSTable] [SSTable] [SSTable]        (có thể chồng lấn key range)
+                       │ compaction (merge-sort, bỏ version cũ & tombstone)
+                 L1:  [SST  a–f][SST g–m][SST n–z]          (không chồng lấn, ~10× L0)
+                 L2:  [....................................] (~10× L1)
+```
+- **SSTable (Sorted String Table)**: file **bất biến**, key đã sort, gồm data blocks + **index block** (key đầu mỗi block) + **bloom filter** + footer.
+- **Write path**: ghi WAL + MemTable rồi trả về → **rất nhanh** (chỉ có I/O tuần tự).
+- **Read path**: MemTable → immutable MemTable → L0 (kiểm tra từng file) → L1 → L2... Dùng **bloom filter** của mỗi SSTable để bỏ qua file chắc chắn không chứa key (9.1.1), và **SuRF/prefix bloom** cho range query.
+- **Delete**: ghi **tombstone**; dữ liệu thật chỉ bị xóa khi compaction tới tầng cuối. ⚠️ Quá nhiều tombstone làm read chậm (Cassandra cảnh báo `tombstone_warn_threshold`).
+- **Compaction strategies**:
+    | | Size-Tiered (STCS) | Leveled (LCS) |
+    |---|---|---|
+    | Cách làm | Gộp các SSTable có kích thước tương đương thành 1 file lớn hơn | Mỗi level có giới hạn kích thước, key không chồng lấn trong level; merge 1 file của Li với các file chồng lấn ở Li+1 |
+    | Write amplification | Thấp | Cao |
+    | Read amplification | Cao (1 key có thể nằm ở nhiều file) | Thấp (tối đa 1 file mỗi level) |
+    | Space amplification | Cao (cần chỗ trống ~2× khi gộp) | Thấp (~10%) |
+    | Dùng ở | Cassandra mặc định (write-heavy) | RocksDB/LevelDB mặc định (read-heavy hơn) |
+- Ngoài ra: **Universal compaction** (RocksDB), **Time-Window compaction** (Cassandra cho time-series, xóa nguyên file theo TTL).
+- **Ứng dụng**: RocksDB (MyRocks, TiKV, CockroachDB Pebble, YugabyteDB DocDB, Kafka Streams state store), LevelDB, Cassandra, ScyllaDB, HBase, InfluxDB, ClickHouse MergeTree (ý tưởng tương tự).
+
+#### 4.3. Ba loại "amplification" — ngôn ngữ để so sánh storage engine
+- **Write amplification** = bytes thực sự ghi xuống disk / bytes ứng dụng ghi. (B+Tree: sửa 100 byte vẫn ghi lại page 8–16 KB + WAL; LSM: dữ liệu bị ghi lại nhiều lần qua các lần compaction.)
+- **Read amplification** = số lần I/O cho 1 lần đọc logic.
+- **Space amplification** = dung lượng chiếm trên disk / dung lượng dữ liệu thật.
+- **RUM conjecture**: không thể tối ưu đồng thời cả Read, Update (write) và Memory/space overhead — mỗi cấu trúc chọn hy sinh 1 trong 3.
+
+#### 4.4. B+Tree vs LSM-Tree
+| | B+Tree (in-place) | LSM-Tree (append-only) |
+|---|---|---|
+| Ghi | Random I/O, cập nhật tại chỗ | **Tuần tự**, throughput ghi rất cao |
+| Đọc điểm | **Ổn định**, O(log_F N) page | Có thể phải xem nhiều SSTable (bloom filter giảm bớt) |
+| Range scan | Tốt (leaf liên tiếp) | Phải merge nhiều SSTable |
+| Nén | Kém hơn (page có chỗ trống, fragmentation) | **Tốt** (file bất biến, sort sẵn) |
+| Độ trễ | Dự đoán được | Có thể giật (latency spike) khi compaction chạy nền |
+| Write amplification | Cao với ghi ngẫu nhiên nhỏ | Phụ thuộc chiến lược compaction |
+| Phù hợp | OLTP đọc nhiều, cần latency ổn định | Ghi nhiều: log, time-series, event, IoT, chat |
+| Đại diện | InnoDB, PostgreSQL, Oracle, SQL Server, WiredTiger (mặc định) | RocksDB, Cassandra, HBase, LevelDB, ScyllaDB |
+
+✅ **Vì sao chọn LSM hay B+Tree?** Không có cấu trúc nào tốt nhất cho cả đọc, ghi và dung lượng (RUM conjecture — 4.3). Chọn **LSM** khi ghi chiếm ưu thế và chấp nhận đọc chậm hơn + latency giật khi compaction (Cassandra, RocksDB, time-series). Chọn **B+Tree** khi đọc nhiều, cần latency ổn định và range scan tốt (đa số OLTP: MySQL, PostgreSQL).
+
+> 🛠 **Áp dụng:**
+> - Chọn storage theo workload: chat history, event log, IoT → Cassandra/ScyllaDB/RocksDB; nghiệp vụ giao dịch → PostgreSQL/MySQL.
+> - Với Cassandra: tránh xóa/ghi đè dày đặc trên cùng partition (tombstone làm chậm đọc), chọn compaction strategy theo workload (time-window cho dữ liệu theo thời gian có TTL).
+> - Khi đánh giá DB, hỏi 3 câu: write amplification, read amplification, space amplification.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao LSM-tree cần Bloom filter?**
+   → Một key có thể nằm ở bất kỳ SSTable nào → đọc 1 key có thể phải mở nhiều file. Bloom filter trả lời rẻ "file này chắc chắn không có key" nên bỏ qua được hầu hết file.
+2. **Xóa trong LSM diễn ra thế nào, vì sao dung lượng không giảm ngay?**
+   → Ghi một **tombstone**; dữ liệu cũ chỉ thật sự biến mất khi compaction gộp tombstone với bản cũ ở tầng dưới.
+</details>
+
+
+---
+
+### 5. Buffer Pool Manager
+
+> 🎯 **Bài toán:** Database lớn hơn RAM, mọi truy cập đều cần page nằm trong RAM. Phải quyết định: giữ page nào, đẩy page nào ra, khi nào ghi page đã sửa xuống disk.
+>
+> ❌ **Cách ngây thơ:** Để OS lo bằng page cache/`mmap` — OS không biết page nào phải ghi log trước (WAL), không phân biệt được "page bị quét 1 lần" với "page dùng liên tục", và có thể chặn thread bất ngờ vì page fault.
+>
+> 💡 **Ý tưởng giải:** DBMS tự quản lý một vùng RAM gồm các **frame**; một **page table** cho biết page nào đang ở frame nào; mỗi frame có **pin count** (đang dùng thì không được đẩy ra) và **dirty flag** (đã sửa thì phải ghi xuống trước khi đẩy ra). Chọn page để đẩy ra bằng **replacement policy** có hiểu biết về workload.
+
+
+#### 5.1. Cấu trúc
+```
+                 Page Table (hash: page_id → frame_id)
+                 ┌─────────┬─────────┬─────────┐
+                 │ p3 → f0 │ p7 → f1 │ p1 → f2 │   + metadata mỗi frame:
+                 └─────────┴─────────┴─────────┘     dirty flag, pin count, latch, thông tin cho replacer
+Buffer Pool (RAM, mảng frame cố định kích thước page):
+                 ┌──────┬──────┬──────┬──────┐
+                 │ p3   │ p7   │ p1   │ free │
+                 └──────┴──────┴──────┴──────┘
+```
+- **Frame**: ô nhớ chứa 1 page. **Page table**: map `page_id → frame` (nằm trong RAM, không persist) — khác với **page directory** (map `page_id → vị trí trong file`, phải persist trên disk).
+- **Pin count**: số thread đang dùng page → page đang được pin thì **không được evict**.
+- **Dirty flag**: page đã bị sửa → trước khi evict phải ghi xuống disk (và log tương ứng phải xuống trước — WAL, chương 17).
+- **Fetch page**: có trong page table → pin & trả về; không có → chọn frame trống hoặc **evict** 1 frame theo replacement policy (nếu dirty thì ghi ra) → đọc page từ disk vào frame.
+
+#### 5.2. Replacement Policies
+- **LRU**: evict page lâu nhất không được dùng (cần cập nhật danh sách mỗi lần truy cập → tốn chi phí đồng bộ).
+- **CLOCK** (xấp xỉ LRU): mỗi frame có **reference bit**; truy cập → set bit = 1. "Kim đồng hồ" quét vòng: gặp bit 1 → đặt về 0 và đi tiếp; gặp bit 0 → evict. **PostgreSQL** dùng biến thể **clock-sweep** với `usage_count` (0–5) thay cho 1 bit.
+- **Vấn đề Sequential Flooding**: 1 full table scan đọc mỗi page đúng 1 lần nhưng đẩy hết hot pages ra khỏi LRU/CLOCK — page "mới dùng gần nhất" lại là page **ít giá trị nhất**.
+- **Giải pháp**:
+    - **LRU-K**: theo dõi K lần truy cập gần nhất của mỗi page, evict page có khoảng cách tới lần truy cập thứ K xa nhất → phân biệt page "nóng thật" với page chỉ được đọc 1 lần. (Project buffer pool của CMU BusTub cài đặt LRU-K.)
+    - **2Q / ARC**: tách 2 danh sách "mới vào" và "truy cập ≥ 2 lần".
+    - **MySQL InnoDB — midpoint insertion LRU**: LRU chia 2 phần **young** (5/8) và **old** (3/8, `innodb_old_blocks_pct = 37`). Page mới đọc được chèn vào **đầu danh sách old** chứ không phải đầu LRU; chỉ được "thăng hạng" lên young nếu được truy cập lại sau ít nhất `innodb_old_blocks_time` (mặc định 1000 ms) → full scan không thể đẩy hot page ra ngoài.
+    - **Localization / ring buffer**: scan lớn dùng vùng buffer riêng nhỏ (PostgreSQL: ring buffer 256 KB cho seq scan bảng lớn, 16 MB cho bulk write, VACUUM).
+    - **Priority hints**: DBMS biết page nào quan trọng (vd page index, root B+Tree) → ưu tiên giữ lại.
+
+#### 5.3. Các tối ưu khác
+- **Multiple buffer pools**: chia nhỏ để giảm contention latch (InnoDB `innodb_buffer_pool_instances`), hoặc chia theo loại dữ liệu.
+- **Pre-fetching**: đọc trước các page tiếp theo của sequential scan, hoặc các leaf tiếp theo khi index range scan (InnoDB *linear/random read-ahead*).
+- **Scan sharing**, **buffer pool bypass** (xem 13.3.1).
+- **Background writer**: luồng nền ghi dần dirty page xuống disk để khi cần evict không phải chờ ghi (PG `bgwriter`, InnoDB page cleaner threads). Phải tôn trọng WAL: log của page phải được flush trước.
+- **OS page cache & Direct I/O**: nếu đọc qua OS page cache, cùng 1 page có thể nằm 2 lần trong RAM (double buffering).
+    - Hầu hết DBMS dùng **`O_DIRECT`** để bỏ qua OS cache (InnoDB `innodb_flush_method = O_DIRECT`, Oracle, SQL Server).
+    - **PostgreSQL** (truyền thống) **dựa vào OS page cache** → `shared_buffers` thường chỉ đặt ~25% RAM, phần còn lại để OS cache. PG 18 bổ sung **asynchronous I/O** (`io_method = worker | io_uring`) cho read.
+
+#### 5.4. Sizing & cấu hình thực tế
+| | PostgreSQL | MySQL InnoDB |
+|---|---|---|
+| Kích thước buffer pool | `shared_buffers` ≈ 25% RAM (phần còn lại cho OS cache); `effective_cache_size` ≈ 50–75% RAM (chỉ là gợi ý cho optimizer) | `innodb_buffer_pool_size` ≈ 50–75% RAM trên máy chuyên chạy DB |
+| Theo dõi hit ratio | `pg_stat_database` (`blks_hit` / (`blks_hit` + `blks_read`)), `EXPLAIN (ANALYZE, BUFFERS)` | `SHOW ENGINE INNODB STATUS`, `Innodb_buffer_pool_reads` vs `read_requests` |
+| Warm-up sau restart | extension `pg_prewarm` | `innodb_buffer_pool_dump_at_shutdown` / `load_at_startup` (mặc định bật) |
+
+> Tỷ lệ cache hit OLTP thường > 99%. Hit ratio thấp → working set lớn hơn RAM → thiếu index (đang full scan), hoặc cần thêm RAM.
+
+**⚖️ Chọn page để đẩy ra (replacement policy)**
+
+| Policy | Ưu điểm | Nhược điểm |
+| :--- | :--- | :--- |
+| LRU | Đơn giản, đúng với "dùng gần đây thì sắp dùng lại" | Phải cập nhật danh sách mỗi lần truy cập (tốn đồng bộ); bị **sequential flooding** |
+| CLOCK | Xấp xỉ LRU với chi phí rất thấp (1 bit/frame) | Vẫn bị sequential flooding |
+| LRU-K / 2Q / ARC | Phân biệt page chỉ dùng 1 lần với page dùng nhiều lần | Phức tạp hơn, tốn thêm metadata |
+| InnoDB midpoint LRU | Page mới vào giữa danh sách, phải được dùng lại sau 1s mới lên vùng "young" | Phải chỉnh tham số khi workload đặc biệt |
+
+✅ **Vì sao chọn:** Hệ thực tế chọn chi phí thấp (CLOCK — PostgreSQL) **cộng** cơ chế chống scan (midpoint insertion — InnoDB; ring buffer riêng cho seq scan — PostgreSQL), vì LRU thuần sẽ để một câu báo cáo quét toàn bảng đẩy sạch dữ liệu nóng của hàng nghìn request OLTP.
+
+> 🛠 **Áp dụng:**
+> - Đặt kích thước buffer pool đúng (5.4) và theo dõi **cache hit ratio** (OLTP nên > 99%); hit ratio giảm đột ngột = working set đã vượt RAM hoặc có query quét bảng lớn.
+> - Restart DB làm buffer pool "lạnh" → latency cao một lúc → bật dump/load buffer pool (InnoDB) hoặc `pg_prewarm`.
+> - Tách workload báo cáo nặng sang replica để không làm "nguội" cache của primary.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao một câu `SELECT` quét toàn bảng có thể làm chậm cả hệ thống, kể cả các query khác chỉ đọc theo PK?**
+   → Scan đưa hàng triệu page "dùng 1 lần" vào buffer pool, đẩy các page nóng ra (sequential flooding); các query OLTP sau đó phải đọc lại từ disk.
+2. **Page đang được pin có bị đẩy ra không? Page dirty muốn đẩy ra phải làm gì trước?**
+   → Không. Page dirty phải được ghi xuống disk — và theo WAL, log tương ứng phải được ghi trước (chương 17).
+</details>
+
+
+---
+
 ### 6. Column-Oriented Storage
+
+> 🎯 **Bài toán:** Câu truy vấn phân tích (`SELECT region, SUM(amount) ... GROUP BY region`) quét hàng tỷ dòng nhưng chỉ dùng 2–3 trong số 100 cột.
+>
+> ❌ **Cách ngây thơ:** Lưu theo dòng (row store / NSM) → mỗi page chứa đầy đủ 100 cột của một số dòng → đọc 2 cột vẫn phải kéo cả 100 cột lên từ disk (~98% I/O lãng phí), dữ liệu khác kiểu xen kẽ nên nén kém.
+>
+> 💡 **Ý tưởng giải:** Lưu **theo cột** (DSM): mỗi cột nằm liền nhau → chỉ đọc cột cần, giá trị cùng kiểu đứng cạnh nhau nên **nén rất tốt** và xử lý được bằng SIMD. Vì ghép lại một dòng hoàn chỉnh từ nhiều cột tốn kém, các hệ hiện đại dùng **PAX**: chia dòng thành nhóm (row group), trong mỗi nhóm lưu theo cột.
+
 
 #### 6.1 Các dạng Storage
 
@@ -61,16 +699,49 @@
 >     → sort giúp các integer gần nhau
 >     → **delta encoding** nén thêm một lớp nữa
 
+**⚖️ Các mô hình lưu trữ**
+
+| Mô hình | Đọc 1 dòng đầy đủ (OLTP) | Quét vài cột của nhiều dòng (OLAP) | Ghi/cập nhật | Nén |
+| :--- | :--- | :--- | :--- | :--- |
+| NSM (row) | ✅ 1 page | ❌ đọc thừa mọi cột | ✅ dễ | Trung bình |
+| DSM (column thuần) | ❌ nhảy qua N vùng | ✅ chỉ đọc cột cần | ❌ ghi N chỗ | ✅ tốt |
+| PAX (row group + column chunk) | ⚠️ trong 1 row group | ✅ | ⚠️ theo lô | ✅ tốt |
+
+✅ **Vì sao chọn PAX** (Parquet, ORC, ClickHouse, DuckDB, Snowflake): giữ được lợi ích theo cột cho quét, đồng thời các cột của cùng một dòng nằm gần nhau trong một row group — dễ ghép dòng, dễ chia song song theo row group, và metadata min/max theo row group cho phép bỏ qua cả khối dữ liệu.
+
+> 🛠 **Áp dụng:**
+> - OLTP (đọc/ghi vài dòng theo key) → row store (PostgreSQL, MySQL). Báo cáo trên dữ liệu lớn → đưa sang column store (ClickHouse, BigQuery, Parquet trên S3) qua CDC/ETL — đừng chạy báo cáo nặng trên DB nghiệp vụ.
+> - Khi lưu Parquet: sắp xếp theo cột hay lọc (vd ngày) để min/max của mỗi row group "hẹp" → bỏ qua được nhiều khối hơn.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao column store nén tốt hơn row store nhiều?**
+   → Giá trị trong một cột cùng kiểu, thường lặp lại hoặc tăng dần → dictionary/RLE/delta encoding rất hiệu quả; row store xen kẽ nhiều kiểu dữ liệu.
+2. **Vì sao column store không hợp với `UPDATE` từng dòng liên tục?**
+   → Một dòng nằm ở N vùng cột đã nén → sửa 1 dòng phải giải nén/ghi lại nhiều khối. Các hệ này thường ghi theo lô (batch) hoặc dùng delta store rồi gộp sau.
+</details>
+
+
 ---
 
 ### 7. Database Hashtable
+
+> 🎯 **Bài toán:** Nhiều thao tác của DB cần tra cứu theo khóa **O(1)**: hash join, `GROUP BY` bằng hash, hash index, bảng metadata nội bộ (page table của buffer pool, lock table).
+>
+> ❌ **Cách ngây thơ:** Mảng kích thước cố định, vị trí = `hash(key) % n`. Đầy thì tạo mảng gấp đôi và **rehash toàn bộ** → với hash table trên disk hàng GB, việc này dừng hệ thống và tốn I/O khổng lồ.
+>
+> 💡 **Ý tưởng giải:** Hai quyết định độc lập: (1) **hàm hash** — chỉ cần nhanh và phân bố đều, không cần an toàn mật mã; (2) **cách tổ chức** — *static* khi biết trước kích thước (hash join biết ước lượng số dòng), *dynamic* khi phải tăng dần mà không được rehash toàn bộ (extendible / linear hashing: chỉ tách bucket cần tách).
+
 
 #### 7.1 Tổng quan
 
 - **Tác dụng**: Join operations, internal metadata, index, ...
 - **Design decisions**: Data organization, Concurrency
 - Dù hashtable có O(1) lookup, nhưng cách implement ảnh hưởng lớn tới hiệu năng thực tế
-- Phần lớn database sử dụng **xxHash** (của Facebook)
+- Hash function trong DBMS **không cần cryptographic** (SHA-256 quá chậm), chỉ cần nhanh + phân bố đều + ít collision:
+    - **xxHash / XXH3** (Yann Collet — tác giả LZ4/Zstd, hiện làm ở Meta): rất phổ biến (ClickHouse, RocksDB, nhiều engine mới)
+    - **MurmurHash3**, **CityHash/FarmHash** (Google), **CRC32** (có lệnh phần cứng SSE4.2 nên rất nhanh)
+    - PostgreSQL dùng Jenkins hash (`hash_any`), MySQL dùng biến thể MurmurHash/xxHash tuỳ module
 
 #### 7.2 Static Hashing Schema
 
@@ -83,8 +754,11 @@
     - **Separate linked list**: Mỗi key trỏ tới linked list các value
     - **Redundant keys**: Lưu trùng key với các value khác nhau
 
+- **Các static schema khác** (để biết tên khi đọc paper/code):
+    - **Robin Hood Hashing**: biến thể linear probing — khi insert, nếu key mới đã "đi xa" vị trí lý tưởng hơn key đang chiếm slot thì **cướp chỗ** ("lấy của người giàu chia cho người nghèo") → phương sai độ dài probe nhỏ hơn.
+    - **Cuckoo Hashing**: dùng 2+ hash function/bảng; lookup chỉ kiểm tra tối đa 2 vị trí (O(1) worst case); insert có thể phải "đá" key cũ sang vị trí thay thế của nó (giống Cuckoo Filter ở 9.1).
 
-Dynamic hashing schema
+#### 7.3 Dynamic Hashing Schema
 
 - **Chained Hashing**
     - Giống cách Java HashMap hoạt động: mỗi bucket có pointer trỏ tới linked list (chain)
@@ -176,33 +850,88 @@ Dynamic hashing schema
                               bucket_number được tính toán hoàn toàn từ h_n và sp
         ```
 
-> **TODO**: Bổ sung phần quản lý bộ nhớ cho hash table (memory allocation, overflow pages).
+#### 7.4 Quản lý bộ nhớ cho Hash Table (disk-oriented)
 
-#### 7.3 Extra: YugabyteDB
-- Based on PostgreSQL
+- **Hash table của index nằm trên page**: trong DBMS disk-oriented, hash table không phải là mảng con trỏ trong RAM mà được tổ chức thành các **page** đi qua buffer pool:
+    ```
+    Header Page  ──►  Directory Page(s)  ──►  Bucket Page(s)  ──►  Overflow Page(s)
+    (metadata:        (mảng page_id của       (mảng slot          (khi bucket đầy
+     global depth,     các bucket)             key/value)          mà chưa split)
+     số directory)
+    ```
+    - Con trỏ giữa các tầng là **page_id**, không phải địa chỉ bộ nhớ → hash table có thể lớn hơn RAM, page ít dùng bị evict như page dữ liệu (đây cũng là cấu trúc của project Extendible Hash Table trong CMU BusTub).
+    - Mỗi page có latch riêng → nhiều thread cùng thao tác các bucket khác nhau (xem 10.2 Hash table latching).
+- **Overflow pages**: khi bucket đầy nhưng chưa thể/không muốn split (static hashing, hoặc linear hashing khi bucket overflow không phải bucket tại split pointer) → cấp phát page mới, nối thành **chuỗi overflow** từ bucket page. Chuỗi dài → lookup tốn nhiều I/O → cần split/rehash định kỳ.
+- **Hash table tạm cho query (hash join, hash aggregate)**: cấp phát trong vùng nhớ của operator, giới hạn bởi `work_mem` (PostgreSQL), `join_buffer_size` (MySQL), memory grant (SQL Server). Vượt giới hạn → **spill**: chia partition và ghi xuống temp file (xem 11.6 và 12.3.1).
+- **PostgreSQL hash index**: từ PG 10 được WAL-logged (crash-safe, replicate được); trước PG 10 không nên dùng. Chỉ hỗ trợ toán tử `=`, không unique, không multi-column.
 
-### 8. B tree index
+#### 7.5 Extra: Hash sharding trong YugabyteDB
+- YugabyteDB = query layer **tái sử dụng code PostgreSQL** (YSQL) + storage phân tán **DocDB** (LSM-tree dựa trên RocksDB, replicate bằng Raft).
+- Mặc định **hash sharding**: `hash(primary key)` → giá trị 16-bit (0..65535) → chia thành các khoảng, mỗi khoảng là 1 **tablet** (shard). Có thể chọn **range sharding** (`PRIMARY KEY (id ASC)`) cho range scan.
+- Đây là ví dụ hash table ở **tầng phân tán**: hash quyết định dữ liệu nằm ở node nào (xem thêm 19.3).
 
-##### 8.1. Các loại b tree
-B+ tree
-   - Data chỉ lưu ở leaf node
-   - Leaf node được nối với nhau tạo thành linked list
-B-link tree (Lehman-Yao)
-   - Mỗi node có thêm **right-sibling pointer** (chỉ trỏ sang phải) và **high-key** (giá trị lớn nhất mà node chịu trách nhiệm), cho phép reader phát hiện và follow sang node mới khi split xảy ra đồng thời
+**⚖️ Các cách tổ chức hash table**
 
-##### 8.2. Các thao tác trên cây b tree
-  - Các thao tác trên b tree như insert thường đi kèm với việc split lại node
-  - Duplicate key sẽ được giải quyết bằng append record vào cuối
-  - Trong InnoDB hay PostgreSQL, do thêm id vào cuối nên với non-clustered index thực chất là 1 compound index với id
-  - Nhiều DB trì hoãn việc merge node khi half full → dẫn đến việc node có thể dưới 50% full → PostgreSQL gọi là non-balanced B-tree
+| Scheme | Ưu điểm | Nhược điểm | Phù hợp |
+| :--- | :--- | :--- | :--- |
+| Linear probing (static) | Dữ liệu liền mạch → cache-friendly, rất nhanh | Phải biết trước kích thước; xóa phức tạp | Hash join / aggregate trong RAM |
+| Chained hashing | Đơn giản, không bao giờ "đầy" | Chuỗi dài → chậm, nhiều con trỏ | Java `HashMap`, hash table tổng quát |
+| Extendible hashing | Tăng dần, chỉ tách bucket bị đầy | Directory có thể phình to (gấp đôi) | Hash index trên disk |
+| Linear hashing | Tăng dần, không cần directory | Bucket bị tách chưa chắc là bucket đầy → có overflow tạm thời | Hash index trên disk |
+
+✅ **Vì sao hash index ít được dùng hơn B+Tree?** Hash chỉ trả lời được `=`; không hỗ trợ `<`, `>`, `BETWEEN`, `ORDER BY`, prefix. B+Tree trả lời được tất cả với chi phí `=` chỉ hơn vài lần I/O (và các tầng trên luôn nằm trong RAM). Vì vậy hash chủ yếu dùng **bên trong** engine (join, aggregate, adaptive hash index của InnoDB), còn index do người dùng tạo gần như luôn là B+Tree.
+
+> 🛠 **Áp dụng:**
+> - Thấy `Hash Join` / `HashAggregate` trong plan → DB đang build hash table trong `work_mem`; nếu bị spill ra disk thì tăng `work_mem` cho session đó.
+> - Hiểu Java `HashMap` (chained + treeify) và `ConcurrentHashMap` dựa trên cùng nguyên lý (`Java.md` 3.4, 9.10).
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao DBMS không dùng SHA-256 làm hàm hash cho hash join?**
+   → Không cần chống tấn công; chỉ cần nhanh và đều. SHA-256 chậm hơn xxHash/CRC32 hàng chục lần trên mỗi tuple.
+2. **Extendible hashing tránh rehash toàn bộ bằng cách nào?**
+   → Directory theo N bit đầu của hash; khi 1 bucket đầy chỉ tách bucket đó dùng thêm 1 bit, các bucket khác giữ nguyên; directory chỉ gấp đôi (copy con trỏ, không di chuyển dữ liệu) khi cần thêm bit toàn cục.
+</details>
+
+
+### 8. B+Tree Index
+
+> 🎯 **Bài toán:** Tìm dòng thỏa `WHERE id = ?`, `WHERE created_at BETWEEN ...`, `ORDER BY ...` trong bảng tỷ dòng **mà không quét toàn bộ**, trong khi bảng vẫn liên tục được thêm/sửa/xóa.
+>
+> ❌ **Các cách ngây thơ:**
+> - *Mảng đã sắp xếp + binary search*: tìm nhanh, nhưng chèn 1 phần tử phải dời nửa mảng.
+> - *Cây nhị phân cân bằng (AVL/Red-Black)*: mỗi node chỉ 1 key → cây cao ~30 tầng với 1 tỷ dòng → 30 lần đọc disk ngẫu nhiên cho 1 lần tìm.
+> - *Hash*: tìm `=` nhanh nhưng không hỗ trợ range/sắp xếp.
+>
+> 💡 **Ý tưởng giải:** Cây cân bằng **nhiều nhánh**, mỗi node = **1 page** chứa hàng trăm key (fan-out lớn) → chỉ 3–4 tầng cho hàng tỷ dòng, và các tầng trên luôn nằm trong RAM. Dữ liệu chỉ ở **leaf**, các leaf **nối nhau** → range scan = tìm điểm đầu rồi đọc tuần tự. Thêm/xóa giữ cây cân bằng bằng **split/merge** cục bộ.
+
+
+##### 8.1. Các loại B-Tree
+- **B-Tree (Bayer & McCreight, 1971)**: key **và value** nằm ở mọi node (cả internal) → không lặp key, nhưng range scan phải duyệt lên xuống cây.
+- **B+Tree**: cây cân bằng, mọi đường đi root → leaf có cùng độ dài; mỗi node (trừ root) luôn **≥ half-full** (`M/2 - 1 ≤ #keys ≤ M - 1`).
+   - Data (hoặc record id) chỉ lưu ở **leaf node**; internal node chỉ chứa key định hướng (separator) → fan-out lớn → cây rất thấp (3–4 tầng cho hàng tỷ dòng).
+   - Leaf node được nối với nhau thành **(doubly) linked list** → range scan tuần tự.
+   - Search/Insert/Delete: **O(log_F N)** với F = fan-out (thường vài trăm).
+- **B-link tree (Lehman-Yao)**: mỗi node có thêm **right-sibling pointer** và **high-key** (giá trị lớn nhất mà node chịu trách nhiệm), cho phép reader phát hiện và follow sang node mới khi split xảy ra đồng thời (chi tiết ở 10.3).
+- **Leaf node lưu gì?** (2 lựa chọn)
+   - **Record ID** (page_id, slot): PostgreSQL (heap + `ctid`), Oracle, SQL Server heap table.
+   - **Tuple data** (index-organized / clustered): InnoDB primary key, SQLite (rowid table), SQL Server clustered index, Oracle IOT. Secondary index khi đó lưu **primary key** thay vì record id.
+
+##### 8.2. Các thao tác trên B+Tree
+- **Insert**: tìm leaf đúng → chèn có thứ tự. Nếu leaf tràn → **split** thành 2 node, đẩy (copy) middle key lên cha; cha tràn thì split tiếp, có thể lan lên tới root (cây cao thêm 1 tầng).
+- **Delete**: xóa khỏi leaf. Nếu leaf dưới half-full → **redistribute** (mượn key từ sibling) hoặc **merge** với sibling, xóa separator ở cha; có thể lan lên trên.
+- **Duplicate key** (non-unique index), 2 cách:
+   - **Append record id vào key** → mọi key trở thành unique: `(key, rid)`. Đây là cách InnoDB (secondary index = key + PK) và PostgreSQL ≥ 12 (heap TID là tie-breaker) làm → non-clustered index thực chất là compound index `(key, id)`.
+   - **Overflow leaf node**: cho phép leaf tràn sang node phụ chứa duplicate (phức tạp hơn, ít dùng).
+- **Lazy merge**: nhiều DBMS **không merge ngay** khi node dưới half-full (vì insert sau đó có thể lại phải split → thrashing), để dọn dẹp sau. PostgreSQL thậm chí chỉ xóa page khi nó **hoàn toàn rỗng**. (CMU gọi đây là "non-balanced" B+Tree; tên thư mục `nbtree` của PostgreSQL thực ra có gốc từ "new B-tree".)
 
 ##### 8.3. Index
 
-- Index với variable-length key
-  - Lưu trữ theo dạng bitmap
-    - Header chứa thông tin
-    - Tiếp theo là các slot array chứa thông tin độ dài và offset của từng key entry
-    - Data được lưu từ cuối lên
+- Index với variable-length key — các cách xử lý (CMU): (1) lưu **pointer** tới key thay vì key (chậm, ít dùng), (2) **variable-length node** (khó quản lý bộ nhớ), (3) **padding** mọi key về độ dài max (lãng phí), (4) **key map / indirection** — cách phổ biến nhất:
+  - Lưu trữ theo kiểu **slotted page** (giống heap page ở 3.3)
+    - Header chứa thông tin (số slot, con trỏ free space, level, sibling pointers...)
+    - Tiếp theo là **slot array (key map)** chứa offset (và độ dài) của từng key entry — slot array được giữ **đã sort**
+    - Data (key + value/child pointer) được lưu từ cuối page ngược lên
     ```
     ┌──────────────────────────────────┐
     │         Page Header              │  ← Chứa: số slot, con trỏ free space, ...
@@ -323,7 +1052,8 @@ B-link tree (Lehman-Yao)
     - Giảm đáng kể kích thước index (đặc biệt với string dài, prefix giống nhau)
     - Nhiều key hơn trên mỗi page → cây thấp hơn → ít I/O hơn
 - **Nhược điểm**: Cần decompress khi so sánh key → tăng CPU
-- **Ứng dụng**: InnoDB, PostgreSQL, SQLite đều sử dụng prefix compression
+- **Ứng dụng**: WiredTiger (MongoDB — mặc định bật prefix compression cho index), MyISAM (`PACK_KEYS`), Oracle (`CREATE INDEX ... COMPRESS n`), DB2, RocksDB/LevelDB (delta-encode key trong block SSTable kèm "restart points" mỗi 16 key).
+- ⚠️ **InnoDB và PostgreSQL B-Tree không dùng prefix compression** theo kiểu này: PostgreSQL dùng **deduplication** (8.4.6) và **suffix truncation** (8.4.7); InnoDB chỉ có page compression (zlib/LZ4 cả page) chứ không nén prefix key.
 
 ###### 8.4.6. Deduplication
 - **Vấn đề**: Với non-unique index, cùng 1 key value có thể xuất hiện nhiều lần (ví dụ: index trên `status` column chỉ có vài giá trị distinct)
@@ -364,18 +1094,64 @@ B-link tree (Lehman-Yao)
     3. Khi leaf node đầy → tạo entry tương ứng trong internal node (parent)
     4. Lặp lại cho các tầng cao hơn cho tới root
 - **Ưu điểm**:
-    - Nhanh hơn rất nhiều so với insert từng key (O(N log N) cho sort vs O(N log²N) cho N lần insert)
+    - Nhanh hơn rất nhiều so với insert từng key. Về số phép so sánh thì cả hai đều O(N log N), nhưng khác biệt nằm ở **I/O**: insert từng key là N lần traverse random (mỗi lần O(log_F N) page, nhiều page không nằm trong buffer pool) + nhiều lần split; bulk build chỉ cần external sort (vài pass tuần tự) + 1 lần ghi tuần tự
     - Leaf node được fill **tuần tự** → tận dụng tối đa sequential I/O
     - Không xảy ra split trong quá trình build → ít write amplification
     - Index compact hơn (ít fragmentation)
 - **Ứng dụng**: `CREATE INDEX` trong hầu hết database đều dùng bulk insert. PostgreSQL, MySQL/InnoDB, Oracle đều sort data trước rồi build B-Tree bottom-up
 
+**⚖️ Các cấu trúc cho bài toán tìm kiếm**
 
-### 8. Filter, inverted index, vector index
+| Cấu trúc | `=` | Range / ORDER BY | Chèn/xóa | I/O mỗi lần tìm (1 tỷ dòng) |
+| :--- | :--- | :--- | :--- | :--- |
+| Mảng sắp xếp | O(log N) | ✅ | ❌ O(N) | ~30 |
+| BST / AVL | O(log₂ N) | ✅ | ✅ | ~30 (mỗi node 1 I/O) |
+| Hash | O(1) | ❌ | ✅ | 1–2 |
+| B-Tree | O(log_F N) | ⚠️ phải đi lên xuống cây | ✅ | 3–4 |
+| **B+Tree** | O(log_F N) | ✅ quét leaf tuần tự | ✅ | **3–4** (thực tế 1–2 vì tầng trên nằm trong RAM) |
+| LSM-tree | O(log N) × số tầng | ✅ phải merge | ✅✅ ghi rất nhanh | Thay đổi |
 
-#### 8.1. Filter
+✅ **Vì sao B+Tree là index mặc định của hầu hết RDBMS:** cân bằng tốt nhất giữa đọc điểm, đọc khoảng và cập nhật, với đơn vị là page khớp cách disk và buffer pool làm việc. B+Tree hơn B-Tree vì internal node không chứa dữ liệu → nhiều key hơn mỗi page (fan-out cao hơn, cây thấp hơn) và range scan chỉ cần đi dọc leaf.
 
-##### 8.1.1. Bloom filter
+> 🛠 **Áp dụng** (chi tiết ở 20.2):
+> - **Composite index `(a, b, c)`** là một B+Tree sắp theo `a` trước, rồi `b`, rồi `c` → giải thích trực tiếp quy tắc *leftmost prefix* và vì sao cột range phải đứng cuối.
+> - **Covering index** tránh quay lại bảng vì leaf đã có đủ cột.
+> - PK ngẫu nhiên (UUIDv4) làm insert rơi vào leaf bất kỳ → page split khắp nơi; PK tăng dần luôn chèn vào leaf cuối.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Bảng 1 tỷ dòng, key 8 byte + con trỏ 8 byte, page 16 KB — cây B+ cao bao nhiêu tầng?**
+   → Fan-out ≈ 16384 / 16 ≈ 1000 → 1000³ = 10⁹ → **3 tầng**. Root và tầng 2 (~1000 page ≈ 16 MB) luôn trong RAM → thực tế chỉ 1 lần I/O.
+2. **Index `(status, created_at)` có dùng được cho `WHERE created_at > ?` không?**
+   → Không hiệu quả: cây sắp theo `status` trước, các `created_at` nằm rải rác trong từng nhóm `status` (trừ khi DB có skip scan và `status` có ít giá trị).
+3. **Vì sao một số DB không merge node ngay khi dưới half-full?**
+   → Insert ngay sau đó có thể lại làm split → tốn công vô ích; trì hoãn merge rẻ hơn và cây vẫn đúng.
+</details>
+
+
+### 9. Filters, Skip List, Trie, Inverted Index & Vector Index
+
+> 🎯 **Bài toán:** B+Tree không giải tốt mọi kiểu câu hỏi:
+> - "Key này **chắc chắn không có** chứ?" — cần trả lời cực rẻ, trước khi đọc disk.
+> - "Có phần tử nào trong khoảng [A, B] không?" mà không đọc dữ liệu.
+> - Cấu trúc sắp xếp **trong RAM** cho phép nhiều thread ghi đồng thời.
+> - Tìm theo **tiền tố** (autocomplete), tìm **văn bản chứa từ**, tìm vector **gần giống**.
+>
+> 💡 **Ý tưởng giải:** Mỗi bài toán một cấu trúc chuyên biệt. Điểm chung: chấp nhận **xấp xỉ / xác suất** hoặc chỉ hỗ trợ một kiểu truy vấn để đổi lấy bộ nhớ và tốc độ.
+
+| Bài toán | Cấu trúc | Đánh đổi chính |
+| :--- | :--- | :--- |
+| Thành viên của tập (point) | Bloom / Cuckoo filter (9.1) | Có false positive, không bao giờ false negative |
+| Thành viên trong khoảng | SuRF (9.1.4) | Bất biến, phải build lại |
+| Tập sắp xếp in-memory, ghi đồng thời | Skip list (9.2) | Kém cache-friendly |
+| Tìm theo tiền tố / key dài chung tiền tố | Trie, Radix tree, ART (9.3) | Tốn bộ nhớ nếu key thưa |
+| Văn bản chứa từ | Inverted index (9.4) | Cập nhật đắt → segment bất biến |
+| Vector gần nhất | IVF, HNSW (9.5) | Kết quả **xấp xỉ** (recall < 100%) |
+
+
+#### 9.1. Filter
+
+##### 9.1.1. Bloom Filter
 - **Ý tưởng**: Sử dụng **multiple hash functions** để đánh dấu các bit trong một **bit array**
 - **Cơ chế**:
     1. Khởi tạo bit array toàn 0
@@ -427,7 +1203,7 @@ B-link tree (Lehman-Yao)
     - **Spell checker**: Kiểm tra từ có tồn tại không
     - **Distributed systems**: Kiểm tra membership
 
-###### 8.1.1.1. Couting bloom filter
+##### 9.1.2. Counting Bloom Filter
 - **Ý tưởng**: Thay vì bit array, sử dụng **counter array** (mỗi phần tử là một counter)
 - **Cơ chế**:
     - Insert: tăng counter tại các vị trí hash
@@ -437,7 +1213,7 @@ B-link tree (Lehman-Yao)
 - **Nhược điểm**: Tốn nhiều bộ nhớ hơn bloom filter thông thường
 
 
-###### 8.1.1.2. Cuckoo Filter
+##### 9.1.3. Cuckoo Filter
 - **Tên gọi**: Lấy cảm hứng từ **chim cúc cu** (cuckoo bird) - loài chim đẩy trứng khác ra khỏi tổ để chiếm chỗ
 - **Ý tưởng**: Lưu **fingerprint** (bản tóm tắt nhỏ của hash) vào **bucket array**, mỗi bucket chứa nhiều slot (thường 4)
 - **Cơ chế**:
@@ -483,7 +1259,7 @@ B-link tree (Lehman-Yao)
     - Không hỗ trợ insert trùng lặp quá nhiều (cùng element insert nhiều lần -> tràn bucket)
 - **Ứng dụng**: Network packet filtering, database key lookup, memory-efficient caching
 
-##### 8.1.3. Succinct Range Filter (SuRF)
+##### 9.1.4. Succinct Range Filter (SuRF)
 - **Vấn đề**: Bloom Filter chỉ hỗ trợ **point query** ("key X có tồn tại không?"), **không** hỗ trợ **range query** ("có key nào trong khoảng [A, B] không?")
 - **Ý tưởng**: Xây dựng filter từ **Fast Succinct Trie (FST)** - một trie nén cực kỳ nhỏ gọn, hỗ trợ cả point query và range query
 - **Cấu trúc FST**: Chia trie thành 2 phần:
@@ -521,7 +1297,7 @@ B-link tree (Lehman-Yao)
 - **Ứng dụng**: LSM-tree storage engine (RocksDB) - filter trước khi đọc SSTable, tránh disk I/O cho cả point và range query
 
 **Các phần dưới đây không đề cập trong khóa học**
-###### 8.1.1.4. Scalable Bloom Filter
+##### 9.1.5. Scalable Bloom Filter
 - **Vấn đề**: Bloom filter thông thường cần biết trước **số lượng element (n)** khi khởi tạo. Nếu n vượt quá định mức -> false positive rate tăng vọt
 - **Ý tưởng**: Sử dụng **chuỗi bloom filters** (slices), filter mới được thêm tự động khi filter hiện tại gần đầy
 - **Cơ chế**:
@@ -538,12 +1314,12 @@ B-link tree (Lehman-Yao)
     - Tốn bộ nhớ hơn 1 bloom filter có kích thước tối ưu ngay từ đầu (do overlap giữa các filter)
     - Không hỗ trợ delete
 
-###### 8.1.1.5. Hybrid Bloom Filter
+##### 9.1.6. Hybrid / Distributed Bloom Filter
 - **Vấn đề**: Trong hệ thống phân tán, mỗi node có bloom filter riêng -> query thường phải broadcast tới **tất cả node** để check
 - **Ý tưởng**: Kết hợp **local bloom filter** (trên mỗi node) với **global summary** (aggregated) để giảm network traffic
 - **Cơ chế**:
     1. Mỗi node duy trì **local bloom filter** cho data của mình
-    2. Một **coordinator** giữ **compressed summary** (bằng log tập trung của các filters) của tất cả local filters
+    2. Một **coordinator** giữ **compressed summary** của tất cả local filters (ví dụ: OR các bit array có cùng kích thước & hash function, hoặc giữ một filter riêng cho mỗi node)
     3. Query đến coordinator trước:
         - Nếu summary trả false -> chắc chắn không có -> **không cần hỏi bất kỳ node nào**
         - Nếu summary trả true -> forward query tới các node tiềm năng
@@ -551,11 +1327,10 @@ B-link tree (Lehman-Yao)
 - **Nhược điểm**:
     - Cần đồng bộ liên tục summary khi data ở các node thay đổi
     - Summary tổng hợp có false positive rate cao hơn (do là union của nhiều filters)
-- **Ứng dụng**: Distributed databases (Cassandra), CDN cache lookup, P2P networks
+- **Ứng dụng**: Ý tưởng gốc là **Summary Cache** (Fan et al., 2000) cho cụm web proxy cache chia sẻ nội dung; cũng gặp trong CDN cache lookup, P2P networks. Lưu ý: Cassandra/HBase/RocksDB dùng bloom filter **cục bộ cho từng SSTable** trên mỗi node, không có global summary kiểu này.
+- **Liên quan**: **Bloom join / semi-join reduction** trong distributed query — node A gửi bloom filter của join key sang node B để B chỉ gửi lại các tuple có khả năng match (giảm dữ liệu shuffle, xem 12.3).
 
-
-
-##### 8.1.2. Skip List
+#### 9.2. Skip List
 - **Ý tưởng**: Xây dựng dựa trên **sorted linked list** nhưng bổ sung thêm các "đường cao tốc" (express lanes) ở các tầng cao hơn để skip qua nhiều phần tử, giúp tăng tốc độ tìm kiếm từ O(N) xuống trung bình **O(log N)**.
 - **Ví dụ cấu trúc**:
     ```text
@@ -592,12 +1367,22 @@ B-link tree (Lehman-Yao)
     - **Kém Cache-friendly**: Các node cấp phát rải rác trong bộ nhớ (đặc trưng linked list) gây cache miss, không tốt bằng mảng liền khối của B-Tree.
     - Tốn bộ nhớ hơn (lưu nhiều pointer).
     - Phù hợp chủ yếu cho **In-memory Database** (như Redis Sorted Set, Memtable của RocksDB/LevelDB) hơn là Disk-based DB.
+- **Độ phức tạp**: search/insert/delete **O(log N) kỳ vọng** (worst case O(N) với xác suất cực nhỏ); bộ nhớ kỳ vọng **2N pointer** với p = 1/2 (Redis dùng p = 1/4, max level 32).
+- **Delete**: tìm node ở mọi tầng, nối lại con trỏ `next` của node đứng trước ở từng tầng.
+- **Skip list vs B+Tree vs Balanced BST (in-memory)**:
+    | | Skip List | Red-Black / AVL | B+Tree |
+    |---|---|---|---|
+    | Rebalance | Không (ngẫu nhiên) | Xoay cây | Split/merge |
+    | Concurrent/lock-free | ✅ Dễ (CAS từng tầng) | ❌ Khó | ⚠️ Cần latch crabbing |
+    | Range scan | ✅ Duyệt level 0 | ⚠️ In-order traversal | ✅ Leaf list |
+    | Cache locality | ❌ Kém | ❌ Kém | ✅ Tốt |
+- Vì sao **Redis** chọn skip list cho ZSet thay vì cây cân bằng (theo antirez): code đơn giản hơn, dễ thêm `ZRANK` (lưu thêm **span** — số node bị nhảy qua — ở mỗi con trỏ để tính rank O(log N)), range query tự nhiên, hiệu năng tương đương.
 
-- [ ] Bài tập: Tự implement Skip List bằng Java (Có thể tham khảo `java.util.concurrent.ConcurrentSkipListMap`).
+- [ ] Bài tập: Tự implement Skip List bằng Java (Có thể tham khảo `java.util.concurrent.ConcurrentSkipListMap`). File `SkipList.java` hiện mới có level 0 (sorted linked list), còn thiếu: mảng `forward[]` theo level, random level, search/insert/delete theo mô tả ở trên.
 
 ---
 
-##### 8.1.3. Trie Index (Prefix Tree)
+#### 9.3. Trie Index (Prefix Tree)
 - **Ý tưởng**: Không lưu toàn bộ key ở một node mà **lưu trữ theo từng ký tự**. Độ sâu của cây phụ thuộc vào độ dài của key thay vì số lượng data.
 - **Cấu trúc**: Mỗi đường đi từ root xuống một node (được đánh dấu là kết thúc `end`) đại diện cho 1 key.
 - **Ví dụ**:
@@ -618,7 +1403,7 @@ B-link tree (Lehman-Yao)
     - Nếu data không chia sẻ nhiều prefix -> **Tốn cực kỳ nhiều bộ nhớ** cho các node rời rạc.
     - Cấu trúc cây có xu hướng "dài và gầy", không phù hợp để duyệt (I/O reading) trên Disk. Do đó, thường biến thể thành **Radix Tree / Patricia Trie** (gộp các node liên tiếp chỉ có 1 child thành 1 node chung) để nén cấu trúc.
 
-##### 8.1.4 Trie key span (Node Span / Radix size)
+##### 9.3.1. Trie Key Span (Node Span / Radix size)
 - **Định nghĩa**: **Span** là lượng byte/bit (hoặc ký tự) được phân tích và kiểm tra tại mỗi tầng của Trie. Thông số này quyết định **fan-out** (số lượng nhánh con tối đa) của mỗi node.
 - **Ví dụ**:
     - **1-bit span**: Mỗi node check 1 bit $\rightarrow$ tối đa 2 nhánh con (0 hoặc 1). Cây sẽ **rất sâu** (ví dụ chuỗi 32-bit int cần duyệt 32 tầng), tốn thời gian traversal (vì nhảy pointer nhiều) nhưng lượng byte mỗi node nhỏ.
@@ -628,7 +1413,7 @@ B-link tree (Lehman-Yao)
     - DB ít khi dùng Trie có span tĩnh. Các hệ thống hiện đại chuyên In-memory (như HyPer, DuckDB) sử dụng **ART (Adaptive Radix Tree)**.
     - ART linh động tăng/giảm kích thước node (Node4, Node16, Node48, Node256). Khi có ít node con $\rightarrow$ dùng span gộp nhỏ, nếu thêm nhiều dữ liệu $\rightarrow$ tự động vươn node to ra. Điều này giúp hệ thống truy xuất cực mạnh mà vẫn cực kỳ tối ưu RAM.
 
-##### 8.1.5. Radix tree (Patricia Trie / Space-optimized Trie)
+##### 9.3.2. Radix Tree (Patricia Trie / Space-optimized Trie)
 - **Định nghĩa**: Là một phiên bản nâng cấp của Trie, được thiết kế để nén cấu trúc. Cốt lõi của nó là **bất kỳ node nào chỉ có ĐÚNG 1 node con sẽ được gộp (merge) vào chung với node đó**.
 - **Cơ chế**: Thay vì một cạnh/node chỉ đại diện cho 1 ký tự, cạnh trong Radix Tree đại diện cho nguyên một chuỗi (chuỗi ký tự / chuỗi bit).
 - **Ví dụ so sánh**:
@@ -648,19 +1433,19 @@ B-link tree (Lehman-Yao)
     - Mức độ **bảo lưu Cache (Cache-friendly)** tốt hơn rất nhiều so với Trie cơ bản vì giảm bớt số lượng lớn Object rời rạc và bước nhảy (pointer traversal).
     - Cực kỳ hữu dụng khi DB chứa những record có tiền tố chung rất lớn (như prefix domain, chuỗi uuid, URL).
 - **Ứng dụng trong kiến trúc System/Database**:
-    - **Redis**: Sử dụng Radix Tree nền tảng (cụ thể là `Rax` library) để chạy cơ chế dữ liệu `Redis Streams` và quản lý Redis Cluster routing.
-    - **Relational Databases (PostgreSQL, InnoDB)**: Radix tree được sử dụng ẩn bên trong Engine (Ví dụ: Memory tracking, quản lý lock id, hay Indexing block dạng SP-GiST engine của PostgreSQL). 
-    - **Khác**: Core cơ chế IP Routing của Linux Kernel cũng dùng Radix Tree vì IP subnet có tính chất nén Radix hoàn hảo.
+    - **Redis**: Sử dụng Radix Tree (thư viện `rax`) cho `Redis Streams` (key là stream ID), lưu danh sách consumer group, và (Redis 6.x) map key theo hash slot trong Redis Cluster.
+    - **PostgreSQL**: index **SP-GiST** cài đặt sẵn radix tree cho kiểu `text` (`text_ops`); từ **PG 17**, VACUUM dùng một **adaptive radix tree** (TidStore) để lưu danh sách dead tuple TID → bỏ giới hạn 1 GB của `maintenance_work_mem` cũ và tiết kiệm bộ nhớ đáng kể.
+    - **Khác**: Linux kernel dùng **LC-trie** (`fib_trie`, một biến thể nén của radix tree) cho bảng định tuyến IPv4 — longest prefix match trên IP subnet là bài toán trie kinh điển. HyPer/DuckDB dùng **ART** cho index in-memory (9.3.1).
 
 
-#### 8.2. Inverted Index (Chỉ mục đảo ngược)
+#### 9.4. Inverted Index (Chỉ mục đảo ngược)
 - **Ý tưởng cốt lõi**: Đi ngược lại với cách truyền thống (Document $\rightarrow$ Chứa Words), Inverted Index xây dựng một "từ điển" mapping từ **Words (Terms)** $\rightarrow$ **Danh sách các Document IDs** chứa từ đó (gọi là Postings List).
 - **Thành phần chính**:
     1. **Term Dictionary (Từ điển)**: Lưu trữ tất cả các từ khóa (terms) có trong hệ thống và chỉ mục trỏ tới cụm document.
     2. **Postings List (Danh sách đối chiếu)**: Mảng các Document ID (và trật tự tần suất, vị trí xuất hiện) tương ứng với từng term.
 - **Ứng dụng**: Là cấu trúc dữ liệu nền tảng cho mọi Search Engine ngày nay (Elasticsearch, Solr, Google Search).
 
-##### 8.2.1. Apache Lucene (Elasticsearch) - Cách cài đặt Từ điển bằng FST
+##### 9.4.1. Apache Lucene (Elasticsearch) - Cách cài đặt Từ điển bằng FST
 - **Vấn đề**: Term Dictionary của một Search Engine có thể chứa hàng tỷ từ. Nếu để dưới Disk thì mỗi lần search tốn I/O quá chậm, nếu đưa hết lên RAM bằng Array/Hashmap hay Tree/Trie thông thường thì vượt quá dung lượng bộ nhớ khả dụng.
 - **Giải pháp của Lucene**: Sử dụng **FST (Finite State Transducer)**.
     - Đây là một cấu trúc đồ thị trạng thái hữu hạn (Automaton). Khác với Trie chỉ chia sẻ được khoản "Tiền tố - Prefix", FST chia sẻ cả **hậu tố (Suffix)**, cho phép tỉ lệ nén rất cao.
@@ -704,7 +1489,7 @@ B-link tree (Lehman-Yao)
     - **Quy trình Tìm kiếm (Query)**: Bắn truy vấn Search tới toàn bộ FST của tất cả Segments đang có $\rightarrow$ Gom Postings List lại $\rightarrow$ Hợp nhất (Merge) $\rightarrow$ Trả kết quả.
     - **Background Merge**: Khi số lượng Segment quá nhiều (tra cứu nhiều FST gây chậm), hệ thống chạy ngầm tiến trình gộp nhiều Segment nhỏ thành 1 Segment lớn, loại bỏ các document đã xóa, và **build lại 1 FST duy nhất** cho Segment mới. Các FST cũ được loại bỏ.
 
-##### 8.2.1. PostgreSQL GIN (B+ Tree) vs Lucene (FST)
+##### 9.4.2. PostgreSQL GIN (B+ Tree) vs Lucene (FST)
 
 ###### A. Cách PostgreSQL GIN liên kết data bằng B+ Tree
 
@@ -814,12 +1599,12 @@ B-link tree (Lehman-Yao)
 | Cần cả hai | PostgreSQL OLTP + Elasticsearch search (đồng bộ CDC) |
 
 
-##### 8.2.2. Vector index (ANN - Approximate Nearest Neighbor)
+#### 9.5. Vector Index (ANN - Approximate Nearest Neighbor)
 Trong môi trường cơ sở dữ liệu vector, việc tìm kiếm chính xác tuyệt đối (gọi là **KNN - K-Nearest Neighbors**) đòi hỏi phải quét và tính khoảng cách với *toàn bộ* vector đang có. Độ phức tạp là $O(N \times D)$ (N số record, D số chiều), điều này không khả thi về mặt hiệu năng khi DB có hàng triệu vector lớn. 
 
 Do đó, hầu hết các hệ thống Vector DB sử dụng các thuật toán **ANN (Approximate Nearest Neighbor)** để đánh đổi một phần accuracy lấy tốc độ search nhanh $O(\log N)$ hoặc $O(1)$. Ở đây ta bỏ qua quá trình biến text/image thành các embedded vector, chỉ đề cập cấu trúc dữ liệu bên dưới.
 
-###### 8.2.2.1. Inverted File Index (IVF)
+##### 9.5.1. Inverted File Index (IVF)
 - **Ý tưởng cốt lõi**: Chia không gian vector rộng lớn thành nhiều clusters (cells). Inverted table sẽ chứa `Cluster ID -> [Posting list các vector thuộc cluster đó]`. Thay vì brute-force scan toàn bộ dataset, chỉ search trong một số clusters gần nhất.
 - **Phân chia cluster như nào?**
   - Hệ thống sử dụng thuật toán gom cụm máy học, chuyên biệt và phổ biến nhất là **K-means Clustering** trong quá trình build index.
@@ -829,7 +1614,7 @@ Do đó, hầu hết các hệ thống Vector DB sử dụng các thuật toán 
   - Mọi điểm vector rơi vào đa giác A đều được chứng minh bằng toán học là **có khoảng cách đến tâm A gần hơn bất kỳ tâm của các tế bào xung quanh nào khác**.
   - **Cơ chế Search (tham số $nprobe$)**: Đầu tiên, DB tính khoảng cách giữa query vector với $K$ tâm. Chọn ra $nprobe$ clusters gần nhất → truy cập Posting list của các cluster đó và brute-force search nội bộ để tìm Top-K vector gần nhất. Tốc độ rất nhanh vì chỉ phải quét một phần nhỏ dữ liệu.
 
-###### 8.2.2.2. Graph Index (HNSW - Hierarchical Navigable Small World)
+##### 9.5.2. Graph Index (HNSW - Hierarchical Navigable Small World)
 **HNSW** là thuật toán tìm kiếm vector state-of-the-art hiện nay, được sử dụng trong Milvus, Qdrant, pgvector.
 - **Ý tưởng thiết kế**: Kết hợp giữa **NSW (Navigable Small World)** (đồ thị proximity graph nối các vectors lân cận) và **Skip List** (cấu trúc phân tầng cho phép skip nhanh).
 - **Cấu trúc phân tầng** (tương tự Skip List):
@@ -851,19 +1636,69 @@ Do đó, hầu hết các hệ thống Vector DB sử dụng các thuật toán 
   3. **Inner Product (Tích vô hướng / Dot Product - IP)**:
      - Tương tự Cosine Similarity nhưng có tính thêm magnitude, chi phí tính toán thấp hơn.
      - **Kỹ thuật tối ưu**: Nếu mô hình AI sinh output vector đã L2-normalized (magnitude = 1) thì `Inner Product ≡ Cosine Similarity`. Khi đó cấu hình DB dùng Inner Product thay Cosine → loại bỏ phép khai căn và phép chia → xử lý hiệu quả bằng tập lệnh SIMD trực tiếp trên CPU registers.
+- **Tham số quan trọng của HNSW**: `M` (số cạnh tối đa mỗi node — lớn thì recall cao nhưng tốn RAM), `ef_construction` (độ rộng beam khi build), `ef_search` (độ rộng beam khi query — tăng thì recall tăng, latency tăng).
+- **Nhược điểm HNSW**: tốn RAM (vector + đồ thị phải nằm trong bộ nhớ để nhanh), build chậm, delete khó (thường chỉ đánh dấu xóa rồi rebuild).
+
+##### 9.5.3. Quantization & Disk-based ANN
+- **Product Quantization (PQ)**: chia vector D chiều thành m sub-vector, mỗi sub-vector được thay bằng ID của centroid gần nhất trong codebook riêng (thường 256 centroid → 1 byte) → vector 768 chiều float32 (3 KB) nén còn vài chục byte. Khoảng cách được tính xấp xỉ qua bảng tra (ADC). Hay kết hợp **IVF-PQ** (FAISS).
+- **Scalar / Binary quantization**: float32 → int8 (giảm 4×) hoặc 1 bit/chiều (giảm 32×, so sánh bằng Hamming distance), sau đó **re-rank** top candidate bằng vector gốc.
+- **DiskANN / Vamana** (Microsoft): đồ thị phẳng tối ưu cho SSD — giữ vector nén PQ trong RAM, đồ thị + vector gốc trên SSD → index hàng tỷ vector trên 1 máy. Có trong SQL Server 2025, Azure, Milvus; `pgvectorscale` (StreamingDiskANN) cho PostgreSQL.
+
+##### 9.5.4. Vector search trong PostgreSQL (pgvector) & vấn đề filter
+- `pgvector` hỗ trợ 2 loại index: **IVFFlat** (build nhanh, cần dữ liệu có sẵn để train centroid, tham số `lists`, `probes`) và **HNSW** (recall/latency tốt hơn, build chậm hơn, tham số `m`, `ef_construction`, `ef_search`).
+    ```sql
+    CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+    SET hnsw.ef_search = 100;
+    SELECT id FROM items ORDER BY embedding <=> '[0.1, 0.2, ...]' LIMIT 10;  -- <=> cosine, <-> L2, <#> inner product
+    ```
+- **Filtered vector search** (vd: `WHERE tenant_id = 42 ORDER BY embedding <=> q LIMIT 10`) là bài toán khó:
+    - **Post-filter**: ANN lấy top-K rồi mới lọc → có thể còn < K kết quả (thậm chí 0) nếu filter chọn lọc mạnh.
+    - **Pre-filter**: lọc trước rồi brute-force → chính xác nhưng chậm nếu tập sau lọc lớn.
+    - Giải pháp: tăng `ef_search`, **iterative index scan** (pgvector 0.8+), partial index / partition theo tenant, hoặc engine hỗ trợ filter ngay trong lúc duyệt đồ thị (Qdrant, Weaviate, Milvus).
+- **Hybrid search**: kết hợp điểm BM25 (full-text, 9.4) với điểm vector, gộp bằng **Reciprocal Rank Fusion (RRF)** — phổ biến trong hệ thống RAG.
+
+> 🛠 **Áp dụng:**
+> - Bloom filter trước cache/DB để chặn truy vấn key không tồn tại (cache penetration — `SystemDesign.md` 2.4), dedupe URL trong crawler.
+> - Full-text search: `LIKE '%x%'` không dùng được B+Tree → PostgreSQL GIN/`tsvector` cho nhu cầu vừa phải, Elasticsearch khi cần ranking/fuzzy/scale.
+> - Semantic search/RAG: pgvector (HNSW) khi dữ liệu vừa và cần chung transaction với dữ liệu nghiệp vụ; vector DB chuyên dụng khi hàng trăm triệu vector hoặc filter phức tạp.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao Bloom filter có thể trả "có thể có" sai nhưng không bao giờ trả "không có" sai?**
+   → Phần tử đã thêm thì chắc chắn đã bật đủ k bit của nó; nếu có 1 bit bằng 0 thì phần tử chưa từng được thêm. Ngược lại k bit đều 1 có thể do các phần tử khác bật.
+2. **Vì sao Lucene/Elasticsearch không sửa index tại chỗ mà tạo segment mới?**
+   → Term dictionary (FST) và posting list nén rất chặt, sửa giữa chừng phải tính lại toàn bộ. Segment bất biến cho phép nén tối đa và đọc không cần khóa; đổi lại cần merge nền và chỉ "near real-time".
+</details>
 
 
+### 10. Latching in database
 
-### 9. Latching in database
+> 🎯 **Bài toán:** Nhiều thread cùng đọc và sửa các cấu trúc dữ liệu trong RAM (page, node B+Tree, bucket hash). Một thread đang **split** node trong khi thread khác đọc node đó → đọc phải trạng thái nửa vời → sai kết quả hoặc crash.
+>
+> ❌ **Cách ngây thơ:** Một mutex lớn cho cả index → đúng, nhưng tại một thời điểm chỉ một thread làm việc; CPU 64 core chỉ dùng được 1.
+>
+> 💡 **Ý tưởng giải:** Khóa **càng nhỏ và giữ càng ngắn càng tốt**: latch cho từng node; khi đi xuống cây chỉ giữ latch của node cha nếu node con có thể bị split/merge (*crabbing*); đoán lạc quan rằng hiếm khi split (*optimistic*); hoặc thiết kế cấu trúc để không cần giữ node cha (*B-link tree*).
+
 Là cơ chế đảm bảo tính nhất quán dữ liệu khi multi-thread truy cập đồng thời trong nội bộ database (không phải transaction-level concurrency control).
 
-#### 9.1. Mục tiêu
+#### 10.0. Lock vs Latch — phân biệt trước khi đọc tiếp
+
+| | **Lock** (transaction-level) | **Latch** (internal, ~ mutex) |
+|---|---|---|
+| Bảo vệ | Nội dung **logic** của DB (tuple, table) khỏi transaction khác | Cấu trúc dữ liệu **vật lý trong bộ nhớ** (page, node B+Tree, hash bucket) khỏi thread khác |
+| Thời gian giữ | Cả transaction | Rất ngắn — trong 1 thao tác (critical section) |
+| Mode | S, X, IS, IX, SIX, U... | Read, Write |
+| Deadlock | **Detect** (wait-for graph) hoặc **prevent** (wait-die, wound-wait) | **Tránh** bằng kỷ luật lập trình (thứ tự acquire cố định) |
+| Rollback | Có (khi abort) | Không có khái niệm rollback |
+| Lưu ở | Lock manager (hash table) | Nhúng trong chính cấu trúc dữ liệu |
+
+#### 10.1. Mục tiêu
    - Small memory footprint
    - Fast execution when no contention
    - Decentralize management of latches
-   - Avoid expensive system calls (Linus Torvalds phản đối việc sử dụng futex trong kernel vào năm 2020)
+   - Avoid expensive system calls — năm 2020 Linus Torvalds phản biện một bài blog benchmark spinlock: **không nên tự viết spinlock ở user-space** vì scheduler của OS không biết thread đang giữ lock (có thể preempt nó, khiến các thread khác spin vô ích); nên dùng primitive của OS như mutex dựa trên **futex** (fast path không cần syscall, chỉ gọi kernel khi thật sự phải chờ).
 
-#### 9.2. Các loại latch
+#### 10.2. Các loại latch
 
    **1. Test-and-set Spinlock (Atomic)**
    - **Cơ chế hoạt động**: Sử dụng vòng lặp vô hạn (spin) liên tục kiểm tra và giành khóa bằng lệnh nguyên thủy của vi xử lý (như Compare-And-Swap - CAS). Khi không lấy được khóa, thread sẽ không ngủ mà liên tục "chạy không tải" (busy-wait).
@@ -872,7 +1707,7 @@ Là cơ chế đảm bảo tính nhất quán dữ liệu khi multi-thread truy 
 
    **2. Blocking Mutex (OS Lock)**
    - **Cơ chế hoạt động**: Sử dụng cơ chế khóa của hệ điều hành (như `std::mutex` hay `pthread_mutex`). Khi không lấy được khóa, thread chuyển trạng thái sang **ngủ (sleep)** và được OS đưa vào hàng đợi chờ (wait queue). Khi khóa được giải phóng, OS sẽ đánh thức (wake up) thread.
-   - **Nhược điểm**: **Chi phí Context Switch (chuyển đổi ngữ cảnh) cao** (~25ns cho mỗi lần sys-call và sleep/wake). Nếu thời gian giữ khóa siêu ngắn (vài nanosecond), việc phải gọi sys-call rồi ngủ mất tài nguyên đáng kể, dẫn tới không thể scale.
+   - **Nhược điểm**: Khi **không tranh chấp**, `lock/unlock` chỉ tốn ~25ns (fast path của futex là 1 lệnh CAS ở user-space). Nhưng khi **có tranh chấp**, thread phải syscall + ngủ + được đánh thức → **context switch tốn vài micro-giây** (gấp hàng trăm lần). Nếu critical section chỉ vài nanosecond thì chi phí ngủ/thức này lớn hơn nhiều so với công việc thực → không scale.
    - **Nơi sử dụng**: Bảo vệ các cấu trúc dữ liệu hoặc tác vụ tốn nhiều thời gian, đặc biệt là quá trình đọc/ghi page vật lý từ đĩa (Disk I/O) lên Buffer Pool (để nhường CPU cho các thread khác chạy trong lúc phần cứng làm việc).
 
    **3. Read-Writer Latch (Shared/Exclusive Lock)**
@@ -897,15 +1732,15 @@ Là cơ chế đảm bảo tính nhất quán dữ liệu khi multi-thread truy 
      3. Trước khi Reader dời đi, sẽ **kiểm tra lại** `version` đó. Nếu version thay đổi $\rightarrow$ Có một Writer nào đó vừa làm modified bởi concurrent writer $\rightarrow$ Thread đọc coi như thất bại và phải bắt đầu **Làm lại (Retry)** từ đầu.
    - **Nơi sử dụng**: Khuynh hướng chung của các hệ thống **In-Memory DBMS** tương lai (Silo, HyPer, SAP HANA). Phổ biến nhất trong việc duyệt các node gốc của cấu trúc B+ Tree vì ở trên đỉnh root tỷ lệ read gấp hàng triệu lần tỷ lệ write, nếu loại bỏ hoàn toàn quá trình ghi lock Read (tránh được cập nhật Reader Counter vật lý) sẽ đẩy tốc độ duyệt tăng đáng kể. Giải quyết triệt để vấn đề Read-Contention của Read-Writer Latch.
 
-Hash table latching
-   Các phương án:
-   1. Global latch: single latch để chặn entire of data structure
+**Hash table latching**
+- Hash table dễ hỗ trợ concurrency hơn B+Tree vì mọi thread đều đi theo **cùng một hướng** (tính hash → tới slot → probe xuống dưới) và chỉ truy cập 1 page/slot tại một thời điểm → không có deadlock do thứ tự ngược.
+- Các phương án (từ thô đến mịn):
+   1. **Global latch**: 1 latch cho toàn bộ cấu trúc — đơn giản nhưng không song song (thường chỉ dùng khi resize toàn bộ bảng).
+   2. **Page/block latch**: mỗi page có 1 reader-writer latch; thread giữ latch của page khi đọc/ghi và nhả trước khi sang page kế tiếp → giảm song song chút ít nhưng truy cập nhiều slot trong 1 page rất nhanh.
+   3. **Slot latch**: latch cho từng slot → song song cao nhất nhưng tốn bộ nhớ và chi phí acquire/release lớn hơn khi probe nhiều slot (có thể dùng spinlock/CAS 1 bit cho mỗi slot).
+- **Lock-free**: insert bằng CAS vào slot trống (linear probing) — dùng trong hash table in-memory hiệu năng cao.
 
-   2. Page/block latch: Lock theo từng page và block với read-writer lock
-
-   3. Slot latch: lock theo từng slot
-
-#### 9.3. B+Tree Concurrency Control
+#### 10.3. B+Tree Concurrency Control
 - **Mục tiêu**: Đảm bảo tính nhất quán của cấu trúc cây khi nhiều threads truy cập đồng thời, ngăn ngừa trạng thái không hợp lệ do Split/Merge, đồng thời tối ưu hóa throughput cho các thao tác song song.
 
 - **Safe Node (Node an toàn)** — Định nghĩa cốt lõi cho tất cả kỹ thuật bên dưới:
@@ -964,318 +1799,397 @@ Hash table latching
         5. **Latch node cha** → chèn key phân cách (separator key) và pointer tới node mới → **Nhả cha**
     - **Ưu điểm**: Cha không bị giữ latch trong suốt quá trình split → tăng song song đáng kể. Luồng Read/Search khi gặp node đang split vẫn tìm được đúng kết quả nhờ cơ chế right-link + high-key.
     - **Ứng dụng thực tế**: **PostgreSQL** sử dụng B-link Tree (thuật toán Lehman-Yao) làm chiến lược concurrency chính cho B+Tree index (`nbtree`). Đây là lý do PostgreSQL có thể handle write-heavy workload trên index hiệu quả.
-    - **Lợi thế quan trọng nhất**: Right-link pointer cho phép **Reader không bao giờ cần lock internal node**. Nếu reader đang ở node cũ và key cần tìm vượt quá high-key → chỉ cần follow right-link sang node mới mà không cần lấy lại bất kỳ latch nào từ cha. Điều này loại bỏ hoàn toàn read lock trên internal nodes → throughput đọc tăng phi mã so với Latch Crabbing.
+    - **Lợi thế quan trọng nhất**: Reader **không cần latch coupling**. Trong thuật toán gốc của Lehman-Yao, reader không lấy latch nào (giả định đọc/ghi 1 page là atomic); trong cài đặt thực tế như PostgreSQL, reader chỉ giữ **shared latch trên 1 page tại một thời điểm** (nhả page cha trước khi sang page con). Nếu reader đến node cũ mà key cần tìm vượt quá high-key → follow right-link sang node mới, không cần quay lại cha → throughput đọc cao hơn hẳn Latch Crabbing.
+
+**⚖️ Các chiến lược đồng bộ B+Tree**
+
+| Chiến lược | Ý tưởng | Ưu điểm | Nhược điểm |
+| :--- | :--- | :--- | :--- |
+| Global latch | 1 khóa cho cả cây | Đơn giản | Không song song |
+| Latch crabbing (pessimistic) | Giữ X-latch dọc đường, nhả cha khi con "an toàn" | Đúng, dễ hiểu | Mọi writer tranh nhau X-latch ở root |
+| Optimistic crabbing | Đi xuống bằng S-latch, chỉ X-latch leaf; nếu leaf phải split thì làm lại kiểu pessimistic | Bỏ nút thắt ở root | Phải làm lại khi đoán sai |
+| B-link tree (Lehman-Yao) | Mỗi node có con trỏ sang phải + high-key → reader tự đi sang node mới tách | Reader gần như không chặn, split không giữ cha | Cài đặt phức tạp hơn |
+| Optimistic lock coupling (version) | Reader không lấy latch, kiểm tra version sau khi đọc | Không có write vào bộ nhớ khi đọc → scale đa core | Phải retry khi có ghi đồng thời |
+
+✅ **Vì sao chọn:** Split thực tế rất hiếm (chỉ khi leaf đầy) nên mọi hệ hiện đại đều **lạc quan**: PostgreSQL dùng B-link tree; InnoDB dùng latch theo node + optimistic; các DB in-memory (HyPer, Umbra, LeanStore) dùng optimistic lock coupling vì trên CPU nhiều core, ngay cả việc tăng bộ đếm reader của RW-latch cũng gây nghẽn cache line.
+
+> 🛠 **Áp dụng:**
+> - Wait event `LWLock:*` (PostgreSQL) hay mutex/rw-lock contention trong `SHOW ENGINE INNODB STATUS` = tranh chấp **latch** (cấu trúc nội bộ), khác hẳn tranh chấp **lock** (dữ liệu) — cách xử lý khác nhau (vd hot page do insert tăng dần cùng lúc, quá nhiều connection).
+> - Nguyên lý giống hệt khi viết code đồng thời trong Java: khóa phạm vi nhỏ, giữ ngắn, đọc lạc quan (`StampedLock`, `ConcurrentHashMap` — `Java.md` 9).
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao lock (transaction) cần cơ chế phát hiện deadlock còn latch thì không?**
+   → Latch giữ rất ngắn và lập trình viên DBMS **ép thứ tự acquire** (luôn từ trên xuống, trái sang phải) nên không thể có chu trình. Lock do người dùng quyết định thứ tự truy cập dữ liệu nên chu trình có thể xảy ra.
+2. **Khi nào node con được gọi là "safe" với thao tác insert?**
+   → Khi nó còn chỗ trống — insert chắc chắn không làm nó split, nên không ảnh hưởng tới node cha → có thể nhả latch của cha.
+</details>
 
 
+### 11. Sorting & Aggregation
 
-    ### 10. Sorting
-    
-    Khi mọi thứ không được lưu trữ trên RAM mà trên disk thì tối ưu I/O đôi khi lại quan trọng hơn là tốc độ thuật toán
-    Việc lấy data: tuple hay chỉ record id
-
-    - Khi query chứa LIMIT thì chỉ cần dùng thuật toán Top-N (min heap / max heap)
-    - Khi không biết trước số lượng kết quả, ta dùng thuật toán để chia nhỏ data và combine lại:
-        - Phase 1: Sorting — chia nhỏ data fit trong RAM, sort từng phần, sau đó lưu lại trong disk thành các sorted runs
-        - Phase 2: Merge — gộp các sorted runs lại với nhau
-        - Công thức (với B buffer pages, N data pages):
-            - Tổng quát: số pass = 1 + ⌈log_{B-1}(⌈N/B⌉)⌉
-            - Trường hợp 2-way merge (B=3, 2 input + 1 output buffer): số pass = 1 + ⌈log2(N)⌉
-            - Total I/O = 2N × số pass (mỗi pass đọc N page + ghi N page)
-        2-pass merge sort:
-            - Yêu cầu: B ≥ √N buffer pages
-            - Cách suy ra: Phase 1 tạo ⌈N/B⌉ sorted runs. Phase 2 cần merge TẤT CẢ runs cùng lúc → cần ⌈N/B⌉ input buffers + 1 output buffer ≤ B → ⌈N/B⌉ ≤ B-1 → N ≤ B(B-1) ≈ B² → B ≥ √N
-
-        Double buffering:
-            Thay vì sử dụng toàn bộ buffer pool, ta chia chúng thành 2 nửa
-            Khi 1 phần hoàn thành và thực thi ghi vào disk, ta thực hiện sort data tại nửa thứ 2
-            Việc này giúp ta overlap I/O và CPU (tối ưu tài nguyên CPU), nhưng giảm hiệu quả của buffer pool đi 1 nửa
-
-    Phân bổ tài nguyên: 
-        - Postgres khá cứng nhắc việc cung cấp tài nguyên: Ví dụ 1GB RAM, mỗi query chỉ có thể dùng 100MB (work_mem)
-        - Các DB doanh nghiệp (Oracle, SQL Server) thực hiện tốt hơn khi có cơ chế memory grant linh hoạt — mượn thêm từ các query không sử dụng
-
-    Tối ưu compare:
-        Kĩ thuật 1: Code specialization / JIT — thay vì gọi function pointer cho comparator, generate code cụ thể (inline function) để giảm overhead gọi hàm
-        Kĩ thuật 2: Suffix truncation — compare binary prefix có độ dài cố định của varchar trước, chỉ khi prefix bằng nhau mới compare full string (giảm cache miss)
-        Kĩ thuật 3: Normalized Key (Sort Key Extraction) — Trích xuất N byte đầu tiên của mỗi key (hoặc toàn bộ nếu key ngắn) thành một **sort key cố định độ dài** (fixed-length binary-comparable prefix). Lưu sort key liền kề nhau trong array → so sánh bằng `memcmp` trên array liên tiếp → tận dụng SIMD + cache-friendly. Chỉ khi 2 sort key bằng nhau mới fallback so sánh full key gốc (hiếm xảy ra). Kỹ thuật này được dùng trong DuckDB, MonetDB.
-
-    Aggregate:
-       - Tổng hợp data ta cần dùng thuật toán sorting hoặc hashing
-       - Tùy theo phần cứng mà sorting hoặc hash có thể nhanh hơn, nhưng trong đại bộ phận các trường hợp thì hashing nhanh hơn
-       - Tương tự như sort, nếu data > memory thì ta cần chiến lược chia nhỏ
-
-       External Hashing Aggregate (khi data không fit trong RAM):
-           Vấn đề: Tại sao không chia nhỏ data thành chunk rồi hash lần lượt?
-               → Các key giống nhau (cùng group) bị PHÂN TÁN khắp các chunk
-               → Ví dụ: key "Vietnam" có thể xuất hiện ở chunk 1, chunk 5, chunk 99...
-               → Khi merge partial results, phải tìm và gộp lại tất cả entry cùng key → chi phí merge rất lớn
-
-           Giải pháp: Dùng hash function để đảm bảo các key giống nhau luôn rơi vào CÙNG 1 partition
-               → Mỗi partition là độc lập, aggregate xong là xong, KHÔNG CẦN MERGE
-
-           Phase 1 — Partition (dùng hash function h1):
-               - Duyệt toàn bộ data, với mỗi tuple: bucket_id = h1(key) % B (B = số partition)
-               - Ghi tuple vào buffer của bucket tương ứng
-               - Khi buffer đầy → flush bucket ra disk
-               - Kết quả: tất cả tuple có cùng key nằm trong cùng 1 partition trên disk
-
-           Phase 2 — ReHash (dùng hash function h2 ≠ h1):
-               - Với mỗi partition:
-                   1. Load partition vào RAM
-                   2. Build hash table bằng h2 (khác h1 để tránh cùng collision pattern)
-                   3. Tính aggregate (SUM, COUNT, AVG...) trực tiếp trên hash table
-                   4. Output kết quả
-               - Tại sao dùng h2 ≠ h1? Vì h1 chỉ đảm bảo cùng key → cùng partition.
-                 Trong partition, cần h2 để build hash table hiệu quả (tránh clustering)
-
-           Yêu cầu bộ nhớ:
-               - Cần B ≤ (số buffer pages - 1) partitions
-               - Mỗi partition phải fit trong RAM ở Phase 2 → cần B ≈ √N partitions
-               - Nếu 1 partition vẫn quá lớn → recursive partitioning: hash lại partition đó bằng h3 để chia nhỏ hơn
-
-           So sánh:
-               | Naive (chia chunk tuần tự)           | External Hash Aggregate              |
-               | Key giống nhau phân tán khắp chunks  | Key giống nhau tập trung 1 partition |
-               | Phải merge tất cả partial results    | Không cần merge — partition độc lập  |
-               | I/O cao do merge                     | I/O = 3N (read + write + read lại)   |
-    
-
-    ### 11. Join
-    #### 11.1. Join Algorithm
-    ##### 11.1.1. Nested Loop Join
-        Thuật toán đơn giản nhất: duyệt qua từng tuple của R, với mỗi tuple, duyệt qua từng tuple của S và so sánh
-        Tốn I/O: O(N*M) nếu không có buffer, O(N*M/B) nếu có buffer
-        
-    ##### 11.1.2. Block Nested Loop Join
-        Tương tự như nested loop join nhưng thay vì duyệt từng tuple của S, ta duyệt từng block của S
-        Tốn I/O: O(N*M/B) nếu có buffer
-        
-    ##### 11.1.3. Sort-Merge Join
-        Tốn I/O cho sort và join nhưng nhanh hơn rất nhiều so với nested loop join
-    
-    ##### 11.1.4. Hash Join
-        Sử dụng hash table để join
-        Cải tiến: Dùng bloom filter trước khi check hash table
-        Khi data > memory ta cần tối ưu lại
-        11.4.1. Partitioned Hash Join
-            Đôi khi còn được gọi là grace hash join
-            Tương tự: Thực hiện hash R và S thành các partition
-            Phase 1: Partition
-                - Dùng hash function h1 để hash R và S thành các partition
-                - Ghi partition vào disk
-            Phase 2: Join
-                - Với mỗi partition:
-                    1. Load partition vào RAM
-                    2. Build hash table bằng h2 (khác h1 để tránh cùng collision pattern)
-                    3. Tính join trực tiếp trên hash table
-                    4. Output kết quả
-            Yêu cầu bộ nhớ:
-                - Cần B ≤ (số buffer pages - 1) partitions
-                - Mỗi partition phải fit trong RAM ở Phase 2 → cần B ≈ √N partitions
-                - Nếu 1 partition vẫn quá lớn → recursive partitioning: hash lại partition đó bằng h3 để chia nhỏ hơn
-            I/O: 3 * (N+M)
-            So sánh:
-                | Naive (chia chunk tuần tự)           | Partitioned Hash Join              |
-                | Key giống nhau phân tán khắp chunks  | Key giống nhau tập trung 1 partition |
-                | Phải merge tất cả partial results    | Không cần merge — partition độc lập  |
-                | I/O cao do merge                     | I/O = 3N (read + write + read lại)   |
-        11.4.2. Hybrid Hash Join
-            Là sự kết hợp giữa Simple Hash Join (toàn bộ trên RAM) và Grace Hash Join (toàn bộ trên Disk).
-            Được sử dụng chủ yếu trong PostgreSQL, SQL Server, MySQL...
-            Ý tưởng: Tận dụng tối đa bộ nhớ RAM còn thừa thay vì ép tất cả xuống Disk.
-            Cách hoạt động:
-                - Phase 1 (Partitioning): 
-                    + Cố ý chia thành 1 phân vùng đặc biệt (Partition 0) vừa khít với lượng RAM đang có và giữ TẤT CẢ data của nó trên RAM (xây luôn Hash Table).
-                    + Các phân vùng còn lại (Partition 1...k) được stream ghi xuống Disk.
-                    + Khi quét bảng S, nếu tuple rơi vào Partition 0 -> Join và trả kết quả ngay lập tức (không chạm Disk). Rơi vào Partition 1...k -> Ghi xuống Disk.
-                - Phase 2 (Grace Hash Join): 
-                    + Chỉ thực hiện Grace Hash Join (đọc lên RAM, build & probe) cho các phân vùng từ 1..k đã lưu dưới Disk.
-            Tối ưu I/O: 
-                - Cực kỳ tiết kiệm I/O do Partition 0 hoàn toàn không sinh ra tác vụ Read/Write xuống Disk nào (tiết kiệm được 2*size(Partition 0) chi phí I/O).
-    
-    
-        #### 11.2. Tổng kết IO Cost của các thuật toán Join
-    | Algorithm | IO Cost | Example |
-    | :--- | :--- | :--- |
-    | Naïve Nested Loop Join | $M + (m \times N)$ | 1.3 hours |
-    | Block Nested Loop Join | $M + (\lceil M / (B-2) \rceil \times N)$ | 0.55 seconds |
-    | Index Nested Loop Join | $M + (m \times C)$ | Variable |
-    | Sort-Merge Join | $M + N + \text{(sort cost)}$ | 0.75 seconds |
-    | Hash Join | $3 \times (M + N)$ | 0.45 seconds |
+> 🎯 **Bài toán:** `ORDER BY`, `GROUP BY`, `DISTINCT`, merge join, tạo index — đều cần sắp xếp hoặc gom nhóm dữ liệu **lớn hơn RAM** dành cho query.
+>
+> ❌ **Cách ngây thơ:** Quicksort trong RAM → không vừa. Sắp xếp trực tiếp trên disk bằng truy cập ngẫu nhiên → mỗi phép so sánh có thể là một lần I/O.
+>
+> 💡 **Ý tưởng giải:** Thiết kế thuật toán để **I/O tuần tự và ít lượt (pass)**: *external merge sort* sắp xếp từng khúc vừa RAM thành các "run", rồi trộn k run cùng lúc theo kiểu tuần tự. Với gom nhóm, nếu không cần thứ tự thì **hash** rẻ hơn sort; khi quá RAM thì chia partition bằng hash để mỗi phần vừa RAM.
 
 
-    #### 11.3. Vấn đề kích thước của Hash Table
-    Vấn đề chung với Hash Table trong DB là **Rất khó đánh giá chính xác số lượng Unique Keys (Cardinality)** từ ban đầu để cấp phát cho đúng kích thước RAM.
-    Khi cấp phát sai (nhỏ hơn thực tế), Hash Table bị đầy, dẫn tới va chạm (collision) cực cao. Có các hướng giải quyết:
-      1. Tình huống tĩnh (Static Hash Table): Chấp nhận lưu dồn bằng **Overflow Pages (Ghi tràn xuống đĩa bằng bucket chaining)**. Tác hại là làm mất độ truy xuất O(1) và sinh ra I/O random làm hệ thống kẹt cứng.
-      2. Tình huống động (Dynamic Hash Table): Sử dụng **Extendible Hashing** hoặc **Linear Hashing** để tự dãn nở mảng mà không cần phải re-hash lại toàn bộ giá trị. Đánh đổi lại là mất thêm chi phí tính toán thu dọn khi resize.
-      3. Ở Hash Join (Grace Hash Join): Xử lý bằng **Recursive Partitioning** (Dùng hàm hash mới chia lại cái phân vùng tràn đó thành các file nhỏ hơn ghi xuống đĩa tiếp).
+> Khi dữ liệu không nằm gọn trong RAM mà nằm trên disk, **tối ưu số lần I/O** thường quan trọng hơn độ phức tạp thuật toán trên CPU.
+
+#### 11.1. Tại sao DBMS cần sort?
+- `ORDER BY`, `GROUP BY` (sort-based), `DISTINCT`, **Sort-Merge Join**, bulk-load B+Tree (xem 8.4.8), window functions (`PARTITION BY ... ORDER BY`).
+- **Lấy gì để sort?** Có 2 lựa chọn:
+    - **Early materialization**: sort nguyên tuple → ít bước truy cập lại nhưng tốn bộ nhớ/I/O hơn.
+    - **Late materialization**: chỉ sort `(sort key, record id)` → nhẹ, nhưng sau đó phải random I/O để lấy lại tuple (tốt cho column-store).
+
+#### 11.2. Top-N Heap Sort
+- Khi query có `ORDER BY ... LIMIT N` → chỉ cần giữ **heap kích thước N** (max-heap nếu tìm N nhỏ nhất) và quét dữ liệu 1 lần: O(M log N), bộ nhớ O(N).
+- PostgreSQL hiển thị trong `EXPLAIN ANALYZE` là `Sort Method: top-N heapsort`.
+
+#### 11.3. External Merge Sort (dữ liệu > RAM)
+- **Phase 1 — Sorting (tạo runs)**: đọc từng khối vừa với B buffer pages, sort trong RAM, ghi ra disk thành các **sorted runs**.
+- **Phase 2 — Merge**: gộp các sorted runs (k-way merge, dùng min-heap để chọn phần tử nhỏ nhất giữa k runs).
+- **Công thức** (B buffer pages, N data pages):
+    - Số pass = `1 + ⌈log_{B-1}(⌈N/B⌉)⌉`
+    - Trường hợp 2-way merge (B = 3: 2 input + 1 output buffer): số pass = `1 + ⌈log₂ N⌉`
+    - **Tổng I/O = 2N × số pass** (mỗi pass đọc N page + ghi N page)
+- **2-pass merge sort** (trường hợp phổ biến nhất trong thực tế):
+    - Yêu cầu: `B ≥ √N` buffer pages.
+    - Suy ra: Phase 1 tạo `⌈N/B⌉` runs. Phase 2 cần merge **tất cả** runs cùng lúc → cần `⌈N/B⌉` input buffers + 1 output buffer ≤ B → `N ≤ B(B-1) ≈ B²` → `B ≥ √N`.
+    - Ví dụ: 1 GB buffer (page 8 KB → B ≈ 131k pages) sort được ~ B² × 8 KB ≈ **137 TB** chỉ với 2 pass.
+- **Double buffering**: chia buffer làm 2 nửa — trong khi nửa này đang chờ I/O ghi/đọc, CPU sort/merge trên nửa còn lại → **overlap I/O và CPU**, đổi lại số buffer hữu dụng cho mỗi pass giảm một nửa.
+- **Dùng B+Tree có sẵn để sort?**
+    - **Clustered B+Tree** trên đúng sort key → chỉ cần duyệt leaf từ trái sang phải: luôn tốt hơn external sort.
+    - **Unclustered B+Tree** → mỗi tuple là 1 random I/O → gần như luôn **tệ hơn** external sort (trừ khi chỉ lấy vài dòng đầu với LIMIT).
+
+#### 11.4. Phân bổ bộ nhớ cho sort/hash
+- **PostgreSQL**: mỗi node Sort/Hash được dùng tối đa `work_mem` (mặc định 4 MB; hash node dùng `work_mem × hash_mem_multiplier`). Một query phức tạp có nhiều node → có thể dùng **nhiều lần** `work_mem`. Vượt quá → spill xuống disk (`Sort Method: external merge  Disk: ...kB`).
+- **MySQL**: `sort_buffer_size` (per session), từ 8.0.12 cấp phát tăng dần theo nhu cầu.
+- **Oracle / SQL Server**: cơ chế **memory grant** linh hoạt — optimizer ước lượng bộ nhớ cần, query chờ grant; có thể mượn thêm từ pool chung khi hệ thống rảnh.
+
+#### 11.5. Tối ưu phép so sánh khi sort
+1. **Code specialization / JIT**: thay vì gọi comparator qua function pointer cho mỗi lần so sánh, sinh code cụ thể (inline) cho kiểu dữ liệu → bỏ overhead gọi hàm.
+2. **Suffix truncation**: với `VARCHAR` dài, so sánh prefix nhị phân có độ dài cố định trước, chỉ khi prefix bằng nhau mới so sánh full string (giảm cache miss).
+3. **Normalized key (sort key extraction)**: trích N byte đầu của mỗi key thành **sort key cố định độ dài, so sánh được bằng `memcmp`** (đã xử lý collation, NULL ordering, dấu âm...). Các sort key nằm liền nhau trong array → cache-friendly, tận dụng SIMD/radix sort. Chỉ khi 2 sort key bằng nhau mới fallback về key gốc. Dùng trong DuckDB, MonetDB, HyPer/Umbra.
+4. PostgreSQL có **abbreviated keys** (từ 9.5) — cùng ý tưởng: so sánh trước 1 giá trị `Datum` 8 byte rút gọn từ string.
+
+#### 11.6. Aggregation: Sorting vs Hashing
+- Aggregation (`GROUP BY`, `DISTINCT`) cần gom các tuple cùng key lại với nhau. 2 cách:
+    - **Sort-based**: sort theo group key rồi quét tuần tự → tiện khi output cần `ORDER BY` cùng key hoặc input đã sorted (index).
+    - **Hash-based**: build hash table `key → running aggregate` → thường **nhanh hơn** vì không cần sắp xếp toàn bộ, chỉ cần gom nhóm.
+- PostgreSQL hiển thị `GroupAggregate` (sort-based) vs `HashAggregate` (hash-based). Từ PG 13, HashAggregate có thể spill xuống disk.
+
+##### External Hashing Aggregate (khi data không fit trong RAM)
+- **Vấn đề**: Tại sao không chia data thành chunk rồi aggregate từng chunk?
+    → Các key giống nhau (cùng group) **phân tán khắp các chunk** (key "Vietnam" xuất hiện ở chunk 1, 5, 99...) → phải merge partial results của mọi chunk → chi phí merge rất lớn.
+- **Giải pháp**: dùng hash function để đảm bảo **cùng key luôn rơi vào cùng 1 partition** → mỗi partition độc lập, aggregate xong là xong, không cần merge.
+- **Phase 1 — Partition** (hash function `h1`):
+    - Duyệt toàn bộ data, với mỗi tuple: `partition_id = h1(key) % (B-1)`.
+    - Ghi tuple vào output buffer của partition tương ứng; buffer đầy → flush xuống disk.
+    - Kết quả: mọi tuple có cùng key nằm trong cùng 1 partition trên disk.
+- **Phase 2 — ReHash** (hash function `h2 ≠ h1`):
+    - Với mỗi partition: load vào RAM → build hash table bằng `h2` → cập nhật running aggregate (SUM, COUNT, MIN/MAX; AVG = giữ (SUM, COUNT)) → output.
+    - Tại sao `h2 ≠ h1`? Mọi key trong 1 partition đều có cùng `h1 % (B-1)`; nếu dùng lại `h1` cho hash table thì phân bố sẽ bị dồn cục (clustering) → cần hàm hash độc lập.
+- **Yêu cầu bộ nhớ**: tối đa `B-1` partitions ở Phase 1; mỗi partition phải vừa RAM ở Phase 2 → xử lý được khoảng `B × (B-1)` pages, tức cần `B ≈ √N`. Nếu 1 partition vẫn quá lớn (data skew) → **recursive partitioning** bằng `h3`.
+
+| | Naive (chia chunk tuần tự) | External Hash Aggregate |
+|---|---|---|
+| Phân bố key | Key giống nhau phân tán khắp chunks | Key giống nhau tập trung 1 partition |
+| Merge | Phải merge tất cả partial results | Không cần merge — partition độc lập |
+| I/O | Cao do merge | ≈ 3N (đọc + ghi partition + đọc lại) |
+
+**⚖️ Chọn cách gom nhóm / sắp xếp**
+
+| Phương án | Khi nào thắng |
+| :--- | :--- |
+| Dùng index đã sắp sẵn (clustered / index trên cột ORDER BY) | Luôn tốt nhất nếu có — không phải sort |
+| Top-N heap | `ORDER BY ... LIMIT N` với N nhỏ |
+| Sort in-memory | Dữ liệu vừa `work_mem` |
+| External merge sort | Dữ liệu lớn, hoặc output cần sắp xếp |
+| Hash aggregate | `GROUP BY` không cần thứ tự — thường nhanh hơn sort |
+
+✅ **Vì sao optimizer chọn như vậy:** chi phí chủ yếu là I/O; dùng thứ tự có sẵn là miễn phí, heap N phần tử chỉ một lượt đọc, hash chỉ cần đưa nhóm về đúng chỗ chứ không cần sắp xếp toàn bộ.
+
+> 🛠 **Áp dụng:**
+> - `EXPLAIN ANALYZE` hiện `Sort Method: external merge Disk: ...` → sort tràn ra disk → tăng `work_mem` cho session/báo cáo đó hoặc tạo index phục vụ `ORDER BY`.
+> - Phân trang có `ORDER BY created_at DESC LIMIT 20` → index trên `created_at` biến sort thành đọc 20 entry đầu của index.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao external merge sort chỉ cần 2 lượt với hầu hết dữ liệu thực tế?**
+   → Với B trang bộ nhớ, sort được khoảng B² trang trong 2 lượt; 1 GB bộ nhớ ứng với hàng chục TB dữ liệu.
+2. **External hash aggregate vì sao phải dùng 2 hàm hash khác nhau?**
+   → Hàm thứ nhất chia partition (mọi key giống nhau về cùng partition); trong một partition mọi key có cùng giá trị hàm thứ nhất, nên dùng lại nó để build hash table sẽ dồn cục.
+</details>
 
 
-    ### 12.Query plan
-    Query plan là 1 DAG of operators
+---
 
-    **Pipeline** là 1 chuỗi các operators được thực thi tuần tự mà các tuple được xử lý liên tục từ operator này sang operator khác mà không cần phải lưu toàn bộ kết quả vào bộ nhớ.
-    
-    **Pipeline breaker** là operator không thể hoàn thành cho đến khi toàn bộ các con của nó emit
-    → join, aggregate, sort
+### 12. Join Algorithms
 
-    #### 12.1. Processing model
-    Định nghĩa cách dbms thực thi data hoặc chuyển data giữa các operator
-    - Control flow: cách các operator giao tiếp với nhau
-    - Data flow: cách data được truyền giữa các operator
-
-    #### 12.1.1. Iterator model (Volcano Model / Pipeline Model)
-    - next(): return next tuple -> Các tuple được trả về và xử lý lần lượt
-    - open()/close(): Khởi tạo và dọn dẹp state của operator.
-    - Đây là model phổ biến nhất trong các hệ quản trị CSDL truyền thống (MySQL, PostgreSQL, SQLite...).
-    - **Ưu điểm**: Bộ nhớ sử dụng (Memory footprint) rất nhỏ, do dòng dữ liệu được truyền luân phiên (pipeline) lên trên mà không cần chờ toàn bộ (trừ các Pipeline Breaker operator như Sort, Hash Join).
-    - **Nhược điểm lớn nhất**: Chi phí gọi hàm `next()` liên tục (function call overhead) rất cao giữa hàng triệu/tỷ bản ghi, gây lãng phí CPU. 
-    Lưu ý: Tại sao khi học ta thấy query theo các page nhưng bản chất lại xử lí lần lượt theo từng tuple?
-    Nó là việc tách biệt giữa tầng thực thi (Execution Engine) và tầng lưu trữ (Storage Engine).
-    Khi ta học, ta thường tập trung vào tầng lưu trữ (Storage Engine) để hiểu cách đọc dữ liệu từ đĩa.
-    Nhưng khi thực thi query, ta lại tập trung vào tầng thực thi (Execution Engine) để hiểu cách xử lý dữ liệu.
-    Do đó mới nảy sinh sự khác biệt giữa việc execution và storage.
+> 🎯 **Bài toán:** Ghép 2 bảng theo điều kiện (`orders.customer_id = customers.id`). Hai bảng có thể lớn hơn RAM.
+>
+> ❌ **Cách ngây thơ:** Với mỗi dòng của bảng A, quét toàn bộ bảng B (naive nested loop) → M × N phép so sánh và hàng chục triệu lần I/O (~1,4 giờ trong ví dụ ở 12.4).
+>
+> 💡 **Ý tưởng giải:** Ba cách tránh so sánh "mọi cặp":
+> 1. **Dùng index** của bảng trong: với mỗi dòng ngoài chỉ tra index (index nested loop).
+> 2. **Sắp xếp** cả hai rồi trượt song song (sort-merge).
+> 3. **Băm** bảng nhỏ thành hash table rồi dò bảng lớn (hash join).
 
 
-    #### 12.1.2. Materialization model
-    - Thực thi ý tưởng: Thay vì xử lý trên từng tuple được trả về, child operator sẽ trả về toàn bộ kết quả (một mảng/list) cho parent cùng một lúc.
-    - Parent sẽ nhận và xử lý toàn bộ cục kết quả đó.
-    - **Ứng dụng**: Phù hợp với hệ thống **In-memory Database** hoặc workload **OLTP** (giao dịch, tải nhẹ). OLTP query thường chỉ truy xuất/update 1 vài bản ghi nên trả về 1 mảng kết quả cuối cùng không tốn nhiều memory, lại tránh được overhead của hàm `next()` như Iterator model.
-    - **Nhược điểm**: Không có nhiều DB dùng cho truy vấn lớn/phân tích (OLAP) vì cần phải allocate bộ nhớ khổng lồ để lưu toàn bộ kết quả trung gian, dễ dẫn tới tràn RAM/Disk I/O thảm hoạ.
+**Ký hiệu** (theo CMU 15-445): bảng ngoài R có **M pages, m tuples**; bảng trong S có **N pages, n tuples**; B buffer pages. Chi phí tính bằng số page I/O, **bỏ qua chi phí ghi output** (giống nhau giữa các thuật toán).
 
-    #### 12.1.3. Vectorized model / Batch model
-    - Kết hợp giữa 2 model trên: Cân bằng hoàn hảo.
-    - Thay vì gọi hàm `next()` trả 1 tuple (Iterator) hay xả toàn bộ về 1 cục khổng lồ (Materialization), thì gọi `next()` trả về **từng batch (mảng)** của tuple (VD: batch 1000 - 10000 tuples, hoặc kích thước dữ liệu vừa khít lọt vào L1/L2 Cache của CPU).
-    - **Ưu điểm**: 
-      - Cực kỳ tối ưu: Giảm tải overhead của việc gọi hàm `next()`.
-      - Tận dụng được Cache của CPU hiệu quả không phải xuống RAM đọc đi đọc lại.
-      - Phát huy trọn vẹn sức mạnh của tập lệnh xử lý song song **SIMD (Single Instruction, Multiple Data)** chíp hiện đại.
-    - **Nhược điểm**: Vẫn tốn nhiều bộ nhớ hơn một chút so với Iterator truyền thống, và code implementation cực kỳ phức tạp.
-    - **Ứng dụng**: Thống trị mảng phân tích dữ liệu **OLAP / Data Warehouse** hiện đại. Hầu hết DB phân tích dùng mô hình này (ClickHouse, Snowflake, Presto, DuckDB...).
-    - **Synergy với Columnar Storage**: Vectorized model và column-store **cộng hưởng với nhau** — mỗi batch trong `next()` là array của 1 column → thẳng vào SIMD register mà không cần shuffle/transpose. Đây là lý do DuckDB và ClickHouse chọn cả 2 cùng lúc.
+> Nguyên tắc chung: luôn chọn **bảng nhỏ hơn làm bảng ngoài (outer/build side)**.
 
-    
-    #### 12.2. Plan processing model (Pull vs Push)
-    - Trong tất cả các model trên (Iterator, Materialization, Vectorized), ta đều thấy có 1 điểm chung là luồng điều khiển đi từ trên xuống dưới, nhưng luồng dữ liệu lại được "kéo" từ dưới lên (Pull) thông qua hàm `next()`.
-    - Có 2 kiến trúc chính về luồng điều khiển (Control Flow):
-        1. **Pull-based (Mô hình Kéo)**:
-            - Parent operator sẽ gọi hàm `next()` để kéo dữ liệu từ child operator.
-            - Phần lớn các RDBMS truyền thống (như MySQL, PostgreSQL) sử dụng kiến trúc này.
-        2. **Push-based (Mô hình Đẩy / Data-centric)**:
-            - Đảo ngược luồng điều khiển: Các child operator (như Scan) sẽ chủ động "đẩy" (push) dữ liệu lên cho parent operator ngay khi nó đọc được.
-            - Thay vì gọi hàm `next()` tốn kém, hệ thống sẽ "gộp" (**Operator Fusion**) các toán tử lại với nhau vào chung một vòng lặp `for`.
-            - Được sử dụng trong các hệ thống hiện đại, đặc biệt là In-memory DB (HyPer, DuckDB).
+#### 12.1. Nested Loop Join (NLJ)
+##### 12.1.1. Naive (Simple) Nested Loop Join
+```text
+for each tuple r in R:          -- outer
+    for each tuple s in S:      -- inner
+        if r.key == s.key: emit(r, s)
+```
+- Cost: `M + (m × N)` — với **mỗi tuple** của R phải quét toàn bộ S.
 
-    **Ví dụ minh họa Operator Fusion trong Push Model:**
-    > Truy vấn: `SELECT B.val FROM A JOIN B ON A.id = B.id WHERE A.val > 100`
+##### 12.1.2. Block Nested Loop Join
+```text
+for each block of (B-2) pages bR in R:
+    for each page bS in S:
+        for each r in bR, s in bS: if match → emit
+```
+- Dùng `B-2` buffer cho R, 1 buffer cho S, 1 buffer cho output.
+- Cost: `M + ⌈M / (B-2)⌉ × N`. Nếu R vừa hết vào RAM (`B > M + 2`) → `M + N` (tốt nhất có thể).
 
-    *1. Vấn đề của Pull Model (Mô hình Kéo)*
-    - Trong mô hình Iterator (Pull), dữ liệu truyền qua các lời gọi hàm `next()`. Mỗi khi lấy một tuple, CPU phải nhảy từ `Join.next()` -> `Filter.next()` -> `Scan.next()`. 
-    - Việc gọi hàm ảo (virtual function calls) hàng triệu lần tạo ra độ trễ (overhead) khổng lồ và **phá hỏng CPU Cache** do ngữ cảnh thực thi (code path) liên tục bị chuyển đổi qua lại giữa các operator.
+##### 12.1.3. Index Nested Loop Join
+- Nếu S có index trên join key → với mỗi tuple của R, tra index thay vì quét S.
+- Cost: `M + (m × C)` với C = chi phí 1 lần index lookup (B+Tree ≈ 2–4 I/O + fetch tuple; nếu index clustered thì rẻ hơn nhiều).
+- Đây là thuật toán **OLTP ưa thích**: outer nhỏ (đã lọc) + inner có index → rất ít I/O. MySQL trước 8.0.18 **chỉ có** NLJ/BNL; join hiệu quả hoàn toàn dựa vào index.
 
-    *2. Giải pháp của Push Model: "Gộp" toán tử (Operator Fusion)*
-    - Kiến trúc Push (Data-centric) để node Scan chủ động đọc và đẩy thẳng dữ liệu qua các bước xử lý tiếp theo ngay trong cùng một vòng lặp.
-    - Dưới đây là mã giả minh hoạ cách Push Model "Fuse" (gộp) các toán tử `Scan`, `Filter` và `Join`:
+#### 12.2. Sort-Merge Join (SMJ)
+- **Phase 1 — Sort**: sort R và S theo join key (external merge sort nếu cần).
+- **Phase 2 — Merge**: 2 con trỏ chạy song song trên 2 bảng đã sort, tiến con trỏ có key nhỏ hơn; khi bằng nhau thì emit. Với key trùng lặp (many-to-many) phải **backtrack** con trỏ bên trong về đầu nhóm key bằng nhau.
+- Cost: `Sort(R) + Sort(S) + (M + N)` với `Sort(X) = 2X × số pass`. Worst case (mọi tuple cùng 1 key) suy biến thành `M × N`.
+- **Khi nào có lợi**: 1 hoặc cả 2 bảng **đã sorted** theo join key (clustered index, output của operator trước), hoặc query cần output **sorted theo join key** (interesting order — xem 15.3.2).
 
-    ```cpp
-    // --- PIPELINE 1: Đẩy dữ liệu bảng A (Build Phase) ---
-    // Toán tử Scan A chủ động quét dữ liệu
-    for (Tuple a : tableA) { 
-        // Toán tử Filter được GỘP (fused) thẳng vào vòng lặp này
-        if (a.val > 100) { 
-            // Đẩy thẳng dữ liệu thoả mãn vào Hash Table của toán tử Join
-            // (Đây là Pipeline Breaker, luồng dữ liệu của 1 tuple tàm dừng ở đây)
-            hashTable.put(a.id, a); 
-        }
+#### 12.3. Hash Join
+- **Build phase**: quét bảng nhỏ hơn (R), build hash table `key → tuple` (hoặc `key → record id`).
+- **Probe phase**: quét bảng S, với mỗi tuple tính hash và tra hash table.
+- Cải tiến: **Bloom filter (sideways information passing)** — trong build phase tạo kèm Bloom filter của các key của R, đẩy xuống phía probe để loại sớm tuple của S chắc chắn không match (rất hiệu quả trong distributed join vì giảm dữ liệu shuffle).
+- Nếu R vừa RAM: cost `M + N`.
+
+##### 12.3.1. Partitioned (Grace) Hash Join — khi data > RAM
+- Tên gọi từ hệ thống GRACE (Đại học Tokyo, 1980s).
+- **Phase 1 — Partition**: dùng `h1` hash **cả R và S** thành `B-1` partition mỗi bảng, ghi xuống disk. Tuple của R và S có cùng key chắc chắn nằm ở partition cùng số thứ tự `i`.
+- **Phase 2 — Build & Probe**: với mỗi cặp partition `(R_i, S_i)`: load `R_i` vào RAM, build hash table bằng `h2`, quét `S_i` để probe.
+- **Yêu cầu bộ nhớ**: mỗi partition của bảng build phải vừa RAM → cần `B > √M` (M = kích thước bảng nhỏ). Partition quá lớn do skew → **recursive partitioning** bằng `h3`.
+- Cost: `3 × (M + N)` = partition (đọc + ghi cả 2 bảng: 2(M+N)) + probe (đọc lại: M+N).
+
+##### 12.3.2. Hybrid Hash Join
+- Kết hợp Simple Hash Join (toàn bộ trên RAM) và Grace Hash Join (toàn bộ partition xuống disk). Dùng trong PostgreSQL (batch 0 giữ trong RAM), SQL Server, Oracle...
+- **Ý tưởng**: tận dụng RAM còn thừa sau khi chia partition thay vì ép tất cả xuống disk.
+    - **Phase 1**: giữ hẳn **partition 0** của R trong RAM (build hash table luôn), các partition 1..k ghi xuống disk. Khi quét S: tuple rơi vào partition 0 → probe và emit ngay (không chạm disk); rơi vào 1..k → ghi xuống disk.
+    - **Phase 2**: Grace Hash Join cho các partition 1..k.
+- **Tiết kiệm**: partition 0 không tốn I/O ghi/đọc lại → giảm `2 × (|R₀| + |S₀|)` I/O so với Grace thuần.
+
+##### 12.3.3. MySQL Hash Join (8.0.18+)
+- Từ MySQL 8.0.18 có hash join cho equi-join không dùng index; từ 8.0.20 thay thế hoàn toàn Block Nested Loop. Bộ nhớ giới hạn bởi `join_buffer_size`; vượt quá thì spill ra các "chunk file" trên disk (giống Grace hash join).
+
+#### 12.4. Tổng kết I/O Cost của các thuật toán Join
+
+Ví dụ CMU: M = 1000 pages, m = 100,000 tuples; N = 500 pages, n = 40,000 tuples; B = 100; 0.1 ms / I/O.
+
+| Algorithm | IO Cost | Ví dụ |
+| :--- | :--- | :--- |
+| Naïve Nested Loop Join | `M + (m × N)` | ~1.4 giờ |
+| Block Nested Loop Join | `M + ⌈M / (B-2)⌉ × N` | ~0.55 giây |
+| Index Nested Loop Join | `M + (m × C)` | Tùy C |
+| Sort-Merge Join | `M + N + (sort cost)` | ~0.75 giây |
+| Hash Join | `3 × (M + N)` | ~0.45 giây |
+
+> **Kết luận**: Hash join gần như luôn tốt nhất cho equi-join trên dữ liệu lớn chưa sorted. Sort-merge thắng khi dữ liệu đã sorted hoặc cần output sorted. Index NLJ thắng khi outer rất nhỏ. Chỉ Nested Loop xử lý được **non-equi join** (`R.a < S.b`, `LIKE`...).
+
+#### 12.5. Các biến thể Join cần biết
+- **Semi-join** (`WHERE EXISTS` / `IN (subquery)`): chỉ cần biết có match hay không → dừng sau match đầu tiên, không nhân bản tuple.
+- **Anti-join** (`WHERE NOT EXISTS`): chỉ emit tuple **không** có match. ⚠️ `NOT IN (subquery)` khác `NOT EXISTS` khi subquery có `NULL`: `x NOT IN (1, NULL)` luôn là `UNKNOWN` → không trả dòng nào.
+- **Outer join**: hash join cần đánh dấu các entry đã match trong hash table để emit phần không match của build side (right/full outer).
+
+#### 12.6. Vấn đề kích thước của Hash Table
+Rất khó ước lượng chính xác số lượng unique keys (cardinality) từ đầu để cấp phát đúng kích thước RAM. Khi cấp phát sai (nhỏ hơn thực tế), hash table đầy → collision cao. Hướng giải quyết:
+1. **Static hash table + overflow pages** (bucket chaining ghi tràn xuống disk): mất tính O(1), sinh random I/O.
+2. **Dynamic hash table** (Extendible / Linear Hashing — xem 7.2): tự giãn nở không cần rehash toàn bộ, đổi lại chi phí khi resize.
+3. **Trong Grace Hash Join**: **recursive partitioning** — dùng hàm hash mới chia partition bị tràn thành các file nhỏ hơn.
+
+✅ **Optimizer chọn thuật toán nào?** Dựa vào ước lượng số dòng (chương 15):
+- **Index nested loop** khi bảng ngoài (sau lọc) **rất ít dòng** và bảng trong có index → điển hình OLTP (`WHERE order_id = ?` rồi ghép items).
+- **Hash join** cho equi-join trên dữ liệu lớn chưa sắp xếp → điển hình báo cáo.
+- **Sort-merge** khi dữ liệu đã sắp xếp sẵn theo khóa join, hoặc output cần sắp xếp theo khóa đó.
+- **Nested loop thường** là lựa chọn duy nhất cho điều kiện không phải bằng (`a.x < b.y`).
+
+> 🛠 **Áp dụng:**
+> - Thấy `Nested Loop` với bảng ngoài hàng triệu dòng trong `EXPLAIN` → thường do **ước lượng sai** (thống kê cũ) hoặc thiếu index → chạy `ANALYZE`, so sánh `rows` ước lượng với `actual rows`.
+> - Luôn đánh index cho cột **foreign key** dùng để join (PostgreSQL không tự tạo).
+> - Hash join bị spill (`Batches: 8` trong EXPLAIN của PostgreSQL) → tăng `work_mem` cho truy vấn đó.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao hash join luôn build hash table từ bảng nhỏ hơn?**
+   → Hash table phải nằm trong RAM; bảng nhỏ vừa RAM hơn và bảng lớn chỉ cần quét tuần tự một lần để dò.
+2. **Vì sao OLTP hầu như chỉ thấy nested loop join?**
+   → Outer chỉ vài dòng sau khi lọc theo khóa, mỗi dòng tra index vài I/O — rẻ hơn nhiều so với build hash table hay sort cả bảng.
+</details>
+
+
+---
+
+### 13. Query Execution: Processing Models & Access Methods
+
+> 🎯 **Bài toán:** Query plan là một cây operator (scan → filter → join → aggregate). Dữ liệu nên chảy giữa các operator thế nào để vừa **ít tốn bộ nhớ**, vừa **ít tốn CPU** cho mỗi dòng?
+>
+> ❌ **Cách ngây thơ:** Mỗi operator chạy xong toàn bộ, ghi kết quả trung gian ra bảng tạm, operator sau đọc lại → tốn bộ nhớ/I/O khổng lồ với dữ liệu lớn.
+>
+> 💡 **Ý tưởng giải:** **Pipeline** — operator cha xin dữ liệu từ operator con theo từng phần, dữ liệu đi thẳng lên trên mà không cần lưu tạm (trừ các *pipeline breaker* như sort, hash build). Câu hỏi còn lại là mỗi lần truyền **bao nhiêu dữ liệu**: 1 dòng, cả khối, hay 1 lô vừa cache CPU.
+
+
+- **Query plan** là một **DAG of operators** (thường là cây).
+- **Pipeline**: chuỗi operators mà tuple đi liên tục từ operator này sang operator khác **không cần materialize** toàn bộ kết quả trung gian.
+- **Pipeline breaker**: operator không thể emit output cho đến khi nhận hết input từ (ít nhất 1) con: build side của hash join, sort, hash aggregate, subquery cần materialize.
+
+#### 13.1. Processing Model
+Định nghĩa cách DBMS thực thi plan và truyền dữ liệu giữa các operator:
+- **Control flow**: các operator gọi nhau như thế nào.
+- **Data flow**: dữ liệu được truyền giữa các operator theo đơn vị nào (1 tuple / batch / toàn bộ).
+
+##### 13.1.1. Iterator Model (Volcano / Pipeline Model)
+- Mỗi operator cài đặt `open()`, `next()`, `close()`. Mỗi lần gọi `next()` trả về **1 tuple** (hoặc EOF).
+- Phổ biến nhất trong RDBMS truyền thống: PostgreSQL, MySQL, SQLite, SQL Server (row mode), Oracle.
+- **Ưu điểm**: memory footprint nhỏ; tự nhiên hỗ trợ pipeline; dễ dừng sớm (`LIMIT`).
+- **Nhược điểm**: gọi `next()` (virtual function call) cho **mỗi tuple ở mỗi operator** → hàng tỷ lời gọi hàm, branch misprediction, phá instruction cache.
+- **Lưu ý**: "Tại sao storage đọc theo page mà execution lại xử lý từng tuple?" → Đây là sự tách biệt giữa **Storage Engine** (đơn vị I/O là page, qua buffer pool) và **Execution Engine** (đơn vị xử lý logic là tuple/batch). Scan operator đọc page từ buffer pool nhưng trả từng tuple cho operator cha.
+
+##### 13.1.2. Materialization Model
+- Mỗi operator xử lý **toàn bộ input một lần** và trả **toàn bộ output** cho cha (có thể chỉ là danh sách record id hoặc column).
+- Phù hợp **OLTP** (query chỉ chạm vài tuple → kết quả nhỏ, tránh overhead gọi `next()`): VoltDB, H-Store. MonetDB dùng biến thể column-at-a-time cho OLAP.
+- **Nhược điểm**: query OLAP có kết quả trung gian lớn → tốn bộ nhớ khổng lồ, dễ spill.
+
+##### 13.1.3. Vectorized / Batch Model
+- Giống Iterator nhưng `next()` trả về **một batch (vector)** tuple, ví dụ 1,024–10,000 tuple (vừa L1/L2 cache).
+- **Ưu điểm**:
+    - Overhead gọi hàm giảm theo hệ số batch size.
+    - Vòng lặp chặt (tight loop) trên array → CPU cache tốt, dễ dùng **SIMD**.
+- **Nhược điểm**: code operator phức tạp hơn; tốn bộ nhớ hơn Iterator một chút.
+- **Ứng dụng**: hầu hết engine OLAP hiện đại: DuckDB, ClickHouse, Snowflake, Presto/Trino, Databricks Photon, SQL Server (batch mode cho columnstore).
+- **Cộng hưởng với columnar storage**: mỗi batch là array của 1 column → nạp thẳng vào SIMD register, không cần transpose.
+
+#### 13.2. Plan Processing Direction: Pull vs Push
+1. **Top-to-bottom (Pull-based)**: operator cha gọi `next()` để **kéo** dữ liệu từ con. Phần lớn RDBMS truyền thống.
+2. **Bottom-to-top (Push-based / data-centric)**: operator lá (scan) chủ động **đẩy** dữ liệu lên cha. Cho phép **operator fusion** — gộp nhiều operator của 1 pipeline vào chung 1 vòng lặp. Dùng trong HyPer/Umbra (compile), DuckDB (vectorized push từ 2021).
+
+**Ví dụ Operator Fusion** — `SELECT B.val FROM A JOIN B ON A.id = B.id WHERE A.val > 100`:
+
+*Pull model*: mỗi tuple phải đi qua chuỗi lời gọi `Join.next() → Filter.next() → Scan.next()`; virtual call hàng triệu lần làm phá CPU cache vì code path liên tục nhảy giữa các operator.
+
+*Push model*: Scan chủ động đọc và đẩy thẳng dữ liệu qua các bước tiếp theo trong cùng 1 vòng lặp:
+
+```cpp
+// --- PIPELINE 1: Build phase (Scan A + Filter + Hash Build) ---
+for (Tuple a : tableA) {
+    if (a.val > 100) {              // Filter được GỘP vào vòng lặp
+        hashTable.put(a.id, a);     // Pipeline breaker: kết thúc pipeline 1
     }
+}
 
-    // --- PIPELINE 2: Đẩy dữ liệu bảng B (Probe Phase) ---
-    // Sau khi Pipeline 1 xong, toán tử Scan B chủ động quét
-    for (Tuple b : tableB) {
-        // Toán tử Join Probe được gộp thẳng vào vòng lặp
-        Tuple a = hashTable.get(b.id); 
-        
-        if (a != null) {
-            // Toán tử Project/Emit cũng được gộp luôn
-            emit(b.val); 
-        }
+// --- PIPELINE 2: Probe phase (Scan B + Hash Probe + Project) ---
+for (Tuple b : tableB) {
+    Tuple a = hashTable.get(b.id);  // Join probe được gộp vào vòng lặp
+    if (a != null) {
+        emit(b.val);                // Projection cũng được gộp
     }
-    ```
+}
+```
 
-    *3. Tại sao Push Model lại nhanh hơn đột phá?*
-    - **Tối đa hoá CPU Cache (Data Locality)**: Khi vòng lặp `for (Tuple a : tableA)` chạy, dòng dữ liệu `a` vừa được lấy từ RAM sẽ nằm ngay trong thanh ghi (register) hoặc L1 Cache siêu tốc của CPU. Nhờ gộp lệnh `if (a.val > 100)`, CPU kiểm tra và nhét nó vào `hashTable` ngay lập tức mà không copy/di chuyển dữ liệu ra vùng nhớ trung gian. Dữ liệu được xử lý triệt để ngay khi nó đang còn "nóng" trong CPU.
-    - **Biên dịch truy vấn (Query Compilation / JIT)**: Để tạo ra được mã vòng lặp lồng nhau tối ưu như trên thay vì một đồ thị cây (Tree of Objects) rời rạc, hệ quản trị cơ sở dữ liệu hiện đại (như HyPer) sẽ lấy Query Plan Tree đó, sinh ra trực tiếp mã C++ hoặc mã máy (LLVM IR), rồi dùng cơ chế biên dịch JIT (Just-In-Time) để chuyển thành file thực thi chạy thẳng dưới nhân CPU. Việc này giúp tiết kiệm tối đa tài nguyên I/O và CPU so với việc thông dịch (interpret) đồ thị cây.
+**Tại sao push + fusion nhanh hơn?**
+- **Data locality**: tuple vừa đọc nằm ngay trong register/L1, được xử lý triệt để (filter → insert hash table) trước khi bị đẩy ra khỏi cache — không copy qua vùng nhớ trung gian.
+- **Query compilation / JIT**: HyPer, Umbra, Spark (whole-stage codegen), PostgreSQL (JIT cho expression qua LLVM từ PG 11) sinh code (C++/LLVM IR/Java bytecode) cho từng pipeline và biên dịch thành mã máy, loại bỏ hoàn toàn chi phí "thông dịch" cây operator.
+- **Hai trường phái hiện đại**: *vectorization* (interpreted, batch — DuckDB, ClickHouse) vs *compilation* (HyPer, Umbra). Paper "Everything You Always Wanted to Know About Compiled and Vectorized Queries But Were Afraid to Ask" (VLDB 2018) cho thấy cả hai đều nhanh tương đương, mỗi bên mạnh ở workload khác nhau.
+
+#### 13.3. Access Methods
+Cách DBMS truy cập dữ liệu trong bảng (không có trong đại số quan hệ).
+
+##### 13.3.1. Sequential Scan (Full Table Scan)
+Quét mọi page của bảng. Không tránh được trong nhiều trường hợp; các kỹ thuật tối ưu:
+- **Prefetching**: Storage Manager dự đoán và nạp trước các page tiếp theo vào buffer pool (overlap I/O và CPU).
+- **Buffer pool bypass**: scan lớn dùng vùng nhớ riêng (ring buffer) để không evict hot pages của query khác (*buffer pollution*). PostgreSQL dùng ring buffer 256 KB cho seq scan bảng lớn hơn 1/4 `shared_buffers`.
+- **Scan sharing / synchronized scans**: query đến sau "nhảy" vào cursor của scan đang chạy trên cùng bảng, đọc đến cuối rồi quay lại đọc phần đầu còn thiếu (PostgreSQL `synchronize_seqscans`, SQL Server "merry-go-round scan").
+- **Data skipping / Zone maps**: lưu MIN/MAX/NULL count cho mỗi block, skip block không thể thỏa WHERE (Parquet, Snowflake, PostgreSQL **BRIN index**, Oracle zone maps).
+- **Late materialization** (column store): lọc trên từng column, chỉ ghép tuple cho các vị trí thỏa mãn cuối cùng.
+- **Encoding & compression**: nhiều tuple hơn trên mỗi I/O.
+- **Clustering / sorting**: sắp xếp vật lý theo clustering key → range query thành sequential I/O.
+- **Parallelization & vectorization (SIMD)**: chia bảng cho nhiều worker; so sánh nhiều giá trị trong 1 lệnh CPU.
+
+##### 13.3.2. Index Scan
+- Dùng index để lấy danh sách record id thỏa điều kiện rồi fetch tuple. Optimizer chọn index dựa trên selectivity, thứ tự output cần thiết, cột trong index (covering?).
+- **Index-only scan**: mọi cột cần đều có trong index → không chạm heap. (PostgreSQL vẫn cần visibility map báo page "all-visible", nếu không phải kiểm tra heap.)
+
+##### 13.3.3. Multi-Index Scan / Bitmap Scan
+- Dùng nhiều index cùng lúc, mỗi index trả tập record id → giao/hợp bằng **bitmap AND/OR** → fetch tuple theo **thứ tự vật lý** (giảm random I/O).
+- PostgreSQL: `Bitmap Index Scan` → `BitmapAnd/BitmapOr` → `Bitmap Heap Scan`. MySQL: **Index Merge** (`type: index_merge`).
+
+#### 13.4. Modification Queries
+- **UPDATE/DELETE**: child operator truyền **record id** lên, operator modification phải cập nhật bảng **và mọi index**.
+    - **Halloween Problem**: `UPDATE ... SET salary = salary * 1.1 WHERE salary < 1100` duyệt bằng index trên `salary` → tuple sau khi cập nhật bị dời tới vị trí "phía trước" con trỏ scan và bị cập nhật lại nhiều lần. Giải pháp: theo dõi record id đã sửa trong query, hoặc materialize danh sách record id trước khi update, hoặc không dùng index trên chính cột bị update. (Phát hiện năm 1976 tại IBM vào đúng ngày Halloween.)
+- **INSERT**: (1) tuple literal trong câu lệnh, hoặc (2) lấy từ child operator: `INSERT INTO t1 SELECT * FROM t2`.
+
+#### 13.5. Expression Evaluation
+- DBMS biểu diễn biểu thức trong WHERE / computed column dưới dạng **expression tree**. Các loại node: comparison (`=`, `<`, `>`, `!=`), conjunction (`AND`, `OR`), arithmetic (`+ - * /`), constant, tuple attribute reference, function call (built-in/UDF), parameter (`$1`).
+- **Thực thi**: duyệt cây **post-order** cho **mỗi tuple**: tại mỗi node gọi `evaluate()` tương ứng (giống `switch` trên loại node), trả kết quả cho cha.
+- **Vấn đề**: virtual call, branch misprediction, cache miss tại mỗi node × số tuple.
+- **Giải pháp**:
+    - **Constant folding**: tính trước phần không phụ thuộc tuple (`WHERE x > 1 + 1` → `x > 2`).
+    - **JIT / compiled expression**: biến cây thành 1 hàm inline.
+
+```text
+SELECT * FROM A WHERE A.x > 100 AND A.y = 200
+
+Expression tree:          AND
+                         /   \
+                        >     =
+                       / \   / \
+                      x 100 y  200
+```
+```cpp
+// Sau khi compile thành hàm inline:
+bool evaluate(const Tuple& t) {
+    return t.x > 100 && t.y == 200;
+}
+```
+
+✅ **Vì sao OLTP và OLAP chọn mô hình khác nhau?**
+- **OLTP → Iterator (1 dòng/lần)**: mỗi query chỉ chạm vài dòng, chi phí gọi hàm không đáng kể; dừng sớm khi có `LIMIT` rất tự nhiên.
+- **OLAP → Vectorized (1 lô ~1.000 dòng/lần)** hoặc **biên dịch query**: query chạm hàng tỷ dòng nên chi phí *mỗi dòng* quyết định tất cả; xử lý theo lô trên mảng cột tận dụng cache CPU và SIMD.
+
+> 🛠 **Áp dụng:**
+> - Đọc `EXPLAIN ANALYZE`: `loops=N` nghĩa là node con chạy N lần (thường trong nested loop) → thời gian thực = `actual time × loops`.
+> - Ứng dụng phân tích nặng chạy chậm trên PostgreSQL dù đã có index → cân nhắc engine vectorized (DuckDB, ClickHouse) thay vì cố tối ưu trên row store.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao gọi `next()` cho từng dòng lại là vấn đề lớn với OLAP?**
+   → Mỗi dòng đi qua mỗi operator là 1 lần gọi hàm ảo (virtual call); với 1 tỷ dòng × 5 operator là 5 tỷ lần gọi, kèm branch misprediction và cache miss — thời gian CPU vượt xa thời gian xử lý dữ liệu thật.
+2. **Operator nào làm "đứt" pipeline?**
+   → Những operator phải nhận hết input trước khi xuất kết quả đầu tiên: sort, phía build của hash join, hash aggregate.
+</details>
 
 
-    #### 12.3. Access method
-    Là cách thức mà hệ quản trị cơ sở dữ liệu truy cập dữ liệu (scan) trong cấu trúc file vật lý.
-    Có các phương pháp tiếp cận chính:
-        1. **Sequential Scan (Full Table Scan)**: Quét toàn bộ dữ liệu lần lượt từ đầu đến cuối page trên đĩa. Nên hạn chế dùng nhưng nếu bắt buộc phải quét, DB có nhiều kỹ thuật tối ưu.
-            *Các kĩ thuật tối ưu để giảm thiểu I/O và tăng tốc Sequential Scan:*
-            - **Prefetching (Đọc trước dữ liệu)**: Storage Manager dự đoán và load trước các page liên tiếp vào Buffer Pool trước khi CPU yêu cầu. Giúp overlap I/O và CPU, tránh bị block chờ đĩa.
-            - **Buffer Pool Bypass**: Khi full table scan cần quét lượng lớn dữ liệu, nếu đưa qua Buffer Pool chung sẽ evict các hot pages đang được cache cho các query khác (buffer pollution). Giải pháp: cấp vùng memory riêng cho scan, quét xong giải phóng, tránh ảnh hưởng Buffer Pool chung.
-            - **Scan Sharing / Synchronized Scans**: Nếu nhiều request cùng table scan trên cùng bảng, request đến sau sẽ attach vào cursor I/O đang active, đọc tiếp từ vị trí hiện tại đến cuối rồi quay lại bù phần đầu → giảm disk I/O đáng kể.
-            - **Data Skipping / Zone Maps**: Lưu metadata thống kê cho từng block (MIN, MAX, NULL count). Khi query có điều kiện WHERE, kiểm tra metadata trước — nếu block không thể chứa kết quả phù hợp thì **skip** toàn bộ block mà không cần đọc dữ liệu thực. Kỹ thuật then chốt của Snowflake / Parquet file.
-            - **Late Materialization**: Kỹ thuật đặc trưng của Columnar Database. Quét từng column riêng rẽ để lọc điều kiện WHERE, đánh dấu các vị trí thỏa mãn. Chỉ reconstruct tuples (tuple reconstruction) cho các rows thỏa điều kiện cuối cùng khi cần SELECT → giảm I/O và giảm data movement trong RAM.
-            - **Data Encoding & Compression**: Giảm kích thước byte mỗi record trong Disk Block thông qua thuật toán nén như RLE, Dictionary → tăng số lượng tuple có thể đọc trong 1 thao tác I/O.
-            - **Clustering / Sorting**: Sắp xếp vị trí vật lý của records trên đĩa theo thứ tự clustering key. Records hay truy vấn chung được lưu liên tiếp → Sequential I/O (hiệu quả hơn Random I/O hàng nghìn lần).
-            - **Parallelization / Vectorization (SIMD)**: 
-                + *Task Parallelization*: Chia table thành các partitions, phân cho N threads xử lý song song.
-                + *Data Vectorization*: Sử dụng SIMD instructions để load batch dữ liệu vào CPU registers, so sánh nhiều giá trị đồng thời thay vì xử lý từng row.
+### 14. Parallel Query Engine Architectures
 
-        2. **Index Scan**: Truy cập thông qua cổng Index (B+Tree), truy xuất dãy Target IDs rồi xuống Disk lấy Tuple gốc.
-        3. **Multi Index Scan / Bitmap Scan**: Sử dụng 2 hay nhiều Index cùng lúc, mỗi Index trả về một tập hợp IDs. Dùng cấu trúc **Bitmap** kết hợp **Bitwise AND/OR** để tìm ra tập hợp IDs thoả mãn tất cả điều kiện → sau đó mới xuống Disk lấy tuple theo danh sách ID đã giao. Tránh được việc lookup Disk nhiều lần.
+> 🎯 **Bài toán:** Máy có hàng chục core và nhiều đĩa, nhưng (1) cần phục vụ hàng nghìn query cùng lúc, và (2) một query báo cáo lớn chạy trên 1 core thì mất hàng phút.
+>
+> 💡 **Ý tưởng giải:** Hai cấp song song khác nhau:
+> - **Inter-query**: nhiều query chạy cùng lúc trên các worker khác nhau → cần concurrency control (chương 16).
+> - **Intra-query**: chia một query thành nhiều phần chạy song song (chia dữ liệu, chạy nhiều operator cùng lúc), nối lại bằng **exchange operator**.
+>
+> Trước đó phải chọn **đơn vị worker**: process, thread, hay chạy nhúng trong ứng dụng.
 
-    #### 12.4. Modification Query
-
-    - **Update/Delete**:
-        - Child operator chỉ truyền **Record ID** cho parent thay vì truyền toàn bộ tuple.
-        - Cần lưu thông tin các ID đã được xử lý để tránh **Halloween Problem**.
-        - **Halloween Problem**: Xảy ra khi `UPDATE` một bản ghi khiến nó thay đổi vị trí (ví dụ: thay đổi giá trị indexed column) → bản ghi có thể xuất hiện lại trong quá trình scan và bị xử lý lần nữa → cần lưu lại danh sách ID đã xử lý để phát hiện và bỏ qua.
-
-    - **Insert**:
-        1. Tuple được truyền trực tiếp trong toán tử (literal values).
-        2. Tuple được lấy từ child operator.
-            - Ví dụ: `INSERT INTO table1 SELECT * FROM table2`
-
-    #### 12.5. Expression Evaluation
-
-    - **Biểu diễn**: DBMS biểu diễn các biểu thức (WHERE clause, computed columns...) dưới dạng **Expression Tree**.
-
-    - **Các loại node trong Expression Tree**:
-        - **Comparison**: `=`, `>`, `<`, `!=`
-        - **Arithmetic**: `+`, `-`, `*`, `/`
-        - **Function**: các hàm built-in hoặc UDF
-        - **Conjunction / Disjunction**: `AND`, `OR`
-        - **Constant**: giá trị hằng số (100, 200...)
-        - **Tuple Attribute Reference**: tham chiếu cột (`A.x`, `A.y`...)
-
-    - **Cách thực thi**: DBMS duyệt cây theo kiểu **post-order** (từ lá lên gốc). Tại mỗi node, nó gọi một hàm `evaluate()` tương ứng với loại operator đó. Kết quả trả về cho node cha, cứ thế cho đến root. Tương tự như việc ta liên tục phải `switch` để xử lý từng node trong tree vậy.
-
-    - **Vấn đề hiệu năng**: Biểu diễn dạng tree gây chậm do overhead gọi hàm ảo (virtual function call), branch misprediction, và cache miss tại mỗi node — lặp lại cho **mỗi tuple** trong bảng.
-
-    - **Giải pháp — JIT / Inline Function**: Một số DBMS cố gắng đưa expression tree về dạng **inline function** (compiled code) để loại bỏ overhead:
-
-        ```
-        Ví dụ: SELECT * FROM A WHERE A.x > 100 AND A.y = 200
-
-        Biểu diễn dưới dạng tree:
-                             AND
-                            /   \
-                          >       =
-                         / \     / \
-                        x  100  y  200
-
-        Biểu diễn dưới dạng inline function:
-        ```
-        ```cpp
-        bool evaluate(Tuple t) {
-            return t.x > 100 && t.y == 200;
-        }
-        ```
-
-### 13. Parallel Query Engine Architectures
 
 - Process model định nghĩa cách hệ thống được tổ chức để support concurrent request/queries.
   - Dùng từ **concurrent** vì Process model nói về cách **tổ chức** để xử lý nhiều request cùng lúc (concurrency = quản lý nhiều task). **Parallelism** (chạy thật sự song song trên nhiều CPU) chỉ là một *cách triển khai* concurrency. Một DBMS có thể concurrent mà không parallel (ví dụ: single-core dùng time-slicing).
@@ -1283,21 +2197,21 @@ Hash table latching
   - 1 worker có thể là 1 process, thread hoặc embedded DBMS.
   - Chủ yếu hiện nay các hệ thống DBMS sử dụng thread model.
 
-#### 13.1. Process model
+#### 14.1. Process model
 - Được sử dụng trong PostgreSQL (đến nay vẫn dùng process-per-connection), Oracle, DB2 (hỗ trợ cả process và thread model).
 - Phụ thuộc vào OS dispatcher.
 - Sử dụng shared memory hoặc pipeline để giao tiếp.
 - Các thư viện pthread được chuẩn hóa từ những năm 90, do đó các hệ thống từ những năm 90 trở về trước thường sử dụng process model.
 
-#### 13.2. Thread model
+#### 14.2. Thread model
 - Sử dụng trong SQL Server, MySQL. Oracle và DB2 hiện tại hỗ trợ cả hai (hybrid).
 - DBMS tự quản lý thread pool và scheduling thay vì phụ thuộc OS, giúp kiểm soát tốt hơn số lượng concurrent workers, giảm context switch.
 
-#### 13.3. Embedded model
+#### 14.3. Embedded model
 - Chạy trong cùng address space (process) với application (ví dụ: RocksDB, SQLite, LevelDB, DuckDB).
 - Application chịu trách nhiệm cho thread và scheduling.
 
-#### 13.4. Scheduling
+#### 14.4. Scheduling
 - Với mỗi query plan, cần quyết định where, when and how to execute it → Scheduling:
   - **Task assignment**: Gán query/operator cho worker nào.
   - **Task priority**: Thứ tự ưu tiên thực thi.
@@ -1309,18 +2223,18 @@ Hash table latching
   - OS không hiểu workload DB nên scheduling không tối ưu (ví dụ: OS có thể preempt process đang giữ latch).
   - Tuy nhiên bottleneck đọc thường nằm ở **I/O** và **query plan** hơn là scheduling overhead.
 
-#### 13.5. Parallel Execution
+#### 14.5. Parallel Execution
 Các hệ thống DBMS thực thi nhiều task đồng thời để nâng cao hiệu suất sử dụng phần cứng.
 - Các task được thực thi không nhất thiết thuộc về cùng 1 query.
 - High-level design không phụ thuộc vào kiến trúc thực thi (process/thread hay multi-node).
 
-##### 13.5.1. Inter-query Parallelism
+##### 14.5.1. Inter-query Parallelism
 - Thực thi **nhiều query** cùng lúc (mỗi query trên 1 worker riêng).
 - Phần lớn sử dụng first-come-first-serve.
 - Nếu các query đều là read-only thì phần lớn không cần explicit coordination (điều phối có chủ đích) giữa những query đó.
 - Nếu có ghi thì việc thực thi đúng trở nên khó khăn (tricky) — cần concurrency control (lock, MVCC...).
 
-##### 13.5.2. Intra-query Parallelism
+##### 14.5.2. Intra-query Parallelism
 - Thực thi **1 query** bằng cách chạy song song các operators của nó.
 - Có 3 dạng parallelism:
   1. **Intra-operator** (data parallelism).
@@ -1333,20 +2247,29 @@ Các hệ thống DBMS thực thi nhiều task đồng thời để nâng cao hi
 - Mỗi worker thực thi hash và probe trên 1 partition riêng của hash table.
 - Các partition độc lập → không cần coordination giữa các worker.
 
-###### 13.5.2.1. Intra-operator (Data Parallelism)
+###### 14.5.2.1. Intra-operator (Data Parallelism)
 - Operators được decompose thành các phần riêng lẻ để thực thi **cùng 1 function** trên các **sub-dataset khác nhau**.
 - Ví dụ: Parallel Seq Scan chia bảng thành N phần, mỗi worker scan 1 phần.
 - Cần insert thêm 1 **Exchange operator** để chia nhỏ (distribute) và tổng hợp (gather) dữ liệu.
 
 **Exchange operator — cơ chế chi tiết:**
 - Exchange operator (Volcano Exchange) là operator đặc biệt được chèn vào query plan để biến plan tuần tự thành plan song song. Nó đóng 2 vai trò: **distribute** (chia data cho worker) và **gather** (gom kết quả từ worker).
-- Exchange operator có **3 biến thể**, được optimizer chọn tại planning time:
+- Exchange operator có **3 loại** (theo số luồng vào/ra), được optimizer chọn tại planning time:
 
-| Biến thể | Partitioning | Dùng khi |
+| Loại | Luồng | Dùng khi |
 |---|---|---|
-| **Gather** | Round-robin / FIFO | Sub-plan không cần ordering → Seq Scan |
-| **Redistribute** | Hash(`key` % N) hoặc Range | Hash Join, Aggregate — cần cùng key về cùng worker |
-| **Broadcast** | Copy toàn bộ → mọi worker | Build side của Hash Join khi bảng nhỏ |
+| **Gather** | N worker → 1 output | Gom kết quả của các worker về cho operator cha (thường ở đỉnh plan song song) |
+| **Distribute** | 1 input → N worker | Chia 1 luồng dữ liệu cho nhiều worker xử lý |
+| **Repartition** | N input → M output | Xáo lại dữ liệu theo key mới giữa 2 giai đoạn song song (vd: trước Hash Join/Aggregate trên key khác) |
+
+- Khi chia dữ liệu (Distribute/Repartition), cần chọn **chiến lược partitioning**:
+
+| Chiến lược | Cách chia | Dùng khi |
+|---|---|---|
+| **Round-robin** | Lần lượt từng worker | Không cần cùng key về cùng worker (scan, filter) — cân bằng tải tốt |
+| **Hash** | `hash(key) % N` | Hash Join, Aggregate — cùng key phải về cùng worker |
+| **Range** | Theo khoảng giá trị | Sort song song (mỗi worker sort 1 khoảng, nối lại là xong) |
+| **Broadcast** | Copy toàn bộ → mọi worker | Build side của Hash Join khi bảng rất nhỏ |
 
 - **Ai quyết định dùng loại nào?** → **Query Optimizer**, không phải Exchange tự quyết tại runtime. Optimizer nhìn toàn bộ query plan tree và chèn đúng loại Exchange vào từng ranh giới song song. Sự phụ thuộc vào operator bên dưới (Seq Scan, Hash Join...) được **resolve tại planning time**, lúc chạy Exchange chỉ thực hiện strategy đã gán sẵn.
 
@@ -1369,34 +2292,42 @@ Các hệ thống DBMS thực thi nhiều task đồng thời để nâng cao hi
   | **Gather** | Lấy tuple từ bất kỳ worker nào có sẵn trước | ❌ Không |
   | **Gather Merge** | Merge-sort từ các queue (mỗi worker trả data đã sorted) | ✅ Có — dùng cho `ORDER BY` |
 
-- **Ví dụ query plan với Exchange (PostgreSQL):**
+- **Ví dụ query plan với Exchange (mô hình tổng quát — như Greenplum "Redistribute Motion", Spark "Exchange hashpartitioning"):**
   ```
-  Gather (Exchange - round-robin)
+  Gather
     └── Hash Join
-          ├── Redistribute (hash on A.id)   ← optimizer chèn đúng loại
+          ├── Repartition (hash on A.id)   ← optimizer chèn đúng loại
           │     └── Parallel Seq Scan A
-          └── Redistribute (hash on B.id)
+          └── Repartition (hash on B.id)
                 └── Parallel Seq Scan B
+  ```
+- **PostgreSQL thực tế** không có operator Repartition (single-node, shared memory). Parallel Hash Join (PG 11+) cho **tất cả worker cùng build chung 1 hash table trong shared memory**, rồi mỗi worker probe phần dữ liệu của mình:
+  ```
+  Gather  (Workers Planned: 2)
+    └── Parallel Hash Join  (Hash Cond: a.id = b.id)
+          ├── Parallel Seq Scan on a
+          └── Parallel Hash
+                └── Parallel Seq Scan on b
   ```
 
 - **Push vs Pull model với Intra-operator parallelism:**
   - **Pull model** (PostgreSQL): Mỗi worker thread chạy riêng 1 iterator pipeline. Parent gọi `next()` trên Exchange/Gather operator. Gather kéo tuple từ các worker qua **shared queue**. Exchange đóng vai trò điều phối, tập hợp kết quả từ nhiều worker.
   - **Push model** (HyPer, DuckDB): Mỗi worker chủ động đẩy tuple/batch vào shared output buffer. Gather consume từ các buffer đó. Hiệu quả hơn vì không có overhead gọi hàm `next()` xuyên qua nhiều tầng.
 
-###### 13.5.2.2. Inter-operator (Pipeline Parallelism)
+###### 14.5.2.2. Inter-operator (Pipeline Parallelism)
 - Nhiều **operators khác nhau** trong cùng 1 query plan chạy đồng thời, output của operator dưới **stream trực tiếp** lên operator trên.
 - Ví dụ: Scan → Filter → Join — cả 3 operator chạy cùng lúc trên các threads khác nhau. Scan đẩy tuple lên Filter, Filter đẩy lên Join mà không cần đợi Scan hoàn thành.
 
 - Hiệu quả nhất với **Push model** vì data tự nhiên chảy từ dưới lên. Pull model khó tận dụng vì parent phải chủ động kéo.
-- Sử dụng trong nhiều hệ thống data stream như: Kafka, Apache Flink
+- Là mô hình thực thi cốt lõi của các **stream processing engine** (Apache Flink, Kafka Streams, Spark Structured Streaming): mỗi operator chạy liên tục trên task riêng và dữ liệu chảy qua chúng như một pipeline không bao giờ kết thúc.
 
-###### 13.5.2.3. Bushy Parallelism
+###### 14.5.2.3. Bushy Parallelism
 - Nhiều **nhánh độc lập** của query plan tree được thực thi song song.
 - Ví dụ: `SELECT * FROM A JOIN B ON ... JOIN C ON ...` — có thể scan bảng A và scan bảng B **cùng lúc** trước khi join, vì 2 nhánh scan này độc lập với nhau.
 - Thực chất là sự kết hợp giữa inter-operator parallelism trên các nhánh song song của cây query plan.
 
-#### 13.6. IO Parallel
-##### 13.6.1. Multi-disk parallelism
+#### 14.6. IO Parallel
+##### 14.6.1. Multi-disk parallelism
 - Lưu trữ dữ liệu trên nhiều đĩa để tăng tốc độ đọc/ghi và tính bền vững
   - Hardware based: I/O controller giúp multidisk được nhận biết như 1 disk duy nhất (ví dụ: RAID).
   - Software based: DBMS tự quản lý ở tầng file/object
@@ -1406,20 +2337,30 @@ Các hệ thống DBMS thực thi nhiều task đồng thời để nâng cao hi
   - Capacity (Dung lượng): Lưu trữ được khối lượng dữ liệu khổng lồ mà một ổ đĩa đơn lẻ không thể chứa hết.
   - Durability (Độ bền / Tính an toàn): Nếu một ổ cứng bị hỏng (crash), dữ liệu không bị mất vì đã có bản sao hoặc mã khôi phục ở các ổ khác.
 
-##### 13.6.2. Partitioning
-- Kỹ thuật chia nhỏ dữ liệu thành các khối (block) và ghi xen kẽ (interleave) lên các vùng lưu trữ khác nhau được quản lý độc lập
-- Không cần rewrite lại application
-- Mục tiêu chính: **Tăng tốc độ đọc/ghi** bằng cách tận dụng băng thông song song của nhiều đĩa.
-- Khi cần đọc một block dữ liệu, hệ thống có thể đọc từ nhiều đĩa cùng lúc, giảm thời gian chờ đợi.
-- Thường được sử dụng trong các hệ thống cơ sở dữ liệu lớn và hệ thống lưu trữ phân tán.
+- Các cấu hình RAID phổ biến:
 
-### 13.7. Tổng kết: Parallel Execution
+  | RAID | Cơ chế | Dung lượng hữu dụng | Chịu lỗi | Ghi chú |
+  |---|---|---|---|---|
+  | **RAID 0** (striping) | Chia block xen kẽ lên N đĩa | 100% | ❌ Hỏng 1 đĩa là mất hết | Nhanh nhất, chỉ dùng cho dữ liệu tạm |
+  | **RAID 1** (mirroring) | Ghi y hệt lên 2 đĩa | 50% | ✅ 1 đĩa | Đọc song song được, ghi chậm bằng 1 đĩa |
+  | **RAID 5** (striping + parity phân tán) | Mỗi stripe có 1 block parity (XOR) | (N-1)/N | ✅ 1 đĩa | "Write penalty": mỗi lần ghi nhỏ phải đọc-sửa-ghi parity → không hợp với OLTP ghi nhiều |
+  | **RAID 6** | 2 block parity | (N-2)/N | ✅ 2 đĩa | Rebuild đĩa lớn lâu → cần chịu được thêm 1 lỗi trong lúc rebuild |
+  | **RAID 10** (1+0) | Mirror rồi stripe | 50% | ✅ ≥1 đĩa (mỗi cặp mirror) | Lựa chọn phổ biến cho database OLTP |
 
-#### 1. Parallel execution is important — Vì vậy hầu hết mọi DBMS lớn đều hỗ trợ nó.
+##### 14.6.2. Database Partitioning (tách dữ liệu ra nhiều vùng lưu trữ)
+- Chia database thành các tập **rời nhau** và gán cho các đĩa/vùng lưu trữ được quản lý độc lập — khác với RAID striping (trong suốt ở tầng block), đây là quyết định ở **tầng DBMS**:
+  - Cấp đơn giản: mỗi database/tablespace một thư mục/đĩa riêng (PostgreSQL `TABLESPACE`, MySQL `DATA DIRECTORY`). Log (WAL) thường được đặt trên đĩa riêng vì là ghi tuần tự liên tục.
+  - **Table partitioning** (logical → physical): chia 1 bảng thành nhiều partition theo range/list/hash (vd theo tháng) → mỗi partition có thể nằm trên storage khác, query chỉ quét partition liên quan (**partition pruning**), xóa dữ liệu cũ bằng `DROP/DETACH PARTITION` thay vì `DELETE` hàng loạt. Xem thêm 20.6.
+- Nếu DBMS hỗ trợ, việc này **trong suốt với application** (không cần sửa query).
+- Mục tiêu: tận dụng băng thông song song của nhiều đĩa, cô lập I/O giữa các workload, quản lý vòng đời dữ liệu.
+
+#### 14.7. Tổng kết: Parallel Execution
+
+##### 1. Parallel execution is important — Vì vậy hầu hết mọi DBMS lớn đều hỗ trợ nó.
 - **Tầm quan trọng**: Trong thời đại dữ liệu lớn (Big Data), việc xử lý hàng tỷ bản ghi bằng một luồng (single-thread) là không khả thi. Để tận dụng tối đa phần cứng hiện đại (CPU nhiều lõi, hệ thống lưu trữ đa đĩa SSD/NVMe), DBMS bắt buộc phải chia nhỏ công việc và chạy song song.
 - **Sự phổ biến**: Hầu hết các DBMS lớn (PostgreSQL, Oracle, SQL Server, hay các hệ thống phân tán) đều có bộ thực thi song song làm nền tảng cốt lõi.
 
-#### 2. However, it is hard to get right — Tại sao lại khó đến vậy?
+##### 2. However, it is hard to get right — Tại sao lại khó đến vậy?
 
 Việc cứ ném thêm worker (luồng/tiến trình) vào một truy vấn không phải lúc nào cũng làm nó nhanh hơn. Dưới đây là 4 rào cản lớn nhất:
 
@@ -1440,9 +2381,27 @@ Việc cứ ném thêm worker (luồng/tiến trình) vào một truy vấn khô
   - **Memory Bandwidth**: Băng thông truyền tải từ RAM vào CPU có giới hạn.
   - **Disk I/O**: Nếu 50 workers cùng đọc ngẫu nhiên từ một HDD, kim đọc phải nhảy liên tục → tốc độ tổng thể giảm thê thảm so với việc để 1 worker đọc tuần tự.
 
-### 14. Query Optimization
+✅ **Vì sao PostgreSQL vẫn dùng process-per-connection trong khi MySQL/SQL Server dùng thread?** PostgreSQL ra đời trước khi thư viện thread chuẩn hóa và ưu tiên tính cô lập (một backend crash không làm hỏng bộ nhớ của backend khác). Cái giá: mỗi kết nối tốn một process → không thể mở hàng nghìn kết nối trực tiếp → **bắt buộc dùng connection pooler** (PgBouncer — 20.8).
 
-#### 14.1. Tại sao cần Query Optimization?
+> 🛠 **Áp dụng:**
+> - Song song trong 1 query chỉ có lợi với query **lớn** (scan/aggregate nhiều dữ liệu); với OLTP nó chỉ thêm chi phí điều phối. PostgreSQL bật qua `max_parallel_workers_per_gather`.
+> - Data skew làm song song vô ích: 1 worker ôm 90% dữ liệu thì cả query phải chờ worker đó.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Exchange operator giải quyết vấn đề gì?**
+   → Nó là "cầu nối" để biến plan tuần tự thành song song: chia dữ liệu cho các worker (distribute/repartition) và gom kết quả lại (gather) mà các operator còn lại không cần biết mình đang chạy song song.
+</details>
+
+
+### 15. Query Optimization
+
+> 🎯 **Bài toán:** Cùng một câu SQL có thể được thực thi theo hàng nghìn cách (thứ tự join, thuật toán join, index nào). Chênh lệch giữa cách tệ nhất và tốt nhất có thể **hơn 50.000 lần** (ví dụ ở 15.1).
+>
+> 💡 **Ý tưởng giải:** Optimizer gồm 3 phần: (1) **phép biến đổi** sinh các plan tương đương về kết quả; (2) **cost model** ước lượng chi phí mỗi plan dựa vào **thống kê dữ liệu** (số dòng, phân bố giá trị); (3) **thuật toán tìm kiếm** chọn plan rẻ nhất mà không phải thử hết (dynamic programming, Cascades).
+
+
+#### 15.1. Tại sao cần Query Optimization?
 
 Application → Parser → Binder → **Optimizer** → Executor
 
@@ -1473,8 +2432,8 @@ Dựa trên thông tin page (catalog), các toán tử ta có thể tính đư�
 
 **Chi tiết từng bước:**
 
-1. **Cross Product (×)**: Kết hợp toàn bộ Emp × Dept
-   - Reads: 1,000 (Emp pages) + 50 (Dept pages) = 1,050 reads
+1. **Cross Product (×)**: Kết hợp toàn bộ Emp × Dept bằng nested loop theo page (Dept làm bảng ngoài)
+   - Reads: 50 (Dept pages) + 50 × 1,000 (mỗi page Dept quét lại toàn bộ Emp) = **50,050 reads**
    - Writes: Emp × Dept = 10,000 × 500 = 5,000,000 tuples → với 5 tuples/page = 1,000,000 pages ghi xuống T₁
    - Tổng: **(50 + 50,000) reads + 1,000,000 writes**
 
@@ -1490,9 +2449,9 @@ Dựa trên thông tin page (catalog), các toán tử ta có thể tính đư�
 
 4. **π_ename**: Loại bỏ duplicates (DISTINCT)
 
-**Tổng I/O: ≈ 2,003,054 ≈ 2M I/Os** → Cực kỳ tốn kém!
+**Tổng I/O: 1,050,050 (×) + 1,002,000 (σ join) + 2,004 (σ dname) + 4 (π) = 2,054,058 ≈ 2M I/Os** → Cực kỳ tốn kém!
 
-#### 14.1.2. So sánh 4 Query Plan — Tác dụng của Optimizer
+#### 15.1.2. So sánh 4 Query Plan — Tác dụng của Optimizer
 
 Cùng 1 query: `SELECT DISTINCT ename FROM Emp JOIN Dept ON E.did = D.did WHERE D.dname = 'Toy'`
 
@@ -1656,7 +2615,7 @@ Tổng: ~37 I/Os
 | **Plan 3** | Index NL Join + Index Scan | Materialization | **37** |
 
 
-#### 14.2. Query Optimizers — Tổng quan
+#### 15.2. Query Optimizers — Tổng quan
 
 Query Optimizer nhận đầu vào là **Logical Plan** và xuất ra một **Physical Execution Plan** tương đương ngữ nghĩa nhưng có chi phí thấp nhất có thể.
 
@@ -1684,7 +2643,7 @@ Physical Execution Plan (access path cụ thể)
 
 ---
 
-#### 14.3. 3 Thành phần của Optimizer
+#### 15.3. 3 Thành phần của Optimizer
 
 Optimizer được xây dựng dựa trên 3 thành phần phối hợp với nhau:
 
@@ -1701,7 +2660,7 @@ Optimizer được xây dựng dựa trên 3 thành phần phối hợp với nh
 
 ---
 
-#### 14.3.1. Transformations (Phép biến đổi)
+#### 15.3.1. Transformations (Phép biến đổi)
 
 **Mục tiêu**: Liệt kê tất cả các hình thức khác nhau của một query plan mà vẫn **đảm bảo tính tương đương ngữ nghĩa** (semantically equivalent) dựa trên mô hình đại số quan hệ.
 
@@ -1723,11 +2682,11 @@ Optimizer được xây dựng dựa trên 3 thành phần phối hợp với nh
 | **Projection pushdown** | Đưa phép chiếu (π) xuống sớm nhất có thể để giảm số cột cần materialize ở các bước trung gian |
 
 > 📌 **Thực tế**: SQL Server được cho là có ~4,500 transformation rules (nguồn: bài giảng CMU 15-445/721, con số chính xác không được Microsoft công bố chính thức). Ngoài ra, một số DBMS hiện đại đang thử nghiệm thêm rules mới được học bởi AI.
-> PostgreSQL không hỗ trợ hint trực tiếp — cần dùng extension `pg_hint_plan`.
+> PostgreSQL không hỗ trợ hint trực tiếp — cần dùng extension `pg_hint_plan` (hoặc chỉnh các tham số `enable_*`, ví dụ `SET enable_nestloop = off` để thử nghiệm). MySQL có optimizer hints dạng comment `/*+ JOIN_ORDER(t1, t2) INDEX(t1 idx_a) */` và `FORCE INDEX`.
 
 ---
 
-#### 14.3.2. Search Algorithm
+#### 15.3.2. Search Algorithm
 
 **Nhiệm vụ**: Với tập rules đã định nghĩa, optimizer duyệt không gian kế hoạch để tìm ra plan tốt nhất.
 
@@ -1795,7 +2754,7 @@ Duyệt:    Breadth-first Search
 |---|---|
 | Thuật toán | **Dynamic Programming** — lưu plan tốt nhất cho mỗi subset |
 | Chiến lược duyệt | Breadth-first (mở rộng theo tầng) |
-| DBMS sử dụng | PostgreSQL, MySQL, DB2, SQLite |
+| DBMS sử dụng | IBM System R, DB2, PostgreSQL (DP đầy đủ khi số bảng < `geqo_threshold` = 12; nhiều hơn thì chuyển sang thuật toán di truyền **GEQO**), MySQL (DP có cắt tỉa, giới hạn bằng `optimizer_search_depth`). SQLite dùng greedy "N nearest neighbors" chứ không phải DP đầy đủ |
 | **Ưu điểm** | Đảm bảo tìm plan tối ưu toàn cục (nếu duyệt hết); dễ hiểu; ổn định |
 | **Nhược điểm** | Tốn bộ nhớ lớn (lưu mọi sub-plan); khó mở rộng khi thêm operator/rule mới; khó cắt nhánh (pruning) sớm |
 
@@ -1904,13 +2863,13 @@ Duyệt:    Depth-first Search
 - Có thể **cắt nhánh sớm** (branch-and-bound): khi đã có upper bound cost, bỏ qua toàn bộ nhánh đắt hơn → nhanh hơn Bottom-Up trên query phức tạp.
 - Các thuộc tính vật lý được truyền xuống để đưa vào quyết định(khác biệt lớn so với Bottom-Up)
 - Framework đại diện: **Volcano** (1993) → **Cascades** (1995, Goetz Graefe) — nền tảng của SQL Server.
-- Cách SQL server thực hiện được mô tả trong cuốn: Extensible query optimizer in paractive của MS
+- Cách SQL Server thực hiện được mô tả trong cuốn **"Extensible Query Optimizers in Practice"** (Bailu Ding, Vivek Narasayya, Surajit Chaudhuri — Microsoft Research, 2024).
 
 | Đặc điểm | Chi tiết |
 |---|---|
 | Thuật toán | **Memoization** + Branch-and-bound pruning |
 | Chiến lược duyệt | Depth-first (đi sâu rồi quay lại) |
-| DBMS sử dụng | SQL Server (Cascades), CockroachDB, Greenplum |
+| DBMS sử dụng | SQL Server (Cascades), CockroachDB, Greenplum/VMware (Orca), Apache Calcite (VolcanoPlanner — dùng trong Flink, Hive...), TiDB (cascades planner) |
 | **Ưu điểm** | Dễ mở rộng (thêm rule/operator mới dễ dàng); cắt nhánh sớm hiệu quả; tiết kiệm bộ nhớ hơn (chỉ lưu nhánh đang xét) |
 | **Nhược điểm** | Cài đặt phức tạp hơn; không đảm bảo tối ưu toàn cục nếu pruning quá mạnh; khó debug |
 
@@ -1941,7 +2900,7 @@ Lựa chọn **access path** cho từng table sao cho tổng chi phí là nhỏ 
 
 ---
 
-#### 14.3.3. Cost Model
+#### 15.3.3. Cost Model
 
 **Nhiệm vụ**: Ước lượng chi phí của một plan để optimizer có thể so sánh và chọn plan tốt nhất.
 
@@ -1971,8 +2930,11 @@ Lựa chọn **access path** cho từng table sao cho tổng chi phí là nhỏ 
 
 - **Column statistics**:
    - Thông thường DBMS tạo phân tích **độc lập trên từng cột**, điều này đôi khi dẫn đến sai lệch khi thực hiện query trên nhiều cột có sự tương quan (correlated columns)
-   - Một số hệ thống tự động tạo statistics trên **nhiều cột** nếu chúng nằm trong 1 compound index (MySQL)
-   - Một số hệ thống cho phép chỉ định (manual) tạo statistics trên nhiều cột (Oracle, DB2)
+   - Một số hệ thống tự động tạo statistics trên **nhiều cột** nếu chúng nằm trong 1 compound index (MySQL dùng index cardinality cho prefix của composite index; SQL Server tự tạo multi-column stats cho index)
+   - Một số hệ thống cho phép chỉ định (manual) tạo statistics trên nhiều cột:
+      - PostgreSQL 10+: `CREATE STATISTICS s1 (dependencies, ndistinct, mcv) ON city, zip FROM addresses;` — giải quyết vấn đề cột tương quan (city ↔ zip)
+      - Oracle (column groups / extended statistics), DB2 (column group statistics), SQL Server (`CREATE STATISTICS ... ON (col1, col2)`)
+   - MySQL 8.0+ có **histogram** cho cột không có index: `ANALYZE TABLE t UPDATE HISTOGRAM ON col WITH 64 BUCKETS;`
 
 **b) Estimation Techniques (Kỹ thuật ước lượng)**
 
@@ -2009,13 +2971,13 @@ Bước 1: Candidate Plan Generation
          → Sinh ra tất cả possible plans từ các index có sẵn
               ↓
 Bước 2: Trial Period (Racing)
-         → Chạy SONG SONG tất cả candidate plans trong trial ngắn
+         → Chạy XEN KẼ (round-robin, từng "work unit") tất cả candidate plans trong trial ngắn
               ↓
 Bước 3: Empirical Measurement
          → Đo "Works" score: số index key scan + số doc fetch + stage resources
               ↓
 Bước 4: Winner Selection
-         → Plan trả về 101 docs đầu tiên với ít "Works" nhất → THẮNG
+         → Plan nào đạt 101 docs trước (hoặc có "productivity" = kết quả/works cao nhất khi hết trial) → THẮNG
               ↓
 Bước 5: Plan Caching
          → Cache winning plan theo query shape (không phân biệt giá trị cụ thể)
@@ -2033,32 +2995,77 @@ Bước 5: Plan Caching
 ---
 
 ##### C. Cardinality Estimation
-- Ước lượng số lượng record mà mỗi toán tử sẽ phải thực hiện(select, join, distinct, ...)
+- Ước lượng **số tuple** mà mỗi operator sẽ sinh ra (selection, join, distinct, group by...). Đây là đầu vào quan trọng nhất của cost model: sai cardinality → chọn sai join order / join algorithm / access path.
 
-Derivable statistic:
-   - Với mỗi relation(R1, R2, ...)
-      - N(R): số lượng tuple
-      - V(A, R): số lượng giá trị duy nhất trong cột A
-      - Selection of A: SC(A,R):  Số lượng trung bình các tuple có cùng giá trị trong cột A = N(R) / V(R, A)
-      - Độ chọn lọc ($sel$) của một vị ngữ $P$ (điều kiện lọc) là tỷ lệ các bản ghi (tuples) thỏa mãn điều kiện đó. 
-        - Vị ngữ so sánh bằng (Equality Predicate): $A = \text{constant}$Công thức: $sel(A = \text{constant}) = \frac{\text{\#occurrences}}{|R|}$
-        - Vị ngữ so sánh nghịch đảo: sel(not P) = 1 - sel(P)
-        - Khi combine nhiều điều kiện thì sao: -> Trong đại bộ phận các mô hình giả định phân phối là độc lập và phân phối đều
-          -Công thức toán học thuần túy giả định các cột độc lập (Independent):$$sel(P1 \wedge P2 \wedge P3 \wedge P4) = sel(P1) \times sel(P2) \times sel(P3) \times sel(P4)$$: càng nhiều điều kiện thì xác suất càng nhỏ
-          - Optimization: Ví dụ trong sql server họ giảm hệ số ở các điều kiện tiếp theo để hệ số không còn quá nhỏ
-      - Join size estimation:
-         Join 2 table R và S -> số lượng tuple trong kết quả join
-         - Giả định: Các giá trị trong cột A của R và cột B của S có giá trị bằng nhau
-         - Công thức: $$N(R \Join S) = \frac{N(R) \times N(S)}{max(|V(A,S)|, |V(A,R|)}$$
-      - Được xây dựng trên các giả định, vì vậy hiện tượng lan truyền lỗi
-      - AQP(adaptive query processing) SQL server: nếu vượt quá giá trị mong đợi, ta sẽ break chúng để lên lại plan mới
-      - 1 bài báo(2015) cho thấy sql server với việc sử dụng sampling cho kết quả estimate tốt nhất
-   - Với mỗi join(R, S)
-      - N(R ⋈ S): số lượng tuple trong kết quả join
+**Thống kê cơ bản** (cho mỗi relation R):
+- `N(R)`: số tuple của R.
+- `V(A, R)`: số giá trị distinct của cột A.
+- **Selection cardinality** `SC(A, R) = N(R) / V(A, R)`: số tuple trung bình có cùng 1 giá trị của A (giả định phân bố đều).
 
-### 15. Transaction
+**Selectivity** `sel(P)` = tỷ lệ tuple thỏa vị ngữ P (0..1); cardinality ước lượng = `sel(P) × N(R)`.
 
-#### 15.1. ACID
+| Vị ngữ | Công thức (giả định phân bố đều) |
+|---|---|
+| `A = c` | $sel = \frac{1}{V(A,R)}$ (hoặc tra histogram / most-common-values nếu có) |
+| `A > c` (range) | $sel = \frac{A_{max} - c}{A_{max} - A_{min}}$ |
+| `NOT P` | $sel = 1 - sel(P)$ |
+| `P1 AND P2` | $sel(P1) \times sel(P2)$ — giả định **độc lập** |
+| `P1 OR P2` | $sel(P1) + sel(P2) - sel(P1) \times sel(P2)$ |
+
+- **Giả định độc lập là nguồn sai số lớn nhất**: `city = 'Hà Nội' AND country = 'VN'` → 2 cột tương quan mạnh, nhân selectivity sẽ **underestimate** nghiêm trọng (càng nhiều điều kiện → xác suất càng nhỏ dần về 0).
+    - SQL Server (cardinality estimator mới từ 2014) dùng **exponential backoff**: `sel1 × sel2^(1/2) × sel3^(1/4) × sel4^(1/8)` (sắp theo selectivity tăng dần) để không quá nhỏ.
+    - PostgreSQL: `CREATE STATISTICS ... (dependencies)` để khai báo phụ thuộc giữa các cột.
+
+**Join size estimation** (equi-join `R.A = S.A`):
+- Giả định **containment of value sets**: mọi giá trị của cột có ít distinct hơn đều xuất hiện ở cột còn lại.
+
+$$N(R \bowtie S) = \frac{N(R) \times N(S)}{\max(V(A,R),\ V(A,S))}$$
+
+- **Lan truyền lỗi (error propagation)**: sai số nhân lên qua từng tầng join → với query 5–10 join, ước lượng có thể lệch **hàng nghìn đến hàng triệu lần**. Paper **"How Good Are Query Optimizers, Really?"** (Leis et al., VLDB 2015, benchmark JOB trên dữ liệu IMDB) cho thấy mọi hệ thống được thử (PostgreSQL, HyPer và 3 hệ thương mại) đều sai số lớn và thường **underestimate**; cardinality estimation ảnh hưởng tới chất lượng plan nhiều hơn độ chính xác của cost model; hệ thống thương mại dùng **sampling** cho ước lượng tốt hơn ở bảng đơn.
+
+**Giảm thiệt hại khi ước lượng sai — Adaptive Query Processing (AQP)**:
+- **SQL Server**: *adaptive join* (quyết định hash join hay nested loop **tại runtime** dựa trên số dòng thực của input), *interleaved execution* cho multi-statement TVF, *memory grant feedback*, *Parameter Sensitive Plan optimization* (2022).
+- **Oracle**: adaptive plans, statistics feedback.
+- **PostgreSQL**: chưa có re-optimization giữa chừng; giải pháp thực tế là `ANALYZE` thường xuyên, tăng `default_statistics_target`, extended statistics.
+- Nghiên cứu: re-optimize khi cardinality thực vượt ngưỡng so với ước lượng (dừng pipeline, materialize, lập plan lại cho phần còn lại).
+
+**⚖️ Ba trường phái chọn plan**
+
+| Trường phái | Ưu điểm | Nhược điểm | Ai dùng |
+| :--- | :--- | :--- | :--- |
+| Heuristic (luật cố định) | Nhanh, dễ đoán | Sai với query phức tạp | Hệ đơn giản, bước đầu của mọi optimizer |
+| Cost-based (thống kê) | Tối ưu với query phức tạp | Phụ thuộc thống kê đúng; ước lượng sai → plan tệ | PostgreSQL, MySQL, Oracle, SQL Server |
+| Empirical (chạy thử) | Không cần thống kê | Chi phí thử, cache plan có thể lỗi thời | MongoDB |
+
+✅ **Vì sao RDBMS chọn cost-based:** query nghiệp vụ có nhiều join và điều kiện, luật cố định không thể biết bảng nào nhỏ sau khi lọc. Nhưng điểm yếu cốt lõi là **ước lượng số dòng (cardinality)** — phần lớn plan tệ trong thực tế đến từ ước lượng sai chứ không phải cost model.
+
+> 🛠 **Áp dụng:**
+> - Query đột nhiên chậm sau khi dữ liệu thay đổi nhiều → thống kê cũ → `ANALYZE`.
+> - Trong `EXPLAIN ANALYZE`, so `rows=` (ước lượng) với `actual rows=` — lệch hàng chục lần trở lên là nguồn gốc vấn đề.
+> - Cột tương quan (thành phố ↔ mã bưu chính) → extended statistics (`CREATE STATISTICS`).
+> - Dùng hint/ép plan chỉ khi đã hiểu nguyên nhân và không sửa được bằng thống kê/index.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao giả định "các cột độc lập" làm optimizer chọn sai?**
+   → Selectivity của `A AND B` được tính bằng tích hai selectivity; nếu A và B tương quan, kết quả thực lớn hơn nhiều → optimizer nghĩ chỉ vài dòng nên chọn nested loop, thực tế lại là hàng triệu dòng.
+2. **"Interesting order" trong DP của System R để làm gì?**
+   → Giữ thêm plan đắt hơn nhưng cho output đã sắp xếp, vì nó có thể giúp bước sau (merge join, ORDER BY) rẻ hơn tổng thể.
+</details>
+
+
+### 16. Transaction
+
+> 🎯 **Bài toán:**
+> - Chuyển tiền: trừ tài khoản A thành công, chưa kịp cộng vào B thì server sập → tiền "bốc hơi".
+> - Hai người cùng mua sản phẩm cuối cùng → cả hai đều thấy "còn 1" và cùng mua thành công.
+>
+> ❌ **Cách ngây thơ:** Chạy tuần tự từng transaction → luôn đúng nhưng throughput bằng một người dùng. Không kiểm soát gì → đủ loại bất thường (dirty read, lost update, write skew...).
+>
+> 💡 **Ý tưởng giải:** **Transaction** gom nhiều thao tác thành một đơn vị với 4 bảo đảm **ACID**. Phần khó nhất là **Isolation**: cho chạy song song nhưng kết quả **tương đương với một thứ tự tuần tự nào đó** (serializable). Có ba trường phái để đạt điều đó: khóa trước (pessimistic — 2PL), kiểm tra sau (optimistic — OCC), và giữ nhiều phiên bản (MVCC). **Isolation level** là cách nới lỏng có kiểm soát để đổi lấy hiệu năng.
+
+
+#### 16.1. ACID
 
 - **Atomicity** (Tính nguyên tử): Đảm bảo "tất cả hoặc không có gì xảy ra"
    - Logging: Ghi tất cả các action của transaction vào log (WAL — Write-Ahead Log)
@@ -2130,18 +3137,25 @@ Derivable statistic:
 
 ---
 
-#### 15.2. Concurrency Control
+#### 16.2. Concurrency Control
 
 Các transaction liên tục xảy ra, schedule cần đảm bảo tính tuần tự (serializability) theo thời gian thực.
 
-##### 15.2.1. Two-Phase Locking (2PL)
+##### 16.2.1. Two-Phase Locking (2PL)
+
+> 🎯 **Bài toán:** Dùng lock để đảm bảo serializable. Nhưng chỉ "khóa trước khi dùng, nhả ngay sau khi dùng" là **chưa đủ**: T1 nhả lock A rồi mới khóa B, giữa đó T2 có thể sửa cả A và B → kết quả không tương đương thứ tự tuần tự nào.
+>
+> 💡 **Ý tưởng giải:** Chia transaction thành 2 pha: **chỉ được lấy lock** (growing), rồi **chỉ được nhả lock** (shrinking). Thời điểm lấy lock cuối cùng (*lock point*) xác định thứ tự tuần tự tương đương. **Strict 2PL** giữ lock ghi tới khi commit để tránh người khác đọc dữ liệu chưa commit (và abort dây chuyền).
+
 
 - 2PL là kỹ thuật quản lý concurrency control bằng cách sử dụng lock
 - 2PL chia transaction thành 2 phase:
    - **Growing phase** (Expanding phase): Transaction **chỉ được acquire lock**, không được release bất kỳ lock nào
    - **Shrinking phase**: Transaction **chỉ được release lock**, không được acquire thêm lock mới
    - **Lock point**: Thời điểm transaction acquire lock cuối cùng (đỉnh của growing phase) — thứ tự các lock point xác định thứ tự serial tương đương
-- 2PL đảm bảo tính tuần tự (serializability) nhưng có thể gây ra **deadlock** và **dirty read** (khi rollback trong shrinking phase)
+- 2PL đảm bảo tính tuần tự (conflict serializability) nhưng có 2 vấn đề:
+   - **Deadlock** (xử lý ở mục A, B bên dưới).
+   - **Cascading abort**: ở 2PL cơ bản, T1 nhả X-lock trong shrinking phase **trước khi commit** → T2 đọc dữ liệu chưa commit của T1 (dirty read); nếu sau đó T1 abort thì T2 cũng buộc phải abort theo (và cứ thế lan truyền).
 
 **Biến thể:**
 - **Strict 2PL (S2PL)**: Chỉ release **write lock** sau khi transaction kết thúc (commit/abort) → ngăn dirty read
@@ -2206,7 +3220,14 @@ Intention lock cho phép lock ở mức cao (table) mà vẫn biết có lock �
 
 ---
 
-##### 15.2.2. Optimistic Concurrency Control (OCC)
+##### 16.2.2. Optimistic Concurrency Control (OCC)
+
+> 🎯 **Bài toán:** Với 2PL, transaction phải chờ lock kể cả khi thực tế hiếm khi đụng nhau — chi phí khóa trả cho trường hợp hiếm.
+>
+> 💡 **Ý tưởng giải:** Giả định lạc quan "hiếm khi xung đột": làm việc trên bản sao riêng, **chỉ kiểm tra lúc commit**; có xung đột thì abort và làm lại. Rất rẻ khi xung đột ít, rất tốn khi xung đột nhiều.
+>
+> 🛠 Đây chính là nguyên lý của **optimistic locking bằng cột `version`** ở tầng ứng dụng (`@Version` của JPA — `SpringBoot.md` 7.4).
+
 
 - **Giả định**: Xung đột hiếm khi xảy ra → không cần lock
 - **3 giai đoạn**:
@@ -2216,16 +3237,15 @@ Intention lock cho phép lock ở mức cao (table) mà vẫn biết có lock �
 - **Ưu điểm**: Không cần lock, hiệu năng cao khi xung đột thấp
 - **Nhược điểm**: Khi xung đột cao, nhiều transaction bị abort → lãng phí tài nguyên (copy data, chỉ abort khi đã hoàn thành gần xong)
 - **Cơ chế validate**:
-   1. **Backward validation**: Kiểm tra xung đột với các transaction đã commit
-   2. **Forward validation**: Kiểm tra xung đột với các transaction đang chạy
-      - Khi transaction bắt đầu, nó ghi lại tất cả các item đọc vào **ReadSet**
-      - Khi chuẩn bị commit, kiểm tra xem bất kỳ item nào trong ReadSet đã bị thay đổi bởi transaction khác (chưa commit) hay không
-      - Nếu có sự thay đổi → xung đột → transaction bị abort
-      - Nếu không → transaction được commit
+   - Mỗi transaction ghi lại **ReadSet** (các item đã đọc) và **WriteSet** (các item sẽ ghi) trong Read Phase.
+   1. **Backward validation**: so sánh **ReadSet của mình** với **WriteSet của các transaction đã commit** trong khoảng thời gian mình đang chạy → nếu giao nhau (mình đã đọc dữ liệu mà người khác vừa ghi đè) → mình abort.
+   2. **Forward validation**: so sánh **WriteSet của mình** với **ReadSet của các transaction còn đang chạy** (chưa commit) → nếu giao nhau → abort mình (hoặc abort bên kia, linh hoạt hơn backward).
+   - Nếu không giao nhau → sang Write Phase và commit.
+- **Ứng dụng**: Hekaton (SQL Server In-Memory OLTP), Silo, FoundationDB, nhiều KV store phân tán. Ở tầng ứng dụng, **optimistic locking** bằng cột `version` (JPA `@Version`) là cùng ý tưởng.
 
 ---
 
-##### 15.2.3. Timestamp Ordering (T/O)
+##### 16.2.3. Timestamp Ordering (T/O)
 
 - Mỗi transaction được gán 1 **timestamp** khi bắt đầu
 - Mỗi data item lưu 2 timestamp: **W-TS** (write timestamp) và **R-TS** (read timestamp)
@@ -2235,7 +3255,7 @@ Intention lock cho phép lock ở mức cao (table) mà vẫn biết có lock �
 
 ---
 
-##### 15.2.4. Phantom Read Prevention
+##### 16.2.4. Phantom Read Prevention
 
 Cả 2PL và OCC mặc định chỉ lock trên **1 đối tượng cụ thể** (tuple, page, table) → phantom read vẫn xảy ra khi có range scan.
 
@@ -2258,18 +3278,40 @@ Cả 2PL và OCC mặc định chỉ lock trên **1 đối tượng cụ thể**
 
 ---
 
-##### 15.2.5. Isolation Levels
+##### 16.2.5. Isolation Levels
 
 Phần lớn các DBMS hiện tại **không đảm bảo Serializable** mặc định do chi phí quá đắt đỏ. Thay vào đó, cung cấp nhiều mức isolation level:
 
-| Isolation Level | Dirty Read | Unrepeatable Read | Phantom Read | Lost Update |
-|---|---|---|---|---|
-| **Read Uncommitted** | ⚠️ Có thể | ⚠️ Có thể | ⚠️ Có thể | ⚠️ Có thể |
-| **Read Committed** | ✅ Không | ⚠️ Có thể | ⚠️ Có thể | ⚠️ Có thể |
-| **Repeatable Read** | ✅ Không | ✅ Không | ⚠️ Có thể | ✅ Không |
-| **Serializable** | ✅ Không | ✅ Không | ✅ Không | ✅ Không |
+**Theo chuẩn ANSI SQL-92** (định nghĩa dựa trên 3 hiện tượng — bị phê bình là mơ hồ):
 
-> 📌 Mặc định: PostgreSQL = **Read Committed**, MySQL (InnoDB) = **Repeatable Read**, SQL Server = **Read Committed**, Oracle = **Read Committed**.
+| Isolation Level | Dirty Read | Unrepeatable Read | Phantom Read |
+|---|---|---|---|
+| **Read Uncommitted** | ⚠️ Có thể | ⚠️ Có thể | ⚠️ Có thể |
+| **Read Committed** | ✅ Không | ⚠️ Có thể | ⚠️ Có thể |
+| **Repeatable Read** | ✅ Không | ✅ Không | ⚠️ Có thể |
+| **Serializable** | ✅ Không | ✅ Không | ✅ Không |
+
+**Thực tế trong các DBMS phổ biến** (paper "A Critique of ANSI SQL Isolation Levels" — Berenson et al., 1995 — bổ sung Lost Update, Write Skew và mức **Snapshot Isolation**):
+
+| Mức (tên trong DBMS) | Dirty Read | Non-repeatable | Phantom | Lost Update | Write Skew |
+|---|---|---|---|---|---|
+| Read Committed (PG, Oracle, SQL Server RCSI, MySQL RC) | ✅ Không | ⚠️ Có | ⚠️ Có | ⚠️ Có | ⚠️ Có |
+| **MySQL InnoDB Repeatable Read** (snapshot cho SELECT thường + locking read cho UPDATE) | ✅ Không | ✅ Không (với SELECT thường) | ✅ Phần lớn không (gap lock) | ⚠️ **Có** (read-modify-write không bị phát hiện) | ⚠️ Có |
+| **PostgreSQL Repeatable Read** (= Snapshot Isolation) | ✅ Không | ✅ Không | ✅ Không | ✅ Không (first-updater-wins → lỗi serialization) | ⚠️ Có |
+| SQL Server `SNAPSHOT` / Oracle `SERIALIZABLE` (thực chất là SI) | ✅ Không | ✅ Không | ✅ Không | ✅ Không | ⚠️ Có |
+| **Serializable** thật (PG SSI, SQL Server/MySQL lock-based) | ✅ Không | ✅ Không | ✅ Không | ✅ Không | ✅ Không |
+
+> 📌 Mặc định: PostgreSQL = **Read Committed**, MySQL (InnoDB) = **Repeatable Read**, SQL Server = **Read Committed** (lock-based; Azure SQL bật sẵn RCSI), Oracle = **Read Committed**.
+>
+> ⚠️ **Lost update ở MySQL RR** — bẫy phỏng vấn kinh điển:
+> ```sql
+> -- T1 và T2 cùng chạy (balance ban đầu = 100)
+> SELECT balance FROM acc WHERE id = 1;     -- cả 2 đọc snapshot: 100
+> -- app tính: T1 muốn +50, T2 muốn -30
+> UPDATE acc SET balance = 150 WHERE id = 1; -- T1, commit
+> UPDATE acc SET balance = 70  WHERE id = 1; -- T2 chờ lock của T1 rồi GHI ĐÈ → mất +50
+> ```
+> InnoDB không báo lỗi (PostgreSQL RR sẽ báo `could not serialize access due to concurrent update`). Cách chữa: `UPDATE acc SET balance = balance + 50` (atomic), `SELECT ... FOR UPDATE`, hoặc optimistic locking bằng cột `version`.
 
 **Chi tiết từng Isolation Level:**
 
@@ -2351,7 +3393,12 @@ T1: COMMIT
 - Ứng dụng: Giao dịch tài chính quan trọng, booking vé máy bay, bất kỳ nghiệp vụ nào mà consistency quan trọng hơn performance.
 
 
-##### 15.2.6. MVCC
+##### 16.2.6. MVCC
+
+> 🎯 **Bài toán:** Với khóa, một câu báo cáo đọc lâu sẽ chặn mọi thao tác ghi (hoặc bị ghi chặn). Ta muốn **đọc không bao giờ phải chờ ghi**.
+>
+> 💡 **Ý tưởng giải:** Khi ghi, **không ghi đè** mà tạo **phiên bản mới**, mỗi phiên bản gắn khoảng thời gian có hiệu lực. Mỗi transaction đọc theo một **snapshot**: thấy phiên bản đã commit trước thời điểm snapshot. Reader và writer làm việc trên các phiên bản khác nhau nên không chặn nhau. Cái giá: phải lưu và **dọn** các phiên bản cũ; hai writer cùng sửa một dòng vẫn phải xử lý xung đột.
+
 
 - **Multi-Version Concurrency Control**: quản lý nhiều physical version của 1 logical object
 - **Nguyên tắc cốt lõi**: Writer tạo version mới thay vì ghi đè → Reader đọc version phù hợp với snapshot của mình
@@ -2405,16 +3452,15 @@ Transaction với ts=5  → không thấy row nào (chưa tồn tại)
 
 > ⚠️ **Quan trọng**: ABORT **KHÔNG** phải là set `End-TS = current time`. Các version do transaction tạo ra phải bị **loại bỏ hoàn toàn** (hoặc đánh dấu aborted để GC dọn dẹp sau), và version cũ phải được khôi phục lại trạng thái ban đầu.
 
-###### C. Write-Write Conflict — Khi nhiều Transaction cùng UPDATE
+###### C. Snapshot Isolation (SI)
+- Khi transaction bắt đầu, nó lấy 1 **snapshot** (timestamp hoặc danh sách txn đang active) → chỉ thấy dữ liệu đã commit **trước** thời điểm đó.
+- Mọi transaction commit sau thời điểm snapshot đều **vô hình** với transaction này (không dirty read, không non-repeatable read, không phantom với đọc thường).
+- Nếu nhiều txn cùng update 1 row → giải quyết bằng **First-Writer-Wins** (hoặc First-Committer-Wins) — xem mục D.
+- **Không** tránh được **write skew** (xem 16.1) → SI không phải Serializable. PostgreSQL bổ sung **SSI** (Serializable Snapshot Isolation, Cahill 2008) để phát hiện cấu trúc "dangerous structure" gồm 2 cạnh rw-dependency liên tiếp và abort 1 transaction.
+
+###### D. Write-Write Conflict — Khi nhiều Transaction cùng UPDATE
 
 MVCC **không** loại bỏ xung đột giữa writer-writer. Khi 2 transaction cùng muốn update 1 row, cần cơ chế giải quyết:
-
-
-###### D. Snap isolation
-- Khi transaction bắt đầu, nó sẽ lấy 1 snapshot timestamp
-- Tất cả các transaction sau khi snapshot timestamp được tạo ra sẽ không ảnh hưởng đến transaction này
-- Nếu nhiều txn cùng update 1 row, nó sẽ dùng First-Writer-Wins
-- Không tránh đc write skew anomaly
 
 **Nguyên tắc: First-Writer-Wins**
 
@@ -2470,11 +3516,18 @@ Thời điểm    T1 (ts=10)                    T2 (ts=15)                    Ro
 > | DBMS | Cơ chế |
 > |---|---|
 > | **PostgreSQL** | First-Writer-Wins: T2 chờ T1 → nếu T1 commit thì T2 nhận lỗi `could not serialize access` (ở Repeatable Read) hoặc re-evaluate điều kiện WHERE (ở Read Committed) |
-> | **MySQL InnoDB** | Row-level lock: T2 bị block tại row lock cho đến khi T1 kết thúc. Nếu timeout → deadlock error |
-> | **Oracle** | Row-level lock tương tự MySQL. T2 chờ tại lock, không dùng First-Writer-Wins |
+> | **MySQL InnoDB** | Row-level X lock: T2 bị block tại row lock cho đến khi T1 kết thúc, sau đó **UPDATE đọc bản mới nhất đã commit** ("current read", không dùng snapshot) và ghi tiếp — không báo lỗi → đây chính là nguồn gốc lost update ở RR. Chờ quá `innodb_lock_wait_timeout` (mặc định 50s) → lỗi `1205 Lock wait timeout exceeded`; nếu tạo chu trình chờ → InnoDB phát hiện và trả `1213 Deadlock found` cho 1 txn |
+> | **Oracle** | Row-level lock tương tự: T2 chờ tại lock. Ở Read Committed: T1 commit thì câu lệnh của T2 tự restart và đọc dữ liệu mới. Ở `SERIALIZABLE`: T2 nhận `ORA-08177: can't serialize access` |
 > | **SQL Server (SI)** | Update conflict detection: Nếu T2 cố commit sau T1 đã commit → T2 abort với `snapshot isolation conflict` |
 
-#### 15.2.7. Version Storage
+#### 16.2.7. Version Storage
+
+> 🎯 **Bài toán:** MVCC sinh ra nhiều phiên bản — lưu ở đâu để đọc bản mới nhanh, ghi rẻ và dọn dẹp được?
+>
+> ⚖️ Ba lựa chọn (bảng so sánh ở cuối mục): lưu chung bảng (append-only — PostgreSQL), bản cũ ra bảng riêng (time-travel), chỉ lưu phần thay đổi (delta/undo log — MySQL, Oracle).
+>
+> ✅ **Vì sao PostgreSQL và MySQL chọn khác nhau:** PostgreSQL ưu tiên thiết kế đơn giản và rollback tức thì (bản cũ vẫn còn nguyên trong heap) → đổi lại phải VACUUM và index phình. InnoDB ưu tiên bảng gọn, bản mới nhất luôn tại chỗ → đổi lại đọc bản cũ phải dựng lại từ undo log và transaction dài làm undo phình (history list length).
+
 
 MVCC tạo version mới mỗi khi UPDATE/DELETE → **lưu các version ở đâu?** Đây là bài toán Version Storage.
 
@@ -2561,13 +3614,13 @@ Rebuild V1: lấy main → apply Δ2 → apply Δ1 → salary=3000, age=25
 | **Write overhead** | Thấp (append) | Cao (full copy) | Thấp (ghi delta nhỏ) |
 | **Read version cũ** | Duyệt chain | Duyệt chain | Apply delta ngược |
 | **Table bloat** | ⚠️ Có (cần VACUUM) | ✅ Không | ✅ Không |
-| **DBMS** | **PostgreSQL** | — | **MySQL InnoDB** (undo log), **Oracle** (undo tablespace) |
+| **DBMS** | **PostgreSQL** | SAP HANA, SQL Server (version store trong `tempdb` cho RCSI/Snapshot) | **MySQL InnoDB** (undo log), **Oracle** (undo tablespace), HyPer |
 
 **Fact**:
   - PostgreSQL không support Read Uncommitted — nó tự động nâng lên Read Committed (vì kiến trúc MVCC của PG luôn đọc committed version)
 
 
-#### 15.2.8. Garbage collection
+#### 16.2.8. Garbage collection
    - Cần remove các physical version không còn được sử dụng hoặc đã abort
    - Approach 1: Tuple level
       - Background vacumn:
@@ -2581,7 +3634,7 @@ Rebuild V1: lấy main → apply Δ2 → apply Δ1 → salary=3000, age=25
       - Transaction dọn dẹp các version cũ của chính nó sau khi commit
 
 
-#### 15.2.9. Index Management (Trong kiến trúc MVCC)
+#### 16.2.9. Index Management (Trong kiến trúc MVCC)
 
 - **Primary index luôn trỏ tới head of version**:
   - Khi một bản ghi bị update nhiều lần, nó tạo thành một chuỗi các phiên bản (version chain).
@@ -2595,6 +3648,9 @@ Rebuild V1: lấy main → apply Δ2 → apply Δ1 → salary=3000, age=25
 - **Phần lớn các dbms không lưu thông tin version của tuple trong keys**:
   - Thường các thẻ (entry) trong B+Tree Index không nhúng timestamp/version id vào khóa mà chỉ có giá trị và con trỏ. Việc giải quyết xem hiển thị cho transaction nào hoàn toàn dựa vào timestamp lưu dưới Tuple data.
   - **PostgreSQL là ngoại lệ?** Đúng vậy. Do kiến trúc thiết kế **Append-only storage** (Tất cả version đều được lưu trên cùng một table/Heap space hệt như một row độc lập). Mỗi version là 1 bản ghi có vị trí địa vật lý riêng (CTID) nên PostgreSQL bắt buộc phải ghi trực tiếp số lượng lớn con trỏ vật lý xuống TỪNG VERSION MỘT (chứ không chỉ trỏ Head). Việc này dẫn hệ lụy **Index Bloat** (Index phình to theo thời gian vì chứa quá nhiều con trỏ mồ côi).
+  - **HOT update (Heap-Only Tuple) — tối ưu quan trọng của PostgreSQL**: nếu UPDATE **không thay đổi cột nào có index** VÀ version mới **vừa trong cùng heap page** với version cũ → PostgreSQL **không thêm entry mới vào bất kỳ index nào**; index vẫn trỏ tới tuple cũ, và tuple cũ có con trỏ `t_ctid` dẫn sang version mới trong cùng page (HOT chain). Version cũ có thể được dọn bằng *page pruning* mà không cần VACUUM toàn bảng.
+    - Hệ quả thực tế: bảng update nhiều nên đặt `fillfactor` < 100 (vd 80–90) để chừa chỗ cho HOT; tránh index các cột hay bị update. Theo dõi tỷ lệ HOT qua `pg_stat_user_tables.n_tup_hot_upd / n_tup_upd`.
+    - Đây là một trong những điểm khác biệt lớn khi so sánh "PostgreSQL vs MySQL" về write amplification (bài viết nổi tiếng của Uber năm 2016 về lý do chuyển từ PostgreSQL sang MySQL).
 
 - **Support duplicate keys from difference snapshot**:
   - Ở bề mặt Logic: `UNIQUE INDEX` hoặc `PRIMARY KEY` nghiêm cấm trùng lặp. Tuy nhiên, dưới cấu trúc vật lý của Index (trong MVCC) các DBMS phải thiết kế để support chứa nhiều keys có hệ thống giá trị giống hệt nhau.
@@ -2607,7 +3663,7 @@ Rebuild V1: lấy main → apply Δ2 → apply Δ1 → salary=3000, age=25
 
 Nghĩa là gì: Khi hệ thống (worker) chạy lệnh SELECT * FROM table WHERE id = 5, truy vấn này đi vào index và có thể nhận về nhiều con trỏ (pointers) khác nhau (vì như ở ý 1, đang có 3 phiên bản của id = 5).
 
-#### 15.2.10. MVCC Deletes
+#### 16.2.10. MVCC Deletes
    - DBMS chỉ deletes 1 tuples khi toàn bộ các version logical của nó not visible
       - Nếu 1 tuple đã bị xóa, không thể có 1 version mới được sinh ra từ nó
       - No write-write conflicts, first writer wins
@@ -2631,19 +3687,55 @@ Nghĩa là gì: Khi hệ thống (worker) chạy lệnh SELECT * FROM table WHER
             - Phức tạp hóa luồng dọn dẹp Garbage Collection sau này.
          - **Mẹo tối ưu (Reduce Overhead)**: Thay vì lưu 1 bản ghi Tombstone to, Database có thể (1) thiết kế một khu riêng biệt (Separate Pool) dành cho Tombstone hoặc (2) tận dụng 1 chuỗi bit đặc biệt (special bit pattern) nhúng thẳng vào trong cấu trúc con trỏ (Version Chain Pointer) -> Cực kỳ tiết kiệm dung lượng.
 
+**⚖️ Các cơ chế concurrency control**
 
-### 16. WAL + Shadow Paging
+| Cơ chế | Ý tưởng | Tốt khi | Kém khi |
+| :--- | :--- | :--- | :--- |
+| **2PL** (pessimistic) | Khóa trước khi đọc/ghi, giữ tới khi commit | Xung đột cao, cần chắc chắn | Reader chặn writer và ngược lại; deadlock |
+| **OCC** (optimistic) | Làm trên bản riêng, kiểm tra xung đột lúc commit | Xung đột thấp, transaction ngắn | Xung đột cao → abort & làm lại nhiều |
+| **Timestamp ordering** | Thứ tự theo timestamp lúc bắt đầu | Hệ phân tán, không deadlock | Transaction dài hay bị abort |
+| **MVCC** (+ lock cho write) | Ghi tạo phiên bản mới, đọc thấy snapshot | Đọc nhiều, ghi ít — đa số web app | Phải dọn phiên bản cũ (VACUUM/purge); vẫn còn write skew nếu chỉ là SI |
 
-#### 16.1. Buffer Pool Policies
+✅ **Vì sao hầu hết RDBMS chọn MVCC + lock cho ghi, mặc định Read Committed/Repeatable Read:** workload web đọc nhiều hơn ghi rất nhiều; MVCC cho phép **đọc không bao giờ chặn ghi**. Serializable đầy đủ tốn kém (khóa nhiều hơn hoặc abort nhiều hơn), nên mặc định dùng mức thấp hơn. Cái giá: **lập trình viên phải tự nhận diện các bất thường còn lại** (lost update, write skew) và xử lý bằng `SELECT ... FOR UPDATE`, cập nhật nguyên tử, cột version, ràng buộc, hoặc bật Serializable cho đúng nghiệp vụ đó.
+
+> 🛠 **Áp dụng:**
+> - Nghiệp vụ "đọc → tính → ghi" (trừ tiền, trừ kho): dùng cập nhật nguyên tử (`SET stock = stock - 1 WHERE stock > 0`), `SELECT ... FOR UPDATE`, hoặc optimistic locking (`@Version`) — đừng tin vào isolation mặc định.
+> - Ràng buộc liên quan nhiều dòng (≥ 1 bác sĩ trực, không đặt trùng phòng) → write skew → khóa dòng "đại diện", exclusion constraint, hoặc Serializable + retry.
+> - Ứng dụng phải **retry** khi gặp deadlock (MySQL 1213) hay serialization failure (PostgreSQL `40001`).
+> - Giữ transaction **ngắn**: không gọi API ngoài, không chờ người dùng bên trong transaction.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Write skew là gì và vì sao Snapshot Isolation không ngăn được?**
+   → Hai transaction đọc cùng điều kiện rồi ghi vào **hai dòng khác nhau**; không có xung đột ghi–ghi nên SI cho cả hai commit, nhưng kết quả chung vi phạm ràng buộc (ví dụ bác sĩ trực ở 16.1).
+2. **Vì sao MySQL Repeatable Read vẫn có lost update còn PostgreSQL Repeatable Read thì không?**
+   → InnoDB cho `UPDATE` đọc bản mới nhất đã commit (current read) và ghi đè; PostgreSQL phát hiện dòng đã bị transaction khác sửa sau snapshot và báo lỗi serialization.
+3. **Vì sao 2PL phải chia hai pha mà không được "khóa – dùng – nhả" tự do?**
+   → Nhả rồi khóa lại cho phép transaction khác chen vào giữa, tạo ra thứ tự không tương đương bất kỳ thứ tự tuần tự nào.
+</details>
+
+
+### 17. WAL + Shadow Paging
+
+> 🎯 **Bài toán:** Sau khi trả "commit thành công", dữ liệu **phải còn** dù mất điện ngay sau đó (Durability), và transaction đang dở **phải biến mất** (Atomicity). Nhưng một transaction sửa nhiều page nằm rải rác; ghi tất cả xuống disk trước khi trả commit = nhiều I/O ngẫu nhiên chậm.
+>
+> ❌ **Cách ngây thơ:**
+> - *Force*: ghi mọi page bị sửa xuống disk lúc commit → commit chậm.
+> - *No-steal*: không bao giờ ghi page của transaction chưa commit → transaction lớn hơn RAM thì không chạy được.
+>
+> 💡 **Ý tưởng giải:** Ghi **nhật ký thay đổi** (log) xuống disk **trước** — log là ghi **tuần tự** nên rất nhanh — rồi mới ghi page dữ liệu sau, lúc nào tiện (**Write-Ahead Logging**). Khi crash, dùng log để làm lại (REDO) phần đã commit và hoàn tác (UNDO) phần chưa commit.
+
+
+#### 17.1. Buffer Pool Policies
 
 Quản lý Buffer Pool liên quan đến việc quyết định **khi nào** một page dữ liệu bị sửa đổi (dirty page) có thể hoặc bắt buộc phải được đẩy (flush) từ bộ nhớ (RAM) xuống đĩa cứng (Disk).
 
-##### 16.1.1. Steal Policy (Chính sách thay thế)
+##### 17.1.1. Steal Policy (Chính sách thay thế)
 Quy định liệu DBMS có thể đẩy (evict) một "dirty page" của một transaction **chưa commit** xuống ổ đĩa để lấy khoảng trống cho page khác hay không.
 - **Steal** (Cho phép): Có thể đẩy dirty page của uncommitted transaction xuống đĩa. Giúp bảo vệ hệ thống không bị tràn bộ nhớ khi transaction sửa quá nhiều dữ liệu. Cách này yêu cầu DBMS phải có khả năng **UNDO** (khôi phục trạng thái cũ) nếu transaction đó bị abort.
 - **No-Steal** (Không cho phép): Phải giữ dirty page trên RAM cho đến khi transaction kết thúc (commit/abort). Không cần UNDO file (chỉ cần xóa dữ liệu trên RAM) nhưng giới hạn dung lượng thay đổi của 1 transaction bằng với kích thước của Buffer Pool.
 
-##### 16.1.2. Force Policy (Chính sách bắt buộc)
+##### 17.1.2. Force Policy (Chính sách bắt buộc)
 Quy định liệu DBMS có bắt buộc phải đẩy (flush) toàn bộ các dirty page của một transaction xuống đĩa ngay **vào lúc nó commit** hay không.
 - **Force** (Bắt buộc): Mọi thay đổi phải được ghi đầy đủ xuống đĩa trước khi commit thành công. Đảm bảo dữ liệu không bị mất nếu crash (Durability), hệ thống không cần cơ chế **REDO**.
 - **No-Force** (Không bắt buộc): Giao dịch có thể trả về commit thành công ngay cả khi dữ liệu (data pages) vẫn đang nằm trên RAM (chưa ghi xuống đĩa). Giúp tăng hiệu năng đáng kể (giảm thời gian chờ I/O ghi ngẫu nhiên đối với dữ liệu phân mảnh) nhưng buộc hệ thống phải lưu trữ các sự kiện thay đổi vào file log để có thể **REDO** khôi phục nếu xảy ra crash.
@@ -2659,7 +3751,7 @@ Quy định liệu DBMS có bắt buộc phải đẩy (flush) toàn bộ các d
 
 ---
 
-#### 16.2. Shadow Paging
+#### 17.2. Shadow Paging
 
 Dựa trên nguyên tắc thiết kế **No-Steal + Force**. Hầu như tránh được việc phải duy trì các file Log khổng lồ cho việc UNDO/REDO. Phổ biến trong bản thiết kế đời đầu hoặc các db nhúng như (LMDB, SQLite trước đây).
 
@@ -2679,7 +3771,7 @@ Dựa trên nguyên tắc thiết kế **No-Steal + Force**. Hầu như tránh �
 
 ---
 
-#### 16.3. WAL (Write-Ahead Logging)
+#### 17.3. WAL (Write-Ahead Logging)
 
 Là giải pháp tiêu chuẩn phục vụ cho kiến trúc **Steal + No-Force**. Do DBMS có quyền ghi dở dang uncommitted data xuống đĩa (Steal) hoặc giữ Committed data trên bộ nhớ (No-Force), hệ thống bắt buộc phải duy trì transaction log để **UNDO** (khi bị abort) và **REDO** (khi crash trước khi dirty pages được flush xuống disk).
 
@@ -2729,22 +3821,57 @@ Là giải pháp tiêu chuẩn phục vụ cho kiến trúc **Steal + No-Force**
 **D. Cơ chế REDO & Checkpoint**
 Việc ghi log liên tục cho phép khôi phục nguyên vẹn, tuy nhiên nếu phải replay toàn bộ log từ đầu, thời gian recovery sẽ rất lớn. Giải pháp là sử dụng **Checkpoint** định kỳ:
 - **Khi Checkpoint chạy (Save)**: 
-  - (Định kỳ hoặc theo cấu hình) DBMS tạm dừng các transaction, flush toàn bộ WAL log chưa ghi và flush toàn bộ **dirty pages** từ RAM xuống đĩa.
+  - (Checkpoint đơn giản / blocking — để dễ hiểu; DBMS thật dùng **fuzzy checkpoint** ở 18.2) DBMS tạm dừng các transaction, flush toàn bộ WAL log chưa ghi và flush toàn bộ **dirty pages** từ RAM xuống đĩa.
   - Ghi 1 log record `CHECKPOINT` đánh dấu thời điểm mà tất cả dirty pages đã được persist an toàn.
 - **Khi Crash (Khôi phục)**: 
   - DBMS khởi động, dò ngược log để tìm checkpoint gần nhất. Toàn bộ log records trước checkpoint được bỏ qua (vì dirty pages đã được flush an toàn). Chỉ cần replay các log records sau checkpoint để khôi phục.
 
+**⚖️ WAL vs Shadow Paging**
 
-### 17. Database crash recovery
+| | Shadow Paging (copy-on-write) | WAL |
+| :--- | :--- | :--- |
+| Ghi khi commit | Mọi page đã sửa + đường dẫn tới root (ngẫu nhiên) | Chỉ log (tuần tự), gộp nhiều commit trong 1 fsync |
+| Recovery | Gần như tức thì (master pointer vẫn trỏ bản cũ) | Phải replay log (giới hạn bằng checkpoint) |
+| Phân mảnh dữ liệu | Cao | Thấp (cập nhật tại chỗ) |
+| Ai dùng | LMDB, CouchDB, một số FS | PostgreSQL, MySQL, Oracle, SQL Server... |
+
+✅ **Vì sao gần như mọi DB chọn WAL (Steal + No-Force):** commit chỉ tốn một lần ghi tuần tự nhỏ; page dữ liệu được ghi lười và gộp nhiều thay đổi; transaction không bị giới hạn bởi RAM. Bonus quan trọng: **cùng luồng log này được dùng cho replication và point-in-time recovery**.
+
+> 🛠 **Áp dụng:**
+> - Các tham số đánh đổi durability lấy tốc độ: PostgreSQL `synchronous_commit`, MySQL `innodb_flush_log_at_trx_commit` và `sync_binlog` (20.9). Chỉ nới lỏng khi chấp nhận mất vài trăm ms dữ liệu.
+> - Disk chứa log nên nhanh và độ trễ fsync thấp; theo dõi độ trễ commit.
+> - Hiểu WAL là hiểu luôn replication của PostgreSQL và CDC (Debezium đọc WAL/binlog).
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao quy tắc "log phải xuống disk trước page dữ liệu" là bắt buộc?**
+   → Nếu page của transaction chưa commit xuống disk trước mà log chưa có, khi crash sẽ không có thông tin để UNDO thay đổi đó.
+2. **Group commit giúp gì?**
+   → Gộp log của nhiều transaction vào một lần fsync → số lần fsync/giây không còn giới hạn số commit/giây.
+</details>
+
+
+### 18. Database crash recovery
+
+> 🎯 **Bài toán:** Vì dùng Steal + No-Force, sau khi crash disk có thể **chứa thay đổi của transaction chưa commit** (đã bị "steal" xuống) và **thiếu thay đổi của transaction đã commit** (chưa kịp ghi page). Phải đưa DB về đúng trạng thái: có mọi thứ đã commit, không có gì chưa commit — và làm nhanh.
+>
+> 💡 **Ý tưởng giải (ARIES):** (1) **Analysis** — đọc log từ checkpoint để biết transaction nào đang dở, page nào có thể bẩn; (2) **Redo** — làm lại **toàn bộ lịch sử** (cả transaction chưa commit) để disk về đúng trạng thái lúc crash; (3) **Undo** — hoàn tác các transaction chưa commit, ghi lại chính việc hoàn tác (CLR) để nếu crash lần nữa không phải làm lại. **Checkpoint** giới hạn lượng log cần đọc.
+>
+> ✅ **Vì sao "redo tất cả rồi mới undo"** thay vì chỉ redo phần đã commit: sau redo, DB ở đúng trạng thái lúc crash → việc undo chỉ là **rollback bình thường** như lúc đang chạy; code đơn giản và đúng với mọi trường hợp (kể cả lock, index).
+
+
+> **ARIES** (*Algorithms for Recovery and Isolation Exploiting Semantics* — IBM, C. Mohan, 1992) là thuật toán recovery mà hầu hết DBMS dùng WAL đều dựa theo. 3 ý tưởng chính: (1) **WAL** với Steal + No-Force, (2) **Repeating history during Redo** — redo lại mọi thứ kể cả txn chưa commit, (3) **Logging changes during Undo** — ghi CLR để undo không bị lặp.
+
+#### 18.1. LSN, Log Record & Rollback bình thường
 - Mỗi log record có một **LSN (Log Sequence Number)** — unique và tăng dần, dùng để xác định điểm bắt đầu recovery.
-   - Unique và tăng dần (chi tiết đã nêu ở trên)
+   - Mỗi log record gồm: `<LSN, prevLSN, TxnId, Type, PageId, Before-image, After-image>`
    - Mỗi page đều có pageLSN(most recent log record that update this page)
    - FlushedLSN: LSN max đã được flush
    - Trước khi page được write xuống disk: pageLSN <= flushedLSN. Lý do: pageLSN là LSN của log record đã modify page, flushedLSN là LSN cuối cùng đã được flush xuống disk log. Để đảm bảo WAL rule (log phải flush trước data), pageLSN phải <= flushedLSN.
    - Trong bài giảng, chúng ta giả định như sau
      - Kích thước tất cả log record feed trong 1 single page
      - Thao tác ghi định kỳ vào page là 1 thao tác atomic
-     - Chỉ 1 version tuple với Strong strich 2 PL
+     - Chỉ 1 version tuple với Strong Strict 2PL (không MVCC)
      - Steal/No-Force với WAL
      - Physical log record schema
      - Bỏ qua log cho index
@@ -2769,7 +3896,7 @@ Việc ghi log liên tục cho phép khôi phục nguyên vẹn, tuy nhiên nế
            - Nếu release lock ngay khi phát lệnh Abort: Transaction T2 có thể đọc dữ liệu chưa nhất quán (Dirty Read) hoặc T2 update xong bị UNDO của T1 ghi đè (Lost Update).
            - **Do đó**: Strict 2PL yêu cầu giữ Exclusive Lock cho đến khi Transaction kết thúc hoàn toàn (ghi xong `TXN-END`). Lúc đó data đã được restore nguyên vẹn, các transaction khác có thể truy cập an toàn.
 
-#### 17.2. Fuzy checkpoint
+#### 18.2. Fuzzy Checkpoint
    - Thay vì block toàn bộ transaction, ta lưu điểm bắt đầu và điểm kết thúc của checkpoint
    - ATT và PTT: 
      - ATT(Active Transaction Table): Lưu thông tin transaction hiện tại: R(running), C: Commit, A: Abort
@@ -2781,7 +3908,7 @@ Việc ghi log liên tục cho phép khôi phục nguyên vẹn, tuy nhiên nế
     - Dirty page table
     - Active transaction table
     
-#### 17.3. ARIES: Recovery phase
+#### 18.3. ARIES: Recovery phase
 ARIES thực hiện khôi phục hệ thống qua **3 pha tuần tự (3-Phase Recovery)**:
 
 ##### 1. Analysis Phase (Pha phân tích)
@@ -2816,24 +3943,54 @@ ARIES thực hiện khôi phục hệ thống qua **3 pha tuần tự (3-Phase R
    - Nhờ CLR, nếu phần mềm dọn dẹp bị crash giữa chừng, quá trình Recovery bật lại sẽ nương vào `UndoNextLSN` của CLR để biết tiến độ, không bao giờ rơi vào bẫy lặp lại việc undo vô hạn.
    - Diệt cỏ tận gốc về đến LSN đầu tiên (`BEGIN`) của TXN -> Ghi log `TXN-END` chốt hạ -> Xóa sổ TXN khỏi ATT. Quy trình ARIES Recovery hoàn tất.
 
+> 🛠 **Áp dụng:**
+> - Checkpoint dày → khởi động lại nhanh nhưng tốn I/O khi chạy; thưa → ngược lại (PostgreSQL `checkpoint_timeout`, `max_wal_size`).
+> - Cùng cơ chế: base backup + replay WAL = **Point-in-Time Recovery** — cứu được lỗi `DELETE` nhầm mà replication không cứu được.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao cần CLR khi undo?**
+   → Nếu crash giữa lúc đang undo, lần recovery sau biết phần nào đã undo xong (theo `UndoNextLSN`) để không undo lặp — undo không phải lúc nào cũng an toàn khi làm hai lần.
+2. **pageLSN dùng để làm gì trong pha Redo?**
+   → Nếu `pageLSN` ≥ LSN của log record thì page đã chứa thay đổi đó → bỏ qua, tránh áp dụng hai lần.
+</details>
 
 
-### 18. Distributed database
-#### 18.1. System architecture
-- Share everything: 
-- Share nothing: 
-   - Mỗi node có cpu, memory, disk riêng
-   - Better performance và effieciency
-   - Khó mở rộng và đảm bảo tính nhất quán
-   - Phần lớn các hệ thống hiện tại đều sử dụng hệ thống này
-   - Ví dụ: 
-      - Khi add thêm 1 node vào, cần rebalance lại data
-- Share disk: 
-   - Đơn giản trong query select
-   - Khi update cần cơ chế notify tới các node khác về thay đổi
-- Share memory(No one do this)
+### 19. Distributed database
 
-#### 18.2. Distributed query
+> 🎯 **Bài toán:** Một máy không còn đủ: dữ liệu vượt dung lượng, lượng ghi vượt khả năng một node, hoặc yêu cầu không được ngừng hoạt động khi một máy/datacenter hỏng.
+>
+> 💡 **Ý tưởng giải:** Ba công cụ, mỗi công cụ giải một bài và **sinh ra bài toán mới**:
+> - **Replication** (nhiều bản sao) → giải *sẵn sàng* & *scale đọc* → sinh ra bài toán **các bản sao lệch nhau** (lag, xung đột).
+> - **Partitioning / sharding** (chia dữ liệu) → giải *dung lượng* & *scale ghi* → sinh ra bài toán **query/transaction xuyên nhiều node**.
+> - **Consensus & atomic commit** (Paxos/Raft, 2PC) → giải *đồng thuận giữa các node* → trả giá bằng **độ trễ** và **giới hạn khi mạng chia cắt** (CAP/PACELC).
+
+#### 19.1. System architecture
+
+> Phân biệt trước: **Parallel DBMS** (các node gần nhau, mạng nhanh & tin cậy — vd 1 rack) vs **Distributed DBMS** (node có thể ở xa nhau, mạng chậm, có thể mất kết nối) — cùng các khái niệm nhưng giả định về mạng khác nhau.
+
+```
+Shared Everything      Shared Memory          Shared Disk                Shared Nothing
+┌──────────────┐      ┌─────┐ ┌─────┐       ┌─────┐ ┌─────┐            ┌─────┐ ┌─────┐
+│ CPU+MEM+DISK │      │ CPU │ │ CPU │       │CPU  │ │CPU  │            │CPU  │ │CPU  │
+│  (1 node)    │      └──┬──┘ └──┬──┘       │MEM  │ │MEM  │            │MEM  │ │MEM  │
+└──────────────┘       ┌─┴───────┴─┐        └──┬──┘ └──┬──┘            │DISK │ │DISK │
+                       │  MEMORY   │        ═══╪═══════╪═══ network    └──┬──┘ └──┬──┘
+                       ├───────────┤        ┌──┴───────┴──┐            ═══╪═══════╪═══ network
+                       │   DISK    │        │ Shared DISK │
+                       └───────────┘        └─────────────┘
+```
+
+| Kiến trúc | Đặc điểm | Ví dụ |
+|---|---|---|
+| **Shared Everything** | 1 node, mọi thứ local — DBMS truyền thống single-node | PostgreSQL, MySQL đơn lẻ |
+| **Shared Memory** | Nhiều CPU dùng chung không gian bộ nhớ qua network — cần OS/phần cứng hỗ trợ đặc biệt; **hầu như không DBMS phân tán nào làm vậy** (khác với máy NUMA nhiều socket) | HPC cluster |
+| **Shared Disk** | Mỗi compute node có CPU+RAM riêng, **dùng chung 1 lớp storage** (SAN, hoặc object storage như S3). Compute **stateless** → scale/thay node rất dễ, không cần di chuyển dữ liệu; tách biệt scale compute và storage. Khó: cache coherence giữa các node khi có ghi (phải notify/invalidate page cache của node khác), lock toàn cục | **Cloud-native**: Amazon Aurora, Snowflake, Neon, AlloyDB, Google Spanner/BigQuery (storage Colossus); Oracle RAC (cổ điển) |
+| **Shared Nothing** | Mỗi node có CPU, RAM, disk riêng; giao tiếp chỉ qua network. Hiệu năng & hiệu quả tốt nhất (data locality), scale gần tuyến tính. Khó: **thêm/bớt node phải di chuyển (rebalance) dữ liệu**, đảm bảo nhất quán & transaction phân tán | Cassandra, CockroachDB, TiDB, Vitess, Citus, Greenplum, Redshift (cổ điển), MongoDB sharded |
+
+> 📌 Xu hướng hiện nay: **tách compute khỏi storage** (shared-disk trên cloud storage) vì object storage rẻ, bền, scale vô hạn; compute bật/tắt theo nhu cầu (serverless). Aurora còn đẩy cả **redo log xuống storage layer** ("the log is the database") — compute chỉ gửi log record, storage node tự apply → giảm network I/O.
+
+#### 19.2. Distributed query
 ##### A. Push query to data
 - Gửi query hoặc 1 phần của query tới node chứa data
 - Thực thi càng nhiều query và process nhất có thể khi data còn ở node đó
@@ -2862,7 +4019,12 @@ ARIES thực hiện khôi phục hệ thống qua **3 pha tuần tự (3-Phase R
 > 📌 **Thực tế**: Hầu hết các hệ thống distributed database sử dụng **Hybrid approach** — push được phần nào thì push (filter, partial aggregation tại data node), phần nào buộc phải pull thì pull (cross-node JOIN, final aggregation). Ví dụ: Spark SQL thực hiện predicate pushdown (đẩy điều kiện WHERE xuống data source) nhưng vẫn phải shuffle data giữa các node khi thực hiện JOIN hoặc GROUP BY trên key khác partition key.
 
 
-#### 18.3. Database partitioning
+#### 19.3. Database partitioning
+
+> 🎯 **Bài toán:** Dữ liệu/lượng ghi vượt khả năng một node → chia dữ liệu cho nhiều node. Chia theo tiêu chí nào để tải đều, query ít phải hỏi nhiều node, và thêm node không phải di chuyển toàn bộ dữ liệu?
+>
+> ⚖️ Hash (đều, mất range query) — Range (range query tốt, dễ nóng một đầu) — List/Directory (linh hoạt, cần bảng tra). `hash % N` đổi N là di chuyển gần hết dữ liệu → **consistent hashing / rendezvous hashing** chỉ di chuyển ~1/N.
+
 - **Split database vào multi resource**:
    - Chia sẻ tải trên nhiều phần cứng: Disk, CPU, RAM.
    - **Physical partitioning** (Phân mảnh vật lý) và **Logical partitioning** (Phân mảnh logic):
@@ -2894,7 +4056,14 @@ ARIES thực hiện khôi phục hệ thống qua **3 pha tuần tự (3-Phase R
    - Tất cả các compute node cùng tiến hành phân vùng logic để chia tải, xử lý dữ liệu từ một hệ thống đĩa chung.
    - **Đặc điểm**: Giảm gánh nặng tái cấu trúc khi thêm node vì dữ liệu trung tâm không di chuyển. Tuy nhiên, lưu trữ chia sẻ có thể trở thành bottleneck ở điểm Disk I/O nếu truy cập quá dày đặc.
 
-#### 18.4. Database Replication (Cơ chế nhân bản)
+#### 19.4. Database Replication (Cơ chế nhân bản)
+
+> 🎯 **Bài toán:** Một node chết là mất dịch vụ (và có thể mất dữ liệu); một node không chịu nổi lượng đọc.
+>
+> 💡 **Ý tưởng giải:** Giữ nhiều bản sao. Hai câu hỏi thiết kế: **ai được ghi** (một leader / nhiều leader / không leader) và **khi nào coi là ghi xong** (đồng bộ / bất đồng bộ / bán đồng bộ).
+>
+> ✅ **Vì sao single-leader + async/semi-sync phổ biến nhất:** đơn giản, không có xung đột ghi; semi-sync bảo đảm ít nhất 1 bản sao có dữ liệu mà không chịu độ trễ của mọi replica. Multi-leader/leaderless chỉ đáng khi cần ghi ở nhiều vùng địa lý hoặc availability cực cao, và phải chấp nhận giải quyết xung đột.
+
 - **Khái niệm**: Là việc lưu trữ các bản sao (copy) của cùng một tập dữ liệu (dataset) trên nhiều nodes (máy chủ) khác nhau thông qua mạng network.
 - **Mục đích cốt lõi**:
    - **High Availability (Sẵn sàng cao)** & **Fault Tolerance (Chịu lỗi)**: Nếu 1 node bị network failure hoặc hardware failure, hệ thống có thể fail-over chuyển hướng sang các node khác.
@@ -2904,13 +4073,15 @@ ARIES thực hiện khôi phục hệ thống qua **3 pha tuần tự (3-Phase R
 ##### A. Các mô hình Replication
 1. **Single-Leader (Primary-Replica / Master-Slave)**:
    - **Cơ chế**: Dành một node duy nhất đóng vai trò Leader (Master) được phép nhận truy cập GHI (Write). Sau khi thay đổi, Leader truyền bản ghi (replication log) tới tất cả các node còn lại (Followers / Replicas). Các truy cập vào Follower bị giới hạn ở ngưỡng ĐỌC (Read-only).
-   - **Đặc điểm**: Rất thông dụng (vd: MySQL, PostgresSQL mặc định). Dễ triển khai, nhất quán cao. Điểm yếu là Leader trở thành điểm chết duy nhất (Single Point of Failure) nếu tiến trình failover tự động cấu hình không vững.
+   - **Đặc điểm**: Rất thông dụng (vd: MySQL, PostgreSQL mặc định). Dễ triển khai, nhất quán cao. Điểm yếu là Leader trở thành điểm chết duy nhất (Single Point of Failure) nếu tiến trình failover tự động cấu hình không vững.
 2. **Multi-Leader (Master-Master)**:
    - **Cơ chế**: Có nhiều hơn 1 node đóng vai trò Leader. Mỗi Leader đều có thể accept write độc lập và replicate changes bidirectionally giữa các Leader/Follower.
    - **Đặc điểm**: Thích hợp cho môi trường chia tách Multi-Datacenter (Mỗi châu lục có 1 Datacenter với Leader cục bộ riêng) giúp né độ trễ write. **Rủi ro to lớn**: Vấn đề giải quyết xung đột ghi chép (Write Conflict - Khi 2 user sửa cùng 1 row ở 2 Datacenter khác nhau trong cùng 1 mili-giây, dẫn đến chia rẽ dữ liệu).
 3. **Leaderless (Quorum-based)**:
    - **Cơ chế**: Mọi node đều bình đẳng. Khi Client update, nó trực tiếp đẩy Write song song (broadcast) vào nhiều nodes. Khi cần Read, nó cũng gửi lấy data từ nhiều nodes để vá lỗi.
    - **Đặc điểm**: Áp dụng quy tắc số đông **Quorum ($W + R > N$)** để đọc dữ liệu chuẩn xác. Ví dụ: Có 3 node ($N=3$), bắt buộc cấu hình ghi vào ít nhất 2 node hoàn thành ($W=2$). Khi đọc, cũng yêu cầu phải tham chiếu đủ ít nhất từ 2 node ($R=2$). Lúc này chắc chắn $W+R=4 > 3$, do đó cụm trả về sẽ có ít nhất 1 node chắp nối thành công bản ghi mới nhất. Cơ chế này đạt tính High Availability cực mạnh trong môi trường chập chờn (Cassandra, DynamoDB sử dụng mô hình này).
+   - **Các cơ chế đi kèm**: **read repair** (khi đọc thấy replica có version cũ → ghi bản mới vào nó), **anti-entropy** (tiến trình nền so sánh Merkle tree giữa replica — xem SystemDesign 11.2), **hinted handoff** + **sloppy quorum** (node đích chết thì ghi tạm vào node khác kèm "hint", khi node đích sống lại thì chuyển giao).
+   - ⚠️ `W + R > N` **không** đảm bảo linearizability tuyệt đối (ghi đồng thời, LWW theo đồng hồ lệch, sloppy quorum...). Cassandra cho chọn consistency level theo từng query: `ONE`, `QUORUM`, `LOCAL_QUORUM`, `ALL`.
 
 ##### B. Propagation
 - **Propagation Schema**
@@ -2929,8 +4100,25 @@ Xác định mức cam kết bảo chứng data giữa Leader và Follower:
    - Vừa bảo toàn được tốc độ hệ thống, vừa cam kết tính High Availability vì ta chắc chắn có một bản gác tạm ở server phái sinh khác ngoài Leader.
 
 - **Propagation Timing**
-  - Continous: Gửi message logs ngay thời điểm nó đượ tạo, cần gửi cả commit/abort message(phần lớn system sử dụng kiến trúc này)
-  - On commit: Chỉ gửi sau khi đã commit, không tốn thời gian gửi các abort txn
+  - **Continuous**: gửi log record tới replica ngay khi nó được tạo, kèm cả commit/abort message (phần lớn hệ thống dùng cách này — vd PostgreSQL streaming replication gửi WAL liên tục).
+  - **On commit**: chỉ gửi log của transaction khi nó commit → không tốn công gửi transaction bị abort, nhưng transaction lớn sẽ làm replica trễ đột ngột (vd MySQL binlog chỉ ghi transaction khi commit).
+
+- **Active-Active vs Active-Passive**
+  - **Active-Active**: transaction thực thi **độc lập trên mọi replica**, cuối cùng kiểm tra kết quả có giống nhau không (cần thực thi tất định).
+  - **Active-Passive**: transaction thực thi ở **1 nơi** rồi truyền **thay đổi** (log) sang replica — phổ biến hơn nhiều.
+
+- **Replication log ở các DBMS phổ biến** (hay hỏi khi phỏng vấn):
+  | | Cơ chế | Ghi chú |
+  |---|---|---|
+  | **MySQL** | **Binlog** (logical): `STATEMENT` / `ROW` (mặc định từ 5.7.7) / `MIXED`; replica có I/O thread kéo binlog → relay log → SQL thread(s) apply | GTID giúp failover dễ; *semi-sync* plugin; **Group Replication / InnoDB Cluster** (Paxos-based) cho multi-primary/HA |
+  | **PostgreSQL** | **Streaming replication** = gửi WAL vật lý (byte-level) → standby là bản sao y hệt (hot standby đọc được) | `synchronous_commit` (`off`/`local`/`remote_write`/`on`/`remote_apply`) + `synchronous_standby_names` (vd `ANY 1 (s1, s2)`) để chọn mức sync |
+  | **PostgreSQL logical** | **Logical replication / logical decoding** (publication/subscription) — gửi thay đổi ở mức row | Cho phép replicate một phần bảng, khác version major, là nền tảng của CDC (Debezium) |
+  | **MongoDB** | **oplog** (capped collection, idempotent ops) | `writeConcern: {w: "majority"}`, `readConcern` |
+
+- **Replication lag & các bảo đảm phía client** (rất hay gặp khi đọc từ replica):
+  - **Read-your-writes**: user vừa sửa profile, reload trang lại đọc từ replica chưa kịp cập nhật → thấy dữ liệu cũ. Cách xử lý: đọc từ leader trong X giây sau khi ghi, hoặc ghi nhớ LSN/GTID của lần ghi và chỉ đọc replica đã apply tới đó.
+  - **Monotonic reads**: 2 lần đọc liên tiếp rơi vào 2 replica lag khác nhau → dữ liệu "đi lùi". Cách xử lý: gắn user với 1 replica cố định (sticky).
+  - **Consistent prefix reads**: thấy câu trả lời trước câu hỏi (do 2 partition lag khác nhau).
 
 
 ##### C. K-Safety (Độ an toàn K)
@@ -2942,7 +4130,7 @@ Xác định mức cam kết bảo chứng data giữa Leader và Follower:
    - `K-Safety = 2`: Dữ liệu phân bổ ở 3 node. Dù 2 node chết cùng lúc thì hệ thống vẫn truy xuất được dữ liệu trọn vẹn ở node còn lại.
 - **Đặc trưng**: Nếu số node hỏng **lớn hơn K** được quy định, một số Database (như Vertica) sẽ buộc phải tắt luôn hệ thống (Shutdown an toàn / Read-only) để ngăn chặn phát sinh hiện tượng dữ liệu rác không đồng nhất.
 
-#### 18.5. Transaction coordination
+#### 19.5. Transaction coordination
 - Khi txn trên nhiều node, cần cơ chế phối hợp để đảm bảo tính nguyên tử
    - Data dạng copy replication hay mỗi node có 1 loại data
 - Kiến trúc: 
@@ -2957,7 +4145,12 @@ Federated(Liên bang)
    - Middleware sẽ điều phối transaction
    - Federated phối hợp nhiều database khác nhau
 
-#### 18.6. Atomic Commit Protocols (Giao thức cam kết nguyên tử)
+#### 19.6. Atomic Commit Protocols (Giao thức cam kết nguyên tử)
+
+> 🎯 **Bài toán:** Một transaction ghi vào nhiều node — tất cả phải cùng commit hoặc cùng hủy, kể cả khi có node chậm/chết.
+>
+> 💡 **Ý tưởng giải:** Tách quyết định thành 2 bước: hỏi mọi node "có chắc chắn commit được không" (prepare — node phải ghi log để giữ lời hứa), rồi mới ra quyết định chung (2PC). Điểm yếu là coordinator; hệ hiện đại **sao chép trạng thái coordinator bằng consensus** (Paxos/Raft) để loại bỏ điểm chết đơn.
+
 - Tiền đề:
     - Tất cả các node trong 1 distributed DBMS are well-behaved
     - Nếu không tin tưởng node, bạn cần sử dụng thuật toán ..
@@ -2979,16 +4172,25 @@ Federated(Liên bang)
 - **Nhược điểm chí mạng của 2PC (The Blocking Problem)**:
    - Nếu Coordinator crash ngay đầu **Pha 2** sau khi đã ra quyết định nhưng *chưa kịp thông báo* cho các Participants → các Participants rơi vào trạng thái **blocked**: data đang bị lock, đã vote `YES`, mất kết nối với Coordinator nên không thể tự quyết định commit hay abort. Tài nguyên bị giữ lock vô thời hạn cho đến khi Coordinator phục hồi. Đặc điểm này biến Coordinator thành **Single Point of Failure**.
 
-- **Optimized**
-   - Early-Prepare voting(rare): 
-   - Early ack after prepare: Send successful ngay sau khi các nốt đều báo ok: Cơ chế ghi log và redo nữa chứ???
+- **Các tối ưu của 2PC**:
+   - **Early Prepare Voting** (hiếm dùng): nếu coordinator biết câu lệnh gửi tới một node là câu lệnh **cuối cùng** của transaction trên node đó, nó gửi kèm luôn yêu cầu PREPARE → node thực thi xong thì vote ngay, tiết kiệm 1 round-trip. Hiếm vì ít khi biết trước đâu là câu lệnh cuối.
+   - **Early Acknowledgement after Prepare**: khi **tất cả** participant đã vote YES, coordinator ghi quyết định COMMIT vào log của mình rồi **trả "commit thành công" cho client ngay**, sau đó mới gửi COMMIT tới participant (phase 2 chạy nền).
+      - *"Còn cơ chế ghi log và redo thì sao?"* → An toàn vì: (1) mỗi participant khi vote YES đã **force-write PREPARE record** xuống WAL của nó (đảm bảo có thể commit kể cả sau khi crash), (2) coordinator đã **force-write COMMIT decision** trước khi ack client. Nếu participant crash sau đó, khi recovery nó thấy txn ở trạng thái *prepared* (in-doubt) → hỏi coordinator → nhận COMMIT → redo/hoàn tất. Nếu coordinator crash, nó đọc lại log quyết định và gửi lại COMMIT. Kết quả: độ trễ client giảm 1 round-trip, durability không đổi.
+   - **Presumed Abort / Presumed Commit**: quy ước mặc định khi không tìm thấy log của txn → giảm số lần force-write log và số message (Presumed Abort được dùng rộng rãi, là chuẩn của X/Open XA).
+   - **Read-only participant**: participant chỉ đọc vote "READ-ONLY" ở phase 1 và được bỏ qua ở phase 2.
+- **Trong thực tế**: XA transaction (MySQL `XA START/PREPARE/COMMIT`, JTA trong Java EE), PostgreSQL `PREPARE TRANSACTION` / `COMMIT PREPARED` — cẩn thận "prepared transaction bị bỏ quên" giữ lock và chặn VACUUM.
 ##### B. Three-Phase Commit (3PC - Giao thức 3 pha)
 - **Cơ chế**: Sinh ra để khắc phục nhược điểm "Treo cứng" của 2PC. Bằng cách cài thêm quy định về Timeout chặt chẽ hơn và chèn một pha đệm gọi là **Pre-Commit** nằm ở giữa. (Sơ đồ: `CanCommit` $\rightarrow$ `PreCommit` $\rightarrow$ `DoCommit`).
 - **Đặc điểm**: Nhờ pha pre-commit, khi Coordinator bị sụp, các participants có thể sử dụng timeout để tự đưa ra quyết định commit/abort tập thể, khắc phục blocking state.
 - **Thực tế**: I/O cost và số network round-trip tăng đáng kể, khiến 3PC quá chậm cho môi trường thực tế. **Hầu như không có DBMS thực tế nào triển khai 3PC**. Thay vào đó, các hệ NewSQL (Spanner, TiDB, CockroachDB) vẫn dùng 2PC nhưng gia cố bằng giải thuật đồng thuận (Raft/Paxos) cho **Coordinator replication**, loại bỏ Single Point of Failure.
 
 
-##### C. Viewstamped replication
+##### C. Viewstamped Replication (VR)
+- Do Brian Oki & Barbara Liskov đề xuất năm **1988** — **sớm hơn** bài báo Paxos được công bố (1998), giải quyết cùng bài toán state machine replication với ý tưởng tương tự; bản "VR Revisited" (2012) rất dễ đọc.
+- **Mô hình**: 1 **primary** + các **backup**; thời gian chia thành các **view** (giống *term* của Raft) — mỗi view có đúng 1 primary được xác định tất định (round-robin theo view number).
+- **Normal case**: primary gán số thứ tự (op-number) cho request, gửi `PREPARE` tới backup; nhận `PREPAREOK` từ **f** backup (tổng f+1 trên 2f+1 replica = quorum) → commit, trả kết quả.
+- **View change**: backup không nghe primary trong timeout → khởi động view mới; primary mới thu log từ quorum, chọn log mới nhất rồi tiếp tục.
+- Ý nghĩa: Raft về bản chất rất gần với VR (leader, term/view, quorum, log replication).
 
 ##### D. Paxos
 
@@ -3000,7 +4202,7 @@ Federated(Liên bang)
 
 Trong một hệ thống phân tán **(N nodes, có thể crash bất kỳ lúc nào)**, làm sao để đảm bảo:
 - **Safety**: Chỉ **một** giá trị được chọn — không bao giờ có 2 node chọn 2 giá trị khác nhau
-- **Liveness**: Nếu còn **đa số node** (`> N/2`) còn sống, tiến trình cuối cùng phải hoàn thành
+- **Liveness**: Nếu còn **đa số node** (`> N/2`) còn sống và liên lạc được, tiến trình *nên* hoàn thành. ⚠️ Paxos **luôn đảm bảo Safety** nhưng **không đảm bảo Liveness** trong mọi trường hợp — đúng như **định lý FLP** (1985): trong hệ bất đồng bộ, không thuật toán đồng thuận tất định nào vừa an toàn vừa chắc chắn kết thúc nếu có dù chỉ 1 node có thể crash. Thực tế dùng timeout ngẫu nhiên + leader để "gần như luôn" kết thúc (xem Dueling Proposers bên dưới).
 
 ###### Các vai trong Paxos
 
@@ -3118,18 +4320,37 @@ P2: PREPARE(n=4) → ...
 
 > 📌 **Quan hệ thực tế**: **Google Spanner, CockroachDB** dùng **2PC cho Atomic Commit** (đảm bảo ACID), nhưng dùng **Paxos/Raft để làm Coordinator "bất tử"** — giải quyết chính xác điểm yếu Single Point of Failure của 2PC thuần túy.
 
-##### E. ZAB
+##### E. ZAB (ZooKeeper Atomic Broadcast)
+- Giao thức đồng thuận riêng của **ZooKeeper** (dùng trong Kafka cũ ≤ 3.x, HBase, Hadoop...). Mục tiêu là **atomic broadcast** có thứ tự toàn cục: mọi server áp dụng các thay đổi theo **cùng một thứ tự**, và giữ thứ tự FIFO theo từng client.
+- Mỗi transaction có **zxid** 64-bit = `epoch` (32 bit cao — tăng mỗi khi có leader mới) + `counter` (32 bit thấp).
+- **3 pha**:
+   1. **Discovery / Leader election**: chọn leader có lịch sử (zxid) mới nhất; leader lấy epoch mới.
+   2. **Synchronization**: leader đồng bộ các follower về đúng lịch sử của mình (gửi diff/truncate/snapshot).
+   3. **Broadcast**: leader nhận write → gửi `PROPOSAL` → nhận `ACK` từ quorum → gửi `COMMIT`. Giống 2PC nhưng **chỉ cần quorum** (không cần tất cả), nên không bị block khi một số follower chết.
+- **Đọc** ZooKeeper được phục vụ bởi bất kỳ server nào → có thể stale; cần `sync()` trước khi đọc nếu muốn thấy dữ liệu mới nhất.
+- So với Raft: rất giống (leader + quorum + epoch/term), khác chủ yếu ở cách bầu leader và đồng bộ lịch sử.
 
 ##### F. Raft
-Cải tiến của Paxos
+- Diego Ongaro & John Ousterhout, 2014 — **"In Search of an Understandable Consensus Algorithm"**: mục tiêu chính là **dễ hiểu và dễ cài đặt đúng** hơn Multi-Paxos, bằng cách tách bài toán thành 3 phần độc lập:
+   1. **Leader election**: mỗi node là Follower/Candidate/Leader; follower không nhận heartbeat trong **election timeout ngẫu nhiên** (150–300 ms) → tăng `term`, thành Candidate, xin phiếu `RequestVote`. Mỗi node chỉ bầu **1 phiếu mỗi term**, và **chỉ bầu cho candidate có log ít nhất mới bằng mình** (so sánh term của entry cuối, rồi tới index).
+   2. **Log replication**: leader nhận lệnh → append vào log → gửi `AppendEntries` (kèm `prevLogIndex`, `prevLogTerm`) → khi **đa số** đã lưu thì entry được **committed** → apply vào state machine. Follower có log lệch bị leader ghi đè lùi dần cho khớp (**Log Matching Property**: 2 log có entry cùng index & term thì mọi entry trước đó giống nhau).
+   3. **Safety**: leader chỉ coi entry là committed nếu entry đó thuộc **term hiện tại** và đã ở đa số (entry của term cũ được commit gián tiếp) → tránh trường hợp mất dữ liệu đã commit khi leader thay đổi liên tục.
+- Các phần mở rộng thực tế: **log compaction / snapshot**, **membership change** (joint consensus hoặc thêm/bớt từng node một), **PreVote** (tránh node bị cô lập tăng term vô cớ làm xáo trộn cluster), **leader lease / ReadIndex** (đọc linearizable mà không phải ghi log).
+- Ứng dụng: **etcd** (Kubernetes), Consul, CockroachDB, TiKV/TiDB, YugabyteDB, **Kafka KRaft** (Kafka 4.0 đã bỏ hẳn ZooKeeper), MongoDB replica set (giao thức dựa trên Raft từ 3.2), RabbitMQ quorum queues.
+- Xem thêm phần Raft trong `SystemDesign.md` (mục 11.7).
 
-#### 18.7. CAP Theorem
+#### 19.7. CAP Theorem
 
-**CAP Theorem** (Brewer's Theorem, 2000) phát biểu rằng một hệ thống phân tán **không thể đảm bảo đồng thời cả 3 thuộc tính** sau cùng một lúc — chỉ có thể đảm bảo tối đa 2 trong 3:
+> 🎯 **Bài toán:** Mạng giữa các bản sao bị đứt. Client vẫn gửi request tới cả hai phía. Trả lời bằng dữ liệu có thể cũ, hay từ chối?
+>
+> 💡 CAP nói rằng **khi có network partition** không thể vừa luôn trả lời (A) vừa luôn trả dữ liệu mới nhất (C). PACELC bổ sung: **ngay cả khi mạng bình thường**, muốn nhất quán mạnh thì phải chờ đồng bộ → tốn latency. Đây là khung để **giải thích lựa chọn của từng hệ thống**, không phải để "chọn 2 trong 3".
+
+
+**CAP Theorem** (Eric Brewer phỏng đoán năm 2000, Gilbert & Lynch chứng minh hình thức năm 2002) phát biểu rằng một hệ thống phân tán **không thể đảm bảo đồng thời cả 3 thuộc tính** sau cùng một lúc — chỉ có thể đảm bảo tối đa 2 trong 3:
 
 | Thuộc tính | Ký hiệu | Ý nghĩa |
 |---|---|---|
-| **Consistency** | C | Mọi node đều trả về cùng một giá trị dữ liệu mới nhất cho mọi request. Đọc sau ghi luôn thấy bản ghi mới nhất. |
+| **Consistency** | C | Mọi node đều trả về cùng một giá trị dữ liệu mới nhất cho mọi request. Đọc sau ghi luôn thấy bản ghi mới nhất. Chính xác hơn: **linearizability** — khác hẳn chữ C trong ACID (ràng buộc toàn vẹn). |
 | **Availability** | A | Mọi request hợp lệ đều nhận được phản hồi (không timeout, không lỗi) — dù dữ liệu có thể không phải mới nhất. |
 | **Partition Tolerance** | P | Hệ thống tiếp tục hoạt động dù mạng bị phân mảnh (một số node mất kết nối với nhau). |
 
@@ -3253,7 +4474,7 @@ N2 so sánh với local (VC=[1,1,0], x=15):
 
 - **Xử lý Conflict khi phát hiện `A ∥ B`**:
   - **Merge tự động**: Nếu data structure hỗ trợ (VD: Set → Union, Counter → Sum). Ví dụ: **CRDT (Conflict-free Replicated Data Types)** trong Riak, Redis, và các database hiện đại.
-  - **Trả về cả 2 version cho client**: Client application tự quyết định version nào đúng (chiến lược của **Amazon DynamoDB** và **Riak** — trả về "siblings"). Phù hợp với Shopping Cart: merge 2 giỏ hàng bằng Union.
+  - **Trả về cả 2 version cho client**: Client application tự quyết định version nào đúng (chiến lược của hệ thống **Dynamo** trong paper Amazon 2007 và **Riak** — trả về "siblings"; lưu ý dịch vụ **Amazon DynamoDB** hiện nay dùng last-writer-wins chứ không trả siblings). Phù hợp với Shopping Cart: merge 2 giỏ hàng bằng Union.
   - **Last Write Wins as fallback**: Dùng LWW chỉ khi không thể resolve theo cách khác.
 
 - **Nhược điểm của Vector Clock**:
@@ -3275,7 +4496,7 @@ N2 so sánh với local (VC=[1,1,0], x=15):
 
 > 📌 **Lưu ý quan trọng — PACELC Theorem**: CAP chỉ mô tả behavior khi có Partition. **PACELC** (2012) bổ sung: ngay cả khi **không có Partition (PC)**, hệ thống phải trade-off giữa **Latency (L)** và **Consistency (C)**. Ví dụ: Synchronous replication = strong consistency nhưng latency cao; Asynchronous replication = latency thấp nhưng chỉ đạt eventual consistency.
 
-#### 18.8. Join in distributed system
+#### 19.8. Join in distributed system
    - **Broadcast Join (Replication Join):** 
       - Áp dụng: Khi có 1 bảng đủ nhỏ (có thể fit vừa RAM của các worker node).
       - Cơ chế: Ta broadcast (sao chép và gửi) toàn bộ data từ bảng nhỏ đó tới tất cả các node đang chứa partition của bảng lớn, sau đó thực hiện join độc lập ở từng node.
@@ -3287,7 +4508,7 @@ N2 so sánh với local (VC=[1,1,0], x=15):
       - Tối ưu: Có một số dịch vụ giúp ta tách riêng khâu shuffle data để xử lý độc lập (như *External Shuffle Service*), giúp lưu kết quả trung gian ổn định để các node thực thi step tiếp theo không bị chết chùm nếu gặp lỗi.
 
 
-#### 18.8. Parquet File Format
+#### 19.9. Parquet File Format
 
 ##### A. Parquet là gì?
 
@@ -3470,3 +4691,220 @@ Footer Metadata:
 | **Đọc toàn bộ row** (`SELECT *`) | Columnar phải ghép dữ liệu từ nhiều cột → overhead | Row-based format, Avro |
 | **Streaming data** | Parquet cần biết toàn bộ data trước khi write (để tính statistics) | Avro, JSON, Protobuf |
 | **File rất nhỏ** (< vài MB) | Overhead metadata/footer lớn hơn lợi ích nén | CSV, JSON |
+
+✅ **Nguyên tắc chọn:** Chỉ phân tán khi thật cần — một node PostgreSQL/MySQL tốt + read replica phục vụ được rất xa (xem playbook ở `SystemDesign.md` 6.3). Khi cần, chọn mức nhất quán theo **nghiệp vụ**: tiền/tồn kho cần nhất quán mạnh (consensus, chấp nhận độ trễ); feed/đếm lượt xem chấp nhận eventual consistency để đổi lấy availability và latency thấp.
+
+> 🛠 **Áp dụng:**
+> - Đọc từ replica → phải xử lý *read-your-writes* (19.4).
+> - Chọn shard key quyết định gần như mọi thứ về sau (19.3, `SystemDesign.md` 6.3).
+> - Tránh transaction xuyên service/shard; nếu buộc phải có thì dùng Saga/Outbox thay vì 2PC (`SystemDesign.md` 3.6, 5.3).
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Vì sao 2PC "chặn" (blocking) còn Raft thì không?**
+   → 2PC cần **tất cả** participant và phụ thuộc vào một coordinator: coordinator chết sau khi participant đã vote YES thì không ai dám tự quyết. Raft chỉ cần **đa số**, và tự bầu leader mới.
+2. **Vì sao trong CAP, P không phải là thứ "chọn bỏ" được?**
+   → Mạng giữa các node có thể đứt bất kỳ lúc nào; hệ phân tán phải quyết định làm gì khi điều đó xảy ra — từ chối (C) hay vẫn phục vụ dữ liệu có thể cũ (A).
+</details>
+
+
+---
+
+### 20. Database thực chiến: MySQL InnoDB & PostgreSQL
+
+> 🎯 Chương này nối lý thuyết với các **tình huống thực tế** khi làm backend. Mỗi mục trả lời: *triệu chứng gì → nguyên nhân gốc (từ chương nào) → cách xử lý*. Ví dụ: quy tắc leftmost prefix (20.2) là hệ quả trực tiếp của cách B+Tree sắp xếp composite key (chương 8); bloat & VACUUM (20.7) là cái giá của MVCC kiểu append-only (16.2.7); gap lock (20.5) là cách InnoDB chống phantom (16.2.4).
+
+
+> Phần này nối lý thuyết ở các chương trước với những gì hay gặp khi làm Backend và khi phỏng vấn.
+
+#### 20.1. So sánh kiến trúc InnoDB vs PostgreSQL
+| | MySQL InnoDB | PostgreSQL |
+|---|---|---|
+| Process model | 1 process, **thread per connection** (14.2) | **Process per connection** (14.1) → cần connection pooler (PgBouncer) khi nhiều kết nối |
+| Tổ chức bảng | **Clustered index** theo PK (3.4, 8.1): dữ liệu nằm trong leaf của PK | **Heap** + mọi index đều là secondary (trỏ `ctid`) |
+| Secondary index trỏ tới | Giá trị **primary key** → lookup 2 lần (secondary → PK → row) | **Vị trí vật lý** (`ctid`) |
+| MVCC | Bản mới nhất nằm tại chỗ, bản cũ ở **undo log** (delta, N2O) | **Append-only**: mọi version nằm trong heap (O2N) — 16.2.7 |
+| Dọn rác | **Purge thread** dọn undo log | **VACUUM / autovacuum** dọn dead tuple |
+| Isolation mặc định | Repeatable Read | Read Committed |
+| Serializable | 2PL (mọi SELECT thành locking read) | **SSI** (không block, abort khi có nguy cơ) |
+| Log | **Redo log** (physical/physiological) + **undo log** + **binlog** (logical, cho replication) | **WAL** (physical, dùng cho cả recovery lẫn replication) |
+| Replication | Binlog (row-based), GTID, Group Replication | Streaming (physical) + Logical replication |
+| Index types | B+Tree, Full-text, Spatial (R-Tree), Hash (adaptive, nội bộ) | B-Tree, Hash, **GIN**, **GiST**, **SP-GiST**, **BRIN**, + extension (pgvector...) |
+| Điểm mạnh | Đơn giản vận hành, đọc theo PK rất nhanh, replication phổ biến (Vitess) | Tính năng phong phú (JSONB, CTE, window, extension, partial/expression index), optimizer mạnh cho query phức tạp |
+
+> Phiên bản (tính đến giữa 2026): MySQL **8.4 LTS** (MySQL 8.0 hết hỗ trợ 4/2026; nhánh 9.x là "Innovation"), PostgreSQL **18** (9/2025: async I/O, `uuidv7()`, B-tree **skip scan**, virtual generated columns). Kiểm tra lại release notes khi phỏng vấn.
+
+#### 20.2. Thiết kế Index — các quy tắc thực tế
+1. **Chọn Primary Key cho InnoDB cẩn thận**: mọi secondary index đều chứa PK → PK to (UUID dạng `VARCHAR(36)`) làm phình **mọi** index. PK ngẫu nhiên (UUIDv4) → insert rải rác → page split, buffer pool kém hiệu quả. Ưu tiên `BIGINT AUTO_INCREMENT` hoặc UUIDv7 lưu `BINARY(16)`.
+2. **Composite index & quy tắc leftmost prefix**: index `(a, b, c)` dùng được cho `WHERE a=?`, `a=? AND b=?`, `a=? AND b=? AND c=?`, `a=? AND b>?`... nhưng **không** dùng hiệu quả cho `WHERE b=?` hay `WHERE c=?` (vì B+Tree sort theo a trước).
+    - Ngoại lệ: **skip scan** — MySQL 8.0.13+ và PostgreSQL 18 có thể "nhảy" qua từng giá trị distinct của cột đầu nếu cột đầu có ít giá trị.
+    - **Thứ tự cột**: cột so sánh **bằng (=)** trước, cột **range** (`>`, `<`, `BETWEEN`, `LIKE 'x%'`) **sau cùng** — cột đứng sau cột range không còn dùng để seek được. Kèm cột `ORDER BY` để tránh sort: `WHERE status = ? ORDER BY created_at` → index `(status, created_at)`.
+3. **Covering index**: index chứa mọi cột query cần → không phải quay lại bảng (MySQL `Extra: Using index`, PG `Index Only Scan`). PostgreSQL 11+ dùng `INCLUDE (...)` (8.4.4).
+4. **Khi nào index KHÔNG được dùng** (hay bị hỏi):
+    | Nguyên nhân | Ví dụ | Cách sửa |
+    |---|---|---|
+    | Hàm/biểu thức trên cột | `WHERE DATE(created_at) = '2026-01-01'`, `WHERE LOWER(email) = ?` | Viết lại thành range `created_at >= '2026-01-01' AND created_at < '2026-01-02'`; hoặc **expression index** (`CREATE INDEX ON users (LOWER(email))`, MySQL 8 functional index) |
+    | Ép kiểu ngầm | Cột `VARCHAR` so với số: `WHERE phone = 0901234567` (MySQL ép từng dòng sang số) | Truyền đúng kiểu `'0901234567'` |
+    | Wildcard đầu | `LIKE '%abc'` | Full-text index, trigram (`pg_trgm` + GIN), reverse string |
+    | Selectivity thấp | `WHERE gender = 'F'` (50% dòng) | Optimizer chọn seq scan là **đúng** — không phải lỗi |
+    | `OR` trên nhiều cột | `WHERE a = 1 OR b = 2` | Index riêng cho a, b (bitmap OR / index merge) hoặc `UNION ALL` |
+    | Không thỏa leftmost prefix | Index `(a,b)` nhưng `WHERE b = ?` | Thêm index phù hợp |
+    | Statistics cũ | Bảng vừa nạp nhiều dữ liệu | `ANALYZE` (PG) / `ANALYZE TABLE` (MySQL) |
+    | `!=`, `NOT IN` | Thường quét phần lớn index | Xem lại logic / partial index |
+5. **Index không miễn phí**: mỗi index làm chậm INSERT/UPDATE/DELETE, tốn disk & buffer pool, giảm khả năng HOT update (PG). Định kỳ tìm index không dùng (`pg_stat_user_indexes.idx_scan = 0`, MySQL `sys.schema_unused_indexes`) và index trùng lặp (`(a)` thừa khi đã có `(a, b)`).
+6. **Index đặc thù của PostgreSQL**: **partial index** (`WHERE status = 'PENDING'`), **GIN** cho JSONB/array/full-text, **GiST** cho geometry/range (exclusion constraint chống đặt phòng trùng giờ), **BRIN** cho bảng rất lớn có dữ liệu tương quan với thứ tự vật lý (log theo thời gian — index chỉ vài KB).
+7. **InnoDB Index Condition Pushdown (ICP)**: với index `(a, b)` và `WHERE a = 1 AND b LIKE '%x%'`, engine lọc `b` ngay trên index entry trước khi đọc row → bớt lookup (`Extra: Using index condition`).
+
+#### 20.3. Đọc EXPLAIN
+**MySQL** — `EXPLAIN` / `EXPLAIN ANALYZE` (8.0.18+) / `EXPLAIN FORMAT=TREE`:
+| Cột | Ý nghĩa |
+|---|---|
+| `type` (tốt → xấu) | `system` > `const` (PK/unique = hằng) > `eq_ref` (join theo PK/unique) > `ref` (index không unique) > `range` > `index` (quét **toàn bộ index**) > `ALL` (**full table scan**) |
+| `key` / `key_len` | Index được chọn / số byte của index được dùng (suy ra dùng bao nhiêu cột của composite index) |
+| `rows`, `filtered` | Số dòng ước lượng phải đọc / % còn lại sau WHERE |
+| `Extra` | `Using index` (covering ✅), `Using where`, `Using index condition` (ICP), ⚠️ `Using filesort` (sort thêm), ⚠️ `Using temporary` (bảng tạm cho GROUP BY/DISTINCT) |
+
+**PostgreSQL** — `EXPLAIN (ANALYZE, BUFFERS)`:
+```text
+Index Scan using idx_orders_customer on orders  (cost=0.43..8.45 rows=3 width=64) (actual time=0.021..0.025 rows=2 loops=1)
+  Index Cond: (customer_id = 42)
+  Buffers: shared hit=4
+Planning Time: 0.1 ms   Execution Time: 0.05 ms
+```
+- `cost=startup..total` (đơn vị tương đối, theo `seq_page_cost=1`), `rows` ước lượng vs `actual rows` thực tế — **lệch lớn = statistics sai** (15.3.3).
+- `loops`: node chạy bao nhiêu lần (bên trong nested loop) → thời gian thật = `actual time × loops`.
+- `Buffers: shared hit` (từ buffer pool) vs `read` (từ disk/OS cache).
+- Node hay gặp: `Seq Scan`, `Index Scan`, `Index Only Scan` (xem `Heap Fetches`), `Bitmap Heap Scan`, `Nested Loop`, `Hash Join`, `Merge Join`, `Sort (external merge Disk: ...)`, `HashAggregate`, `Gather`.
+
+#### 20.4. Phân trang: OFFSET vs Keyset (Seek)
+```sql
+-- ❌ OFFSET lớn: DB vẫn phải đọc & bỏ qua 100000 dòng
+SELECT * FROM posts ORDER BY created_at DESC, id DESC LIMIT 20 OFFSET 100000;
+
+-- ✅ Keyset: nhớ (created_at, id) của dòng cuối trang trước; index (created_at, id)
+SELECT * FROM posts
+WHERE (created_at, id) < ('2026-05-01 10:00:00', 98765)   -- row value comparison (PG, MySQL 8)
+ORDER BY created_at DESC, id DESC LIMIT 20;
+```
+- Thêm `id` làm **tie-breaker** để thứ tự là duy nhất (nhiều post cùng `created_at`).
+- Nhược điểm keyset: không nhảy thẳng tới "trang 57" được → phù hợp infinite scroll / API cursor.
+
+#### 20.5. Locking trong InnoDB (Repeatable Read)
+| Loại lock | Khóa gì | Mục đích |
+|---|---|---|
+| **Record lock** | 1 entry trong index | Khóa dòng (thực chất khóa trên **index record**, không phải trên "row") |
+| **Gap lock** | Khoảng trống giữa 2 index record | Chặn INSERT vào khoảng → chống phantom |
+| **Next-key lock** | Record + gap phía trước nó | Mặc định khi locking read/UPDATE/DELETE ở RR |
+| **Insert intention lock** | Gap lock đặc biệt khi INSERT | Nhiều insert vào cùng gap ở vị trí khác nhau không chặn nhau |
+| **Intention lock (IS/IX)** | Cấp bảng | Phân cấp lock (16.2.1-D) |
+| **AUTO-INC lock** | Bộ đếm auto increment | `innodb_autoinc_lock_mode = 2` (mặc định 8.0): interleaved, không khóa cả statement |
+
+- ⚠️ **UPDATE/DELETE với WHERE không có index phù hợp** → InnoDB phải quét và **khóa mọi dòng đã quét** (gần như khóa cả bảng ở RR).
+- Ví dụ gap lock gây "deadlock khó hiểu":
+    ```sql
+    -- Bảng t có index trên id; đang có id = 10, 20
+    -- T1: SELECT * FROM t WHERE id = 15 FOR UPDATE;   -- không có dòng 15 → khóa gap (10, 20)
+    -- T2: SELECT * FROM t WHERE id = 16 FOR UPDATE;   -- gap lock tương thích nhau → cũng khóa (10, 20)
+    -- T1: INSERT INTO t (id) VALUES (15);             -- chờ vì T2 giữ gap
+    -- T2: INSERT INTO t (id) VALUES (16);             -- chờ vì T1 giữ gap → DEADLOCK
+    ```
+    Pattern "kiểm tra không tồn tại rồi insert" nên thay bằng `INSERT ... ON DUPLICATE KEY` / `UNIQUE` constraint + bắt lỗi.
+- **Debug deadlock**: `SHOW ENGINE INNODB STATUS` (mục *LATEST DETECTED DEADLOCK*), `innodb_print_all_deadlocks = ON`; `performance_schema.data_locks` (8.0).
+- **Phòng tránh deadlock**: truy cập các dòng theo **thứ tự nhất quán** (vd sort theo id trước khi update hàng loạt), transaction ngắn, có index cho WHERE, retry transaction khi gặp lỗi 1213.
+- **PostgreSQL row lock**: `FOR UPDATE` > `FOR NO KEY UPDATE` (UPDATE thường lấy mức này) > `FOR SHARE` > `FOR KEY SHARE` (FK check lấy mức này → không xung đột với UPDATE thường). Không có gap lock (dùng SSI cho Serializable). **Advisory lock** (`pg_advisory_xact_lock(key)`) cho khóa nghiệp vụ tùy ý.
+- **Job queue trong DB**: `SELECT ... FROM jobs WHERE status = 'NEW' ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED;` (PG 9.5+, MySQL 8.0+) — nhiều worker lấy job song song không chặn nhau. `NOWAIT` → báo lỗi ngay thay vì chờ.
+
+#### 20.6. Table Partitioning
+- **Range** (theo thời gian — phổ biến nhất), **List** (theo vùng/tenant), **Hash** (chia đều).
+- Lợi ích: **partition pruning** (query có điều kiện trên partition key chỉ quét partition liên quan), xóa dữ liệu cũ tức thì (`DROP/DETACH PARTITION` thay vì `DELETE` hàng triệu dòng → không bloat, không undo log khổng lồ), maintenance (VACUUM/index) theo từng partition.
+- Lưu ý: query **không** có partition key phải quét mọi partition; PK/UNIQUE phải chứa partition key (cả PG lẫn MySQL); quá nhiều partition (hàng nghìn) làm planning chậm.
+- Partitioning (trong 1 node) ≠ **Sharding** (chia ra nhiều node — 19.3).
+
+#### 20.7. VACUUM, Bloat & các vấn đề vận hành MVCC
+- **PostgreSQL**:
+    - UPDATE/DELETE để lại **dead tuple** → `autovacuum` dọn và đánh dấu chỗ trống tái sử dụng (không trả lại disk cho OS; `VACUUM FULL` / `pg_repack` mới thu nhỏ file nhưng `VACUUM FULL` khóa bảng).
+    - **Transaction ID wraparound**: XID 32-bit (~4 tỷ, so sánh theo vòng tròn 2^31) → tuple cũ phải được **freeze** trước khi hết vòng; nếu autovacuum không theo kịp, PG buộc phải dừng nhận ghi để bảo vệ dữ liệu. Theo dõi `age(datfrozenxid)`.
+    - Theo dõi: `pg_stat_user_tables` (`n_dead_tup`, `last_autovacuum`), tinh chỉnh `autovacuum_vacuum_scale_factor` cho bảng lớn.
+- **InnoDB**: version cũ nằm trong undo log; **purge** dọn khi không còn read view nào cần. Theo dõi **History list length** trong `SHOW ENGINE INNODB STATUS` — tăng liên tục = có transaction mở quá lâu.
+- ⚠️ **Long-running transaction là kẻ thù chung**: 1 transaction (hoặc session `idle in transaction`) mở hàng giờ → VACUUM/purge không dọn được mọi version mới hơn snapshot của nó → bloat, chậm toàn hệ thống, replica lag (PG hot standby với `hot_standby_feedback`). Đặt `idle_in_transaction_session_timeout`, `statement_timeout`; không gọi API bên ngoài trong transaction.
+
+#### 20.8. Connection Management
+- Mỗi connection PostgreSQL là 1 **process** (~vài MB RAM, chi phí fork) → không nên có hàng nghìn connection trực tiếp. Dùng **PgBouncer** (transaction pooling: nhiều client dùng chung ít server connection; lưu ý không dùng được session state như `SET`, advisory lock theo session, prepared statement — PgBouncer 1.21+ đã hỗ trợ prepared statement ở protocol level).
+- Kích thước pool phía app (HikariCP): **nhỏ hơn bạn nghĩ** — công thức gợi ý của HikariCP wiki: `connections = (core_count × 2) + effective_spindle_count`. Pool quá lớn → context switch & lock contention trong DB tăng, throughput giảm. Tổng connection của **mọi instance app** cộng lại phải < `max_connections`.
+- Xem `SpringBoot.md` mục HikariCP.
+
+#### 20.9. Redo, Undo, Binlog & Doublewrite trong MySQL
+- **Redo log**: WAL của InnoDB (17.3) — đảm bảo durability; ghi tuần tự, vòng tròn. `innodb_flush_log_at_trx_commit`: `1` = fsync mỗi commit (an toàn, mặc định), `2` = ghi vào OS cache mỗi commit, fsync mỗi giây (mất ≤ 1s khi OS crash), `0` = ghi + fsync mỗi giây.
+- **Undo log**: lưu before-image để rollback và phục vụ MVCC (đọc version cũ).
+- **Binlog**: log **logical** ở tầng server MySQL (không phải InnoDB) cho replication & point-in-time recovery. `sync_binlog = 1` để fsync mỗi commit.
+- **Internal 2PC giữa redo log và binlog** (để 2 log luôn nhất quán): (1) InnoDB **prepare** (ghi redo với trạng thái prepare) → (2) ghi **binlog** → (3) InnoDB **commit**. Khi crash recovery: transaction đã prepare mà có trong binlog → commit; không có trong binlog → rollback. Group commit gom nhiều transaction cho mỗi bước fsync.
+- **Doublewrite buffer**: chống torn page (3.3).
+
+#### 20.10. Thay đổi schema online (Zero-downtime migration)
+- **PostgreSQL**: `CREATE INDEX CONCURRENTLY` (không khóa ghi, chậm hơn, không chạy trong transaction); `ADD COLUMN` có `DEFAULT` hằng số là tức thì từ PG 11; luôn đặt `SET lock_timeout = '5s'` trước DDL để tránh xếp hàng chặn mọi query sau nó.
+- **MySQL 8**: `ALGORITHM=INSTANT` (thêm cột — 8.0.29+ thêm ở vị trí bất kỳ), `ALGORITHM=INPLACE, LOCK=NONE` cho nhiều thao tác index; bảng rất lớn dùng **gh-ost** / **pt-online-schema-change** (tạo bảng shadow, copy dần, đồng bộ thay đổi rồi swap).
+- **Expand–Contract pattern** (đổi tên/đổi kiểu cột không downtime): (1) thêm cột mới, (2) code ghi cả 2 cột, (3) backfill dữ liệu cũ theo batch, (4) code đọc cột mới, (5) bỏ ghi cột cũ, (6) drop cột cũ. Mỗi bước deploy độc lập và rollback được.
+- Công cụ quản lý migration: Flyway, Liquibase.
+
+#### 20.11. Checklist xử lý Slow Query
+1. Tìm query chậm: MySQL **slow query log** (`long_query_time`), `performance_schema.events_statements_summary_by_digest`; PostgreSQL **`pg_stat_statements`**, `log_min_duration_statement`, `auto_explain`.
+2. `EXPLAIN ANALYZE` → tìm node tốn thời gian nhất, so sánh `rows` ước lượng vs thực tế.
+3. Thiếu index / index sai thứ tự cột / index không dùng được (20.2)?
+4. Đọc quá nhiều dữ liệu: `SELECT *`, thiếu `LIMIT`, OFFSET lớn, N+1 query từ ORM.
+5. Sort/hash spill xuống disk → tăng `work_mem` cho session đó hoặc thêm index phục vụ ORDER BY.
+6. Lock contention: query nhanh nhưng phải **chờ lock** (`pg_stat_activity.wait_event`, `pg_locks`; MySQL `sys.innodb_lock_waits`).
+7. Statistics cũ → `ANALYZE`; data skew → extended statistics / histogram.
+8. Vấn đề hệ thống: bloat, buffer pool quá nhỏ, I/O bão hòa, quá nhiều connection, replica lag.
+9. Thay đổi ở tầng thiết kế: cache (Redis), denormalize, materialized view, read replica, partitioning, archive dữ liệu cũ.
+
+---
+
+### 21. Câu hỏi phỏng vấn Database thường gặp
+
+**Q1. Index là gì? Tại sao B+Tree mà không phải Hash/BST?**
+Index là cấu trúc phụ giúp tìm dòng mà không quét cả bảng. B+Tree có fan-out lớn → cây rất thấp (3–4 lần I/O cho hàng tỷ dòng), dữ liệu sorted → hỗ trợ range query, ORDER BY, prefix; leaf nối nhau → scan tuần tự. Hash chỉ hỗ trợ `=`; BST/AVL nhị phân quá cao và mỗi node là 1 lần I/O.
+
+**Q2. Clustered vs Non-clustered index?**
+Clustered: thứ tự vật lý của dữ liệu theo index key, dữ liệu nằm trong leaf → mỗi bảng chỉ có 1 (InnoDB: PK). Non-clustered: leaf chứa key + con trỏ (PK ở InnoDB, ctid ở PG) → cần thêm 1 bước lookup. PostgreSQL không có clustered index duy trì tự động (lệnh `CLUSTER` chỉ sắp xếp 1 lần).
+
+**Q3. Vì sao không nên dùng UUIDv4 làm PK trong MySQL?**
+Ngẫu nhiên → insert vào vị trí bất kỳ của B+Tree → page split, fragmentation, buffer pool kém; 16 byte (hoặc 36 byte nếu lưu chuỗi) và bị nhân bản vào mọi secondary index. Dùng BIGINT tăng dần hoặc UUIDv7/ULID (`BINARY(16)`).
+
+**Q4. ACID là gì, mỗi chữ được đảm bảo bởi cơ chế nào?**
+Atomicity — undo log / WAL + rollback (16.1, 17); Consistency — constraint + logic ứng dụng; Isolation — 2PL / MVCC / SSI (16.2); Durability — WAL + fsync + replication (17, 18).
+
+**Q5. Các isolation level và anomaly tương ứng? MySQL RR có chống phantom không?**
+Xem 16.2.5. MySQL RR: SELECT thường đọc snapshot (không thấy phantom); locking read dùng next-key lock chặn insert vào khoảng. Nhưng **không** chống được lost update dạng read-modify-write và write skew.
+
+**Q6. MVCC hoạt động thế nào? Khác nhau giữa MySQL và PostgreSQL?**
+Writer tạo version mới, reader đọc version phù hợp snapshot → đọc không chặn ghi. MySQL: bản mới tại chỗ + undo log (delta), purge dọn; PostgreSQL: mọi version trong heap, VACUUM dọn, secondary index phải cập nhật (trừ HOT). (16.2.6–16.2.9, 20.1)
+
+**Q7. Optimistic vs Pessimistic locking — khi nào dùng?**
+Pessimistic (`SELECT ... FOR UPDATE`): xung đột cao, critical section ngắn, cần chắc chắn (trừ tồn kho hot item). Optimistic (cột `version`, `UPDATE ... WHERE id=? AND version=?` → 0 dòng thì retry): xung đột thấp, tránh giữ lock lâu, phù hợp web (user edit form vài phút).
+
+**Q8. Deadlock là gì, DB xử lý ra sao, ứng dụng nên làm gì?**
+Chu trình chờ lock. DB phát hiện bằng wait-for graph và abort 1 victim (InnoDB, PG `deadlock_timeout`). Ứng dụng: thứ tự truy cập nhất quán, transaction ngắn, index đầy đủ, **retry** transaction bị chọn làm victim.
+
+**Q9. Làm sao scale database khi read tăng? khi write tăng?**
+Read: index + query tuning → cache → read replica (chú ý replication lag) → CQRS/read model. Write: tối ưu batch/async, partitioning, **sharding** (19.3), chuyển workload ghi nhiều sang LSM-based store, tách service/DB theo domain.
+
+**Q10. Sharding key chọn thế nào? Vấn đề khi sharding?**
+Cardinality cao, phân bố đều, phần lớn query có chứa key (tránh scatter-gather), ít cần transaction xuyên shard (vd `tenant_id`, `user_id`). Vấn đề: hot shard, cross-shard join/transaction (2PC/Saga), resharding, unique constraint toàn cục, sinh ID toàn cục (SystemDesign 11.5).
+
+**Q11. WAL là gì, vì sao ghi log lại nhanh hơn ghi thẳng data page?**
+Log ghi **tuần tự, append-only**, gom nhiều transaction trong 1 fsync (group commit); data page ghi ngẫu nhiên có thể hoãn lại (No-Force) và gom nhiều thay đổi vào 1 lần ghi. Khi crash, replay log (REDO) và hoàn tác txn chưa commit (UNDO). (17, 18)
+
+**Q12. Replication sync vs async? Read-your-writes?**
+Xem 19.4: sync an toàn nhưng chậm/kém sẵn sàng; async nhanh nhưng có lag và có thể mất dữ liệu khi failover; semi-sync là thỏa hiệp. Read-your-writes: đọc từ primary sau khi ghi hoặc theo dõi LSN/GTID.
+
+**Q13. N+1 query là gì?**
+Lấy N bản ghi cha rồi với mỗi bản ghi lại query con → N+1 lượt round-trip. Giải pháp: JOIN/`JOIN FETCH`, batch `WHERE id IN (...)`, `@EntityGraph`, DataLoader (GraphQL). Xem `SpringBoot.md` 7.2.
+
+**Q14. COUNT(*) trên bảng lớn chậm, làm sao?**
+InnoDB/PG đều phải quét (do MVCC mỗi transaction thấy số dòng khác nhau). Giải pháp: con số xấp xỉ từ statistics (`pg_class.reltuples`, `information_schema.tables.TABLE_ROWS`), bảng counter cập nhật bằng trigger/event, cache, hoặc index nhỏ nhất để quét.
+
+**Q15. SQL vs NoSQL — chọn thế nào?**
+SQL: dữ liệu quan hệ, cần transaction ACID, query linh hoạt/ad-hoc, ràng buộc toàn vẹn. NoSQL: access pattern biết trước theo key, scale ghi ngang khổng lồ, schema linh hoạt, chấp nhận eventual consistency. Thực tế thường dùng **polyglot persistence**: PostgreSQL làm nguồn chân lý + Redis cache + Elasticsearch search + Kafka/ClickHouse cho analytics. (SystemDesign 6.1)
+
+**Q16. Khi nào DB không dùng index dù có index?**
+Xem bảng 20.2.4 — selectivity thấp, hàm trên cột, ép kiểu, wildcard đầu, sai thứ tự cột, statistics cũ, bảng nhỏ (seq scan rẻ hơn).
