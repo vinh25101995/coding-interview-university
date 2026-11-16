@@ -1610,6 +1610,7 @@ Bạn không bao giờ thực sự học xong!
 
 
 - ### Bảo mật
+    - [Kiến trúc bảo mật: Lỗ hổng, Tấn công & Phòng thủ (kèm lưu ý Spring Boot)](../security-architecture-vi.md)
     - [MIT (23 videos)](https://www.youtube.com/playlist?list=PLUl4u3cNGP62K2DjQLRxDNRi0z2IRWnNh)
         - [Introduction, Threat Models](https://www.youtube.com/watch?v=GqmQg-cszw4&index=1&list=PLUl4u3cNGP62K2DjQLRxDNRi0z2IRWnNh)
         - [Control Hijacking Attacks](https://www.youtube.com/watch?v=6bwzNg5qQ0o&list=PLUl4u3cNGP62K2DjQLRxDNRi0z2IRWnNh&index=2)
