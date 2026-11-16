@@ -47,13 +47,13 @@ Mỗi chương được viết theo mạch **Bài toán → Cách giải → Áp
 ## Mục lục
 
 0. [✅ Checklist trọng tâm Spring Boot](#-checklist-trọng-tâm-spring-boot-đọc-theo-thứ-tự-ưu-tiên)
-1. [Kiến trúc Tổng quan Spring Framework & Spring Boot](#1-kiến-trúc-tổng-quan-spring-framework--spring-boot) (gồm Spring Boot 4 / Framework 7)
+1. [Kiến trúc Tổng quan Spring Framework & Spring Boot](#1-kiến-trúc-tổng-quan-spring-framework--spring-boot) (gồm **1.0 Bản đồ kiến trúc** và Spring Boot 4 / Framework 7)
 2. [IoC Container & Bean Lifecycle Internals](#2-ioc-container--bean-lifecycle-internals)
 3. [Circular Dependency & Three-Level Cache](#3-circular-dependency--three-level-cache)
 4. [Spring AOP & Proxy Mechanisms](#4-spring-aop--proxy-mechanisms)
 5. [Spring Boot Auto-Configuration Internals](#5-spring-boot-auto-configuration-internals)
 6. [Spring MVC Architecture & Request Lifecycle](#6-spring-mvc-architecture--request-lifecycle)
-7. [Spring Data JPA & Hibernate Internals](#7-spring-data-jpa--hibernate-internals)
+7. [Spring Data JPA & Hibernate Internals](#7-spring-data-jpa--hibernate-internals) (gồm **7.0 Kiến trúc tầng persistence**, mapping, flush, schema migration)
 8. [Quản lý Giao dịch (@Transactional Deep Dive)](#8-quản-lý-giao-dịch-transactional-deep-dive)
 9. [Spring Security Architecture & JWT Stateless Flow](#9-spring-security-architecture--jwt-stateless-flow)
 10. [Spring Kafka: Cấu hình, Producer, Consumer & Manual Partition Assignment](#10-spring-kafka-cấu-hình-producer-consumer--manual-partition-assignment)
@@ -75,6 +75,7 @@ Mỗi chương được viết theo mạch **Bài toán → Cách giải → Áp
 
 | Mức | Chủ đề | Phải giải thích được | Mục |
 | :--- | :--- | :--- | :--- |
+| ⭐⭐⭐ | **Bức tranh tổng thể** | Bản đồ module, luồng khởi động, đường đi của 1 request tới DB, 5 lớp của tầng persistence (Spring Data → JPA → Hibernate → JDBC → HikariCP) | 1.0, 7.0, 21-Q17–Q19 |
 | ⭐⭐⭐ | IoC / DI | IoC là gì, 3 cách inject & vì sao chọn constructor injection, `@Primary`/`@Qualifier` | 1.1, 21-Q7, Q8 |
 | ⭐⭐⭐ | Bean lifecycle & scope | Các bước tạo bean, BPP tạo proxy ở đâu, singleton có thread-safe không, prototype trong singleton | 2.2, 2.3, 2.4 |
 | ⭐⭐⭐ | AOP & Proxy | JDK proxy vs CGLIB, **self-invocation** làm mất `@Transactional/@Async/@Cacheable` | 4 |
@@ -83,7 +84,9 @@ Mỗi chương được viết theo mạch **Bài toán → Cách giải → Áp
 | ⭐⭐⭐ | JPA/Hibernate | Persistence context & dirty checking, **N+1**, lazy loading/OSIV, optimistic vs pessimistic lock, batch insert | 7 |
 | ⭐⭐⭐ | Request lifecycle | Filter → DispatcherServlet → HandlerMapping → Interceptor → Controller → MessageConverter; xử lý exception tập trung | 6 |
 | ⭐⭐⭐ | Thread model | Tomcat 200 thread, HikariCP pool, `@Async` executor, virtual threads — nút thắt nằm ở đâu | 6.4, 11, 13.1 |
-| ⭐⭐ | Security | Filter chain, authentication flow, JWT vs session, resource server, CSRF/CORS | 9 |
+| ⭐⭐ | Mapping & flush | Owning side/`mappedBy`, cascade vs orphanRemoval, flush khác commit, thứ tự SQL khi flush | 7.7, 7.8 |
+| ⭐⭐ | Schema migration | `ddl-auto=validate` + Flyway/Liquibase, expand → contract | 7.10 |
+| ⭐⭐ | Security | Filter chain, authentication flow, JWT vs session, resource server, CSRF/CORS, OAuth2/OIDC (Authorization Code + PKCE) | 9 |
 | ⭐⭐ | Configuration | Thứ tự ưu tiên property, profiles, `@ConfigurationProperties`, secrets | 14 |
 | ⭐⭐ | Messaging (Kafka) | Partition & key, consumer group, commit offset, retry/DLT, idempotent consumer | 10 |
 | ⭐⭐ | Resilience | Timeout, retry, circuit breaker, bulkhead | 16 |
@@ -105,6 +108,222 @@ Mỗi chương được viết theo mạch **Bài toán → Cách giải → Áp
 >
 > 💡 **Ý tưởng giải:** **Đảo ngược quyền điều khiển (IoC):** class chỉ **khai báo cần gì** (tham số constructor), một **container** tạo object và **tiêm** dependency vào. Class vẫn là POJO bình thường. Những việc lặp lại quanh business logic (transaction, security) được thêm vào bằng **proxy** (AOP) thay vì viết tay. **Spring Boot** giải bài toán tiếp theo: cấu hình hàng trăm bean hạ tầng — tự cấu hình theo những gì có trên classpath.
 
+
+### 1.0. Bản đồ kiến trúc — nhìn toàn cảnh trước khi đi vào chi tiết
+
+> 🎯 **Bài toán:** Học từng mảnh (bean lifecycle, proxy, N+1, propagation...) mà không biết mảnh đó **nằm ở đâu** trong hệ thống thì không ghép lại được: không trả lời nổi "request đi qua những gì?", "lỗi này thuộc tầng nào?", "ai tạo ra object này?".
+>
+> 💡 **Ý tưởng:** Nhìn Spring bằng **4 bản đồ**: (A) các module xếp chồng lên nhau thế nào, (B) lúc khởi động chuyện gì xảy ra, (C) một request đi qua những tầng nào, (D) code của bạn chia tầng ra sao. Mọi chương sau chỉ là phóng to một ô trên các bản đồ này.
+
+#### A. Bản đồ module: cái gì xây trên cái gì
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ Code của bạn: @RestController, @Service, @Repository, @Entity, @Configuration │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ SPRING BOOT        spring-boot (SpringApplication, embedded server, config)   │
+│ (lắp ráp)          spring-boot-autoconfigure (@Conditional — chương 5)        │
+│                    starters (gom dependency + BOM) · actuator (12) · loader   │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ CÁC DỰ ÁN RIÊNG    Spring Data (JPA, Redis, Mongo...) (7) · Spring Security   │
+│ (phiên bản riêng)  (9) · Spring Kafka (10) · Spring Cloud (20) · Spring Batch │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ SPRING FRAMEWORK                                                              │
+│   Web:          spring-web (HTTP, MessageConverter, RestClient)               │
+│                 spring-webmvc (DispatcherServlet — 6) · spring-webflux (18)   │
+│   Data access:  spring-tx (trừu tượng transaction — 8)                        │
+│                 spring-jdbc (JdbcTemplate/JdbcClient, DataSource utils)       │
+│                 spring-orm (tích hợp JPA/Hibernate: EntityManagerFactory,     │
+│                             JpaTransactionManager)                            │
+│   AOP:          spring-aop (proxy — 4) · spring-aspects (AspectJ)             │
+│   Core container (2, 3):                                                      │
+│                 spring-context (ApplicationContext, event, @Scheduled/@Async, │
+│                                 cache abstraction, validation)                │
+│                 spring-beans (BeanFactory, BeanDefinition, DI)                │
+│                 spring-core (Resource, Environment, type conversion)          │
+│                 spring-expression (SpEL: "#{...}", @PreAuthorize, @Cacheable) │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ Thư viện bên thứ ba: Tomcat · Hibernate · HikariCP · Jackson · JDBC driver    │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ JVM (xem Java.md)                                                             │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+Cách đọc bản đồ:
+- **Mọi thứ đều là bean trong IoC container.** `DataSource`, `EntityManagerFactory`, `DispatcherServlet`, `SecurityFilterChain`, `KafkaTemplate`... đều chỉ là bean. Hiểu container (chương 2) là hiểu cách mọi module được lắp vào.
+- **AOP là "keo dán" của tính năng khai báo.** `@Transactional`, `@Cacheable`, `@Async`, `@PreAuthorize`, `@Retryable` đều chạy theo một cơ chế: container bọc bean bằng proxy (chương 4). Vì vậy chúng có chung một bẫy self-invocation.
+- **Spring không tự làm việc nặng, nó tích hợp.** Tomcat xử lý HTTP, Hibernate làm ORM, HikariCP giữ connection, Jackson xử lý JSON. Spring cung cấp lớp trừu tượng thống nhất phía trên (ví dụ `PlatformTransactionManager` dùng chung cho JDBC, JPA, JTA).
+- **Spring Boot không thêm tính năng runtime mới.** Nó quyết định **bean nào được tạo** dựa trên classpath và property, rồi đóng gói thành một file JAR chạy được. Bỏ Spring Boot đi, bạn vẫn làm được mọi thứ, chỉ phải tự khai báo từng bean.
+- **Starter chỉ là danh sách dependency.** `spring-boot-starter-data-jpa` kéo về `spring-orm` + `spring-data-jpa` + Hibernate + HikariCP + `spring-tx`; code auto-config nằm ở module autoconfigure.
+
+#### B. Bản đồ khởi động: từ `main()` tới lúc nhận request
+
+Cùng quy ước với sơ đồ C bên dưới: **bên trái là class thật**, **bên phải là việc nó làm**.
+
+```
+main()
+└─ SpringApplication.run(App.class, args)
+│
+├─ ① CHUẨN BỊ
+│    SpringApplication ··················· đoán loại ứng dụng (Servlet / Reactive / None) từ classpath
+│    ConfigurableEnvironment ············· gom property: application.yml, biến môi trường, tham số,
+│                                          profile đang bật                                        [14]
+│    AnnotationConfigServletWebServerApplicationContext
+│                                          tạo IoC container cho ứng dụng web Servlet               [2.1]
+│
+├─ ② ĐỌC "BẢN THIẾT KẾ" — chưa có object nào được tạo
+│    ConfigurationClassPostProcessor ····· (một BeanFactoryPostProcessor) đọc @Configuration,
+│                                          quét @Component trong package của bạn                  [2.4]
+│    AutoConfigurationImportSelector ····· đọc file AutoConfiguration.imports, đánh giá @Conditional,
+│                                          giữ lại các auto-config phù hợp                          [5]
+│    BeanDefinition ······················ kết quả: mỗi bean là một bản mô tả (class, scope, phụ thuộc)
+│
+├─ ③ ĐĂNG KÝ NHỮNG BEAN "XỬ LÝ BEAN KHÁC"                                            [2.4]
+│    AutowiredAnnotationBeanPostProcessor  sẽ xử lý @Autowired, @Value cho mọi bean tạo sau
+│    AnnotationAwareAspectJAutoProxyCreator
+│                                          sẽ bọc proxy cho bean có @Transactional, @Cacheable, @Aspect...
+│
+├─ ④ TẠO WEB SERVER (chưa mở port)
+│    TomcatServletWebServerFactory ······· tạo Tomcat, đăng ký DispatcherServlet + các Filter
+│
+├─ ⑤ TẠO SINGLETON BEAN theo đồ thị phụ thuộc: ai được cần thì tạo trước              [2.3]
+│    DefaultListableBeanFactory ·········· với từng bean: constructor → inject → @PostConstruct → bọc proxy
+│      HikariDataSource ·················· tạo pool, mở connection tới DB
+│      Flyway ···························· chạy migration chưa áp dụng (nếu dùng)                    [7.10]
+│      LocalContainerEntityManagerFactoryBean
+│                                          dựng EntityManagerFactory: Hibernate quét @Entity,
+│                                          kiểm tra schema  ← thường là bước chậm nhất
+│      JpaTransactionManager ············· quản lý transaction cho JPA
+│      OrderRepository ··················· JpaRepositoryFactory sinh proxy cho interface
+│      OrderService ······················ tạo object, rồi được bọc thành OrderService$$SpringCGLIB$$0
+│      OrderController ··················· nhận proxy của OrderService qua constructor
+│
+├─ ⑥ MỞ CỬA
+│    TomcatWebServer.start() ············· mở port 8080, bắt đầu nhận kết nối
+│    ApplicationRunner / CommandLineRunner chạy code khởi động của bạn (nếu có)
+│    ApplicationReadyEvent ··············· báo sẵn sàng; readiness = ACCEPTING_TRAFFIC              [12]
+```
+- Phần lớn lỗi lúc khởi động rơi vào bước ②–⑤: thiếu bean (`NoSuchBeanDefinitionException`), trùng bean, circular dependency (chương 3), sai cấu hình DB, entity không khớp schema.
+- Chi tiết từng bước: câu Q5 ở mục 21.
+
+#### C. Bản đồ runtime: một request `POST /orders` đi qua những gì
+
+**Cách đọc sơ đồ:** mỗi dòng gồm hai phần, ngăn cách bằng dấu chấm `····`
+- **Bên trái** là **class hoặc bean thật** — đúng cái tên bạn sẽ thấy trong stack trace hoặc khi debug.
+- **Bên phải** là **việc class đó làm** trong request này.
+- Các dòng được nhóm theo **tầng** (①–⑩). Số trong `[ ]` là mục giải thích chi tiết.
+
+```
+Client gửi:  POST /orders   Authorization: Bearer eyJ...   {"customerId":7,"items":[...]}
+│
+├─ ① TOMCAT — web server nhúng trong ứng dụng                                        [6.4]
+│    NioEndpoint ························· nhận kết nối TCP, giao request cho 1 worker thread (pool 200)
+│    Http11Processor ····················· đọc byte HTTP → dựng HttpServletRequest / HttpServletResponse
+│    ApplicationFilterChain ·············· gọi lần lượt từng Filter; filter cuối cùng gọi DispatcherServlet
+│
+├─ ② FILTER — chạy TRƯỚC Spring MVC, chưa biết controller nào sẽ xử lý                [6.2, 9.1]
+│    DelegatingFilterProxy ··············· cầu nối: Tomcat chỉ biết Filter, class này chuyển sang bean Spring
+│    FilterChainProxy ···················· (Spring Security) chọn SecurityFilterChain khớp URL rồi chạy:
+│      BearerTokenAuthenticationFilter ··· đọc header Authorization, xác minh JWT → lưu vào SecurityContext
+│      AuthorizationFilter ··············· kiểm tra quyền theo URL
+│      ExceptionTranslationFilter ········ không đạt → trả 401/403 NGAY TẠI ĐÂY, request không vào MVC
+│
+├─ ③ SPRING MVC — DispatcherServlet.doDispatch()                                     [6.1]
+│    RequestMappingHandlerMapping ········ tìm method khớp "POST /orders" → OrderController#create;
+│                                          trả về HandlerExecutionChain = method đó + các interceptor
+│    HandlerInterceptor.preHandle() ······ logic chung trước controller (log, tenant...); false → dừng
+│    RequestMappingHandlerAdapter ········ chuẩn bị tham số cho method controller rồi gọi nó:
+│      RequestResponseBodyMethodProcessor  thấy tham số có @RequestBody → nhờ converter đọc body
+│      MappingJackson2HttpMessageConverter đọc JSON → object CreateOrderRequest (DTO) bằng ObjectMapper
+│      WebDataBinder + LocalValidatorFactoryBean
+│                                          thấy @Valid → chạy Hibernate Validator trên DTO;      [15]
+│                                          sai → MethodArgumentNotValidException (controller không chạy)
+│
+├─ ④ CODE CỦA BẠN — tầng web
+│    OrderController.create(dto) ········· nhận DTO đã hợp lệ, gọi service, chọn status code
+│
+├─ ⑤ PROXY + MỞ TRANSACTION                                                          [4, 8.5]
+│    OrderService$$SpringCGLIB$$0 ········ proxy bọc OrderService — controller thực ra đang gọi vào đây
+│    TransactionInterceptor ·············· đọc @Transactional trên method → yêu cầu mở transaction
+│    JpaTransactionManager ··············· tạo EntityManager mới, gọi BEGIN
+│    HikariDataSource ···················· cho mượn 1 Connection có sẵn trong pool (pool 10)     [13.1]
+│    TransactionSynchronizationManager ··· gắn EntityManager + Connection vào ThreadLocal của thread này
+│
+├─ ⑥ CODE CỦA BẠN — tầng nghiệp vụ
+│    OrderService.placeOrder(dto) ········ (object thật) kiểm tra quy tắc, tạo Order, gọi repository
+│
+├─ ⑦ SPRING DATA + HIBERNATE                                                         [7.0, 7.1]
+│    OrderRepository ····················· interface của bạn; thứ được inject là proxy do Spring Data sinh ra
+│    SimpleJpaRepository.save() ·········· id == null → em.persist(order), ngược lại → em.merge(order)
+│    EntityManager (shared proxy) ········ tra ThreadLocal để lấy EntityManager của transaction hiện tại
+│    SessionImpl ························· (Hibernate) đưa order vào Persistence Context, xếp lệnh INSERT
+│                                          vào hàng đợi — ⚠️ CHƯA gửi SQL nào
+│
+│  ... OrderService.placeOrder() return, quyền điều khiển quay lại proxy ở ⑤ ...
+│
+├─ ⑧ COMMIT — TransactionInterceptor thấy method kết thúc không lỗi                  [7.8, 8.5]
+│    JpaTransactionManager.commit() ······ bắt đầu kết thúc transaction
+│    SessionImpl.flush() ················· dirty checking + chạy hàng đợi lệnh → sinh SQL INSERT/UPDATE
+│    PreparedStatement.executeUpdate() ··· (JDBC) gửi từng câu SQL qua Connection đang mượn
+│    Driver JDBC (vd PgConnection) ······· đóng gói theo giao thức của DB, gửi qua TCP → Database
+│    Connection.commit() ················· DB ghi vĩnh viễn, các transaction khác bắt đầu nhìn thấy
+│    HikariPool ·························· nhận lại Connection; ThreadLocal được dọn sạch
+│
+├─ ⑨ ĐƯỜNG VỀ
+│    OrderController ····················· nhận OrderResponse (DTO) từ service, trả ResponseEntity 201
+│    RequestResponseBodyMethodProcessor ·· xử lý giá trị trả về của controller
+│    MappingJackson2HttpMessageConverter · DTO → chuỗi JSON, ghi vào response body
+│    HandlerInterceptor.afterCompletion()  dọn dẹp, ghi log thời gian xử lý
+│    ApplicationFilterChain → Tomcat ····· response đi ngược qua các Filter, ghi ra socket;
+│                                          worker thread trở về pool
+│
+└─ ⑩ NẾU CÓ EXCEPTION TRONG ④–⑦
+     TransactionInterceptor ·············· RuntimeException → ROLLBACK (vẫn trả Connection về pool)    [8.2]
+     ExceptionHandlerExceptionResolver ··· tìm @ExceptionHandler phù hợp trong @RestControllerAdvice    [6.3]
+     ProblemDetail ······················· body lỗi chuẩn RFC 9457 trả về client
+     ⚠️ Lỗi ở tầng ② (xác thực/phân quyền) KHÔNG đi qua @RestControllerAdvice
+        vì lúc đó request chưa vào DispatcherServlet.
+```
+> Spring Boot 4 (Jackson 3): converter JSON đổi tên thành `JacksonJsonHttpMessageConverter`; vai trò giữ nguyên.
+
+| Tầng | Tài nguyên bị giữ | Giới hạn mặc định | Hết thì sao |
+| :--- | :--- | :--- | :--- |
+| Tomcat | 1 thread / request | 200 thread | Request xếp hàng, rồi timeout |
+| Transaction | 1 connection DB từ lúc mở tới lúc commit | 10 connection | Thread chờ pool tối đa 30s rồi ném `SQLTransientConnectionException` |
+| Persistence Context | Entity + snapshot trong heap | Dung lượng heap | Chậm dần, GC nhiều, `OutOfMemoryError` |
+
+→ **200 thread tranh nhau 10 connection.** Đây là lý do "gọi HTTP bên trong transaction" hoặc bật OSIV làm sập hệ thống: connection bị giữ trong lúc chờ mạng, 190 thread còn lại đứng chờ pool.
+
+Mỗi dòng trong stack trace của một lỗi production thuộc về một tầng trên sơ đồ này: `org.apache.catalina` (Tomcat), `o.s.security` (filter), `o.s.web.servlet` (MVC), `$$SpringCGLIB$$` hoặc `o.s.aop` (proxy), `o.s.transaction`, `o.s.data.jpa`, `org.hibernate`, `com.zaxxer.hikari`, rồi tới driver JDBC.
+
+#### D. Bản đồ code của bạn: kiến trúc phân tầng
+
+| Tầng | Trách nhiệm | Không nên làm |
+| :--- | :--- | :--- |
+| **Controller** (`@RestController`) | Giao tiếp HTTP: map URL, validate đầu vào, đổi DTO ↔ lời gọi service, chọn status code | Chứa logic nghiệp vụ; gọi thẳng repository; trả entity ra ngoài |
+| **Service** (`@Service`) | Một method public = một **use case** = một **transaction**; điều phối repository và service khác | Biết về `HttpServletRequest`, JSON, status code |
+| **Repository** (`@Repository`) | Truy cập dữ liệu của một aggregate | Chứa quy tắc nghiệp vụ; tự mở transaction dài |
+| **Domain** (`@Entity`, value object) | Dữ liệu + quy tắc bất biến của chính nó | Phụ thuộc vào tầng trên |
+
+- **Phụ thuộc chỉ đi một chiều:** Controller → Service → Repository. Tầng dưới không biết tầng trên.
+- **Vì sao không trả `@Entity` từ controller?** (1) Jackson gọi getter của quan hệ lazy → `LazyInitializationException` hoặc N+1, quan hệ hai chiều thì lặp vô hạn. (2) Lộ field nội bộ (password hash, cột audit). (3) API bị buộc chặt vào schema DB: đổi tên cột là vỡ hợp đồng với client. → Dùng DTO (record) cho request/response, map bằng tay hoặc MapStruct.
+- **Vì sao transaction đặt ở Service?** Chỉ service biết một use case gồm những thao tác nào phải cùng thành công hoặc cùng thất bại (xem Q13).
+- **Package theo tính năng** (`order/`, `payment/`, mỗi package có đủ controller–service–repository) thường dễ bảo trì hơn **package theo tầng** (`controller/`, `service/`, `repository/`) khi dự án lớn: thay đổi một tính năng nằm gọn một chỗ, và có thể để class ở mức package-private.
+- **Hexagonal / Clean Architecture** là bước tiếp theo của cùng ý tưởng: domain không phụ thuộc framework, DB và HTTP là "adapter" cắm vào qua interface. Đáng dùng khi logic nghiệp vụ phức tạp; với CRUD đơn giản thì 3 tầng là đủ.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **`@Transactional`, `@Cacheable` và `@Async` có điểm chung gì về cơ chế, và hệ quả chung là gì?**
+   → Cả ba được thực hiện bằng **AOP proxy** bọc quanh bean. Hệ quả: chỉ có tác dụng khi gọi **từ bean khác** qua proxy; gọi nội bộ `this.method()` thì bị bỏ qua, và method không được `private`/`final`, class không `final`.
+2. **Xóa Spring Boot khỏi dự án, chỉ giữ Spring Framework, thì mất gì?**
+   → Mất auto-configuration (phải tự khai báo `DataSource`, `EntityManagerFactory`, `DispatcherServlet`...), mất embedded server và fat JAR (phải đóng WAR), mất quản lý phiên bản qua starter/BOM, mất Actuator. Các tính năng IoC, AOP, MVC, transaction vẫn còn nguyên.
+3. **Tomcat có 200 thread, HikariCP có 10 connection. Một API giữ transaction 2 giây vì gọi HTTP ra ngoài. Hệ thống chịu được bao nhiêu request/giây cho API đó?**
+   → Khoảng 10 / 2 = **5 request/giây**. Nút thắt là connection pool, không phải thread pool. Cách sửa: đưa lời gọi HTTP ra ngoài transaction.
+4. **Vì sao `EntityManagerFactory` phải được tạo sau `DataSource` nhưng trước Repository?**
+   → Hibernate cần connection để đọc metadata và validate schema; còn repository proxy cần `EntityManager` (sinh ra từ factory) để hoạt động. Container tự suy ra thứ tự này từ đồ thị phụ thuộc.
+5. **Stack trace có dòng `OrderService$$SpringCGLIB$$0.placeOrder`. Dòng đó cho biết điều gì?**
+   → Lời gọi đang đi qua **proxy CGLIB** của `OrderService`, tức là bean này có ít nhất một advice (transaction, cache, security...). Nếu dòng này **không** xuất hiện ở chỗ bạn mong đợi, khả năng cao là self-invocation.
+</details>
 
 ### 1.1. Triết lý Thiết kế: Inversion of Control & Loose Coupling
 
@@ -821,6 +1040,123 @@ connections      │   accept()           theo dõi hàng nghìn kết nối    
 > ❌ **Cái giá:** SQL bị ẩn đi → dễ sinh **N+1 query**, nạp thừa dữ liệu, `LazyInitializationException`, tốn bộ nhớ khi xử lý lô lớn. Hiểu persistence context là chìa khóa để dùng JPA đúng.
 
 
+### 7.0. Kiến trúc tầng persistence — ai là ai, ai gọi ai
+
+> 🎯 **Bài toán:** Trong code chỉ thấy `interface OrderRepository extends JpaRepository<Order, Long>` — không có class cài đặt, không có SQL, không thấy connection. Khi có lỗi hoặc chậm thì không biết phải nhìn vào tầng nào.
+>
+> 💡 **Ý tưởng:** Tầng persistence là **5 lớp xếp chồng**, mỗi lớp giải một bài toán và có thể thay thế độc lập. Các mục 7.1–7.10 đều là chi tiết của lớp Hibernate.
+
+Cùng quy ước: **bên trái là class thật**, **bên phải là việc nó làm**.
+
+```
+OrderRepository extends JpaRepository<Order, Long> ··· interface CỦA BẠN — không có class cài đặt
+│
+├─ ① SPRING DATA JPA — thư viện tiện ích của Spring
+│    proxy của OrderRepository ··········· do JpaRepositoryFactory sinh lúc khởi động, cài đặt interface
+│    SimpleJpaRepository ················· cài đặt sẵn save / findById / delete / findAll(Pageable)
+│    PartTreeJpaQuery ···················· dịch tên method findByStatus(...) thành JPQL
+│    SimpleJpaQuery / NativeJpaQuery ····· chạy câu query khai báo bằng @Query
+│
+├─ ② JPA — đặc tả, package jakarta.persistence (chỉ có interface + annotation, không có code chạy)
+│    EntityManager ······················· API chuẩn: persist / find / merge / remove / createQuery
+│
+├─ ③ HIBERNATE ORM — cài đặt của JPA
+│    SessionImpl ························· class thật đứng sau EntityManager
+│    StatefulPersistenceContext ·········· Persistence Context: map id → entity + snapshot          [7.1]
+│    ActionQueue ························· hàng đợi INSERT / UPDATE / DELETE chờ flush             [7.8]
+│    Dialect (vd PostgreSQLDialect) ······ dịch JPQL sang SQL đúng cú pháp của từng loại DB
+│
+├─ ④ JDBC — API chuẩn java.sql + driver của từng DB
+│    PreparedStatement / ResultSet ······· gửi SQL có tham số, đọc kết quả trả về
+│    Driver (vd org.postgresql.Driver) ··· nói giao thức mạng riêng của DB
+│
+└─ ⑤ HIKARICP — connection pool
+     HikariDataSource ···················· cài đặt DataSource: cho mượn và thu hồi Connection
+     HikariPool ·························· giữ sẵn N kết nối TCP đã đăng nhập tới DB              [13.1]
+     │
+     ▼
+   Database
+```
+
+| Lớp | Là gì | Giải bài toán gì | Có thể thay bằng |
+| :--- | :--- | :--- | :--- |
+| ① Spring Data JPA | Thư viện của Spring | Khỏi viết DAO lặp lại; query theo tên method; phân trang | Tự viết DAO dùng `EntityManager` |
+| ② JPA | **Đặc tả** (Jakarta Persistence), không có code chạy | API chuẩn, không khóa vào một ORM | — |
+| ③ Hibernate | **Cài đặt** JPA (mặc định trong Spring Boot) | Map object ↔ bảng, sinh SQL, cache cấp 1 | EclipseLink |
+| ④ JDBC | API chuẩn của Java + driver của từng DB | Gửi SQL, nhận kết quả | (R2DBC cho reactive) |
+| ⑤ HikariCP | Connection pool | Mở kết nối TCP + xác thực rất đắt → tái sử dụng | Tomcat JDBC, DBCP2 |
+
+→ Câu "JPA và Hibernate khác gì nhau?": JPA là **bản hợp đồng** (interface, annotation), Hibernate là **người thực hiện**. `@Entity`, `EntityManager` thuộc JPA; `Session`, `@BatchSize`, `StatelessSession` là phần mở rộng riêng của Hibernate. Spring Data JPA **không phải ORM**, nó chỉ là lớp tiện ích gọi xuống `EntityManager`.
+
+#### Hai object trung tâm: Factory và Session
+
+| | `EntityManagerFactory` (= Hibernate `SessionFactory`) | `EntityManager` (= Hibernate `Session`) |
+| :--- | :--- | :--- |
+| Số lượng | **1** cho cả ứng dụng (mỗi DataSource một cái) | **1 cho mỗi transaction** (hoặc mỗi request nếu bật OSIV) |
+| Chi phí tạo | Rất đắt: quét `@Entity`, dựng metamodel, chuẩn bị SQL, validate schema | Rất rẻ |
+| Thread-safe | ✅ | ❌ |
+| Giữ gì | Mapping, Dialect, second-level cache | Persistence Context (cache cấp 1) + 1 JDBC Connection |
+| Vòng đời | Từ lúc khởi động tới lúc tắt app | Mở khi transaction bắt đầu, đóng khi kết thúc |
+
+- **Vậy sao inject được `EntityManager` (không thread-safe) vào repository singleton?** Thứ được inject là một **proxy dùng chung**. Mỗi lần gọi, proxy tra `TransactionSynchronizationManager` (ThreadLocal) để lấy `EntityManager` thật của transaction trên thread hiện tại. Cùng nguyên lý với scoped proxy ở Q16.
+- **Ai tạo ra các bean này?** Auto-configuration của Spring Boot: thấy HikariCP + `spring.datasource.*` → tạo `HikariDataSource`; thấy Hibernate → tạo `LocalContainerEntityManagerFactoryBean` và `JpaTransactionManager`; thấy Spring Data JPA → quét các interface repository và tạo proxy. Bạn khai báo bean cùng kiểu thì auto-config lùi lại (`@ConditionalOnMissingBean`).
+
+#### Đường đi của `orderRepository.save(order)` bên trong một method `@Transactional`
+
+```
+① MỞ TRANSACTION
+   OrderService$$SpringCGLIB$$0 ········· controller gọi vào proxy, chưa phải object thật
+   TransactionInterceptor ··············· thấy @Transactional → yêu cầu mở transaction
+   JpaTransactionManager ················ tạo SessionImpl, mượn Connection từ HikariDataSource, BEGIN
+   TransactionSynchronizationManager ···· gắn SessionImpl + Connection vào ThreadLocal
+
+② GỌI REPOSITORY
+   OrderService.placeOrder() ············ (object thật) gọi orderRepository.save(order)
+   SimpleJpaRepository.save() ··········· isNew(order)? → có → em.persist(order)
+   SessionImpl.persist() ················ đưa order vào Persistence Context (trạng thái managed),
+                                          xếp lệnh INSERT vào ActionQueue
+                                          ⚠️ CHƯA gửi SQL (trừ ID kiểu IDENTITY: phải INSERT ngay để lấy ID)
+
+③ LOGIC TIẾP THEO
+   OrderService ························· order.setStatus(PAID) → chỉ đổi field trong heap, không có SQL
+
+④ COMMIT — method return không lỗi
+   TransactionInterceptor ··············· gọi commit
+   SessionImpl.flush() ·················· dirty checking: so order với snapshot → phát hiện status đổi  [7.8]
+   ActionQueue ·························· chạy INSERT (giá trị lúc persist) rồi UPDATE status
+   PreparedStatement.executeUpdate() ···· gửi từng câu SQL qua Connection
+   Connection.commit() ·················· DB ghi vĩnh viễn
+   SessionImpl.close() ·················· Persistence Context biến mất, order thành detached
+   HikariPool ··························· nhận lại Connection; ThreadLocal được dọn
+```
+- Để ý bước ④: vì `setStatus` xảy ra **sau** `persist`, Hibernate gửi **hai** câu (INSERT rồi UPDATE). Gán đủ field trước khi gọi `save()` thì chỉ còn một câu INSERT.
+
+Đường đi của `findById(1L)`: Hibernate tìm trong Persistence Context trước → có thì trả luôn **không chạy SQL**; chưa có thì `SELECT`, dựng entity từ `ResultSet`, lưu thêm một bản snapshot để dirty checking, rồi trả về.
+
+**Lỗi thuộc tầng nào?**
+
+| Triệu chứng | Tầng | Xem |
+| :--- | :--- | :--- |
+| `No property 'xyz' found for type 'Order'` lúc khởi động | ① Spring Data (tên method sai) | 7.9 |
+| `LazyInitializationException`, N+1, `MultipleBagFetchException` | ③ Hibernate | 7.2, 7.3 |
+| `Schema-validation: missing column` lúc khởi động | ③ Hibernate đối chiếu entity với DB | 7.10 |
+| `DataIntegrityViolationException` (Spring đã dịch từ `SQLException`) | ④ DB từ chối: trùng unique, sai FK | 7.8 |
+| `Connection is not available, request timed out after 30000ms` | ⑤ HikariCP cạn pool | 13.1 |
+
+`@Repository` còn có một tác dụng ít người để ý: bật **dịch exception**. Lỗi riêng của từng driver hoặc của Hibernate được đổi thành cây `DataAccessException` thống nhất của Spring, nhờ đó tầng service không phụ thuộc công nghệ bên dưới.
+
+<details><summary>🧠 Tự kiểm tra</summary>
+
+1. **Interface repository không có class cài đặt, vì sao gọi được?**
+   → Lúc khởi động, Spring Data tạo một **proxy** cho mỗi interface. Method CRUD được chuyển tới `SimpleJpaRepository`; method tự khai báo được dịch thành query (từ tên method hoặc `@Query`) và chạy qua `EntityManager`.
+2. **Dự án bỏ Spring Data JPA nhưng vẫn giữ Hibernate. Còn dùng được `@Transactional` và dirty checking không?**
+   → Được. `@Transactional` thuộc `spring-tx`, dirty checking thuộc Hibernate. Chỉ mất phần repository tự sinh; phải tự viết DAO gọi `EntityManager`.
+3. **Sau `repository.save(order)`, nhìn vào DB bằng một session khác thì chưa thấy dòng mới. Vì sao?**
+   → Có hai khả năng chồng lên nhau: lệnh INSERT còn nằm trong hàng đợi chưa flush, và kể cả đã flush thì transaction chưa commit nên session khác không thấy (isolation).
+4. **Vì sao tạo `EntityManagerFactory` mỗi request là sai lầm nghiêm trọng, còn tạo `EntityManager` mỗi transaction lại là thiết kế đúng?**
+   → Factory rất đắt và thread-safe, sinh ra để dùng chung. `EntityManager` rẻ, không thread-safe và chứa trạng thái của **một đơn vị công việc**, nên phải riêng cho từng transaction.
+</details>
+
 ### 7.1. Persistence Context & 4 Trạng thái của Entity
 
 Persistence Context là bộ nhớ đệm cấp 1 (First-Level Cache) được quản lý bởi `EntityManager`. Mọi thao tác đọc/ghi trong cùng một Transaction đều tương tác trước tiên với Persistence Context.
@@ -991,6 +1327,195 @@ int increasePrice(@Param("c") String category);
 | Rủi ro hiệu năng ẩn | N+1, lazy loading | Thấp | Thấp |
 
 ✅ **Lựa chọn hay gặp:** JPA cho phần **ghi theo aggregate** (CRUD nghiệp vụ), SQL tường minh (JdbcClient/jOOQ, projection DTO) cho **đọc/báo cáo** và xử lý lô lớn — kết hợp cả hai trong một service là bình thường.
+
+### 7.7. Mapping quan hệ: owning side, `mappedBy`, cascade, orphanRemoval
+
+> 🎯 **Bài toán:** Trong object, quan hệ có **hai đầu** (`order.getItems()` và `item.getOrder()`). Trong DB chỉ có **một** cột khóa ngoại (`order_item.order_id`). Hibernate phải biết nhìn vào đầu nào để ghi cột đó.
+
+```java
+@Entity
+class Order {
+    @Id @GeneratedValue Long id;
+
+    // INVERSE side: "cột FK do field `order` bên OrderItem quản lý" → Hibernate KHÔNG nhìn list này khi ghi FK
+    @OneToMany(mappedBy = "order", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<OrderItem> items = new ArrayList<>();
+
+    public void addItem(OrderItem item) {      // helper: luôn đồng bộ CẢ HAI đầu
+        items.add(item);
+        item.setOrder(this);
+    }
+    public void removeItem(OrderItem item) {
+        items.remove(item);
+        item.setOrder(null);
+    }
+}
+
+@Entity
+class OrderItem {
+    @Id @GeneratedValue Long id;
+
+    // OWNING side: bên giữ cột FK → Hibernate chỉ nhìn field này để ghi order_id
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "order_id")
+    private Order order;
+}
+```
+
+- **Owning side** = bên có cột khóa ngoại (luôn là phía `@ManyToOne`). **Inverse side** = bên khai báo `mappedBy`, chỉ để đọc.
+- **Bẫy kinh điển:** chỉ gọi `order.getItems().add(item)` mà quên `item.setOrder(order)` → `order_id` bị ghi **NULL**, vì Hibernate chỉ đọc owning side.
+- **`@OneToMany` một chiều** (không có `mappedBy`): thiếu `@JoinColumn` thì Hibernate tạo thêm **bảng trung gian**; có `@JoinColumn` thì INSERT con xong lại chạy thêm câu `UPDATE` để gán FK. → Ưu tiên quan hệ hai chiều, hoặc chỉ dùng `@ManyToOne` rồi query phía con.
+- **`@ManyToMany`:** dùng `Set`, không dùng `List` (với `List`, xóa một phần tử khiến Hibernate xóa hết các dòng bảng nối rồi insert lại). Bảng nối cần thêm cột (ngày tạo, vai trò...) → tách thành entity riêng với hai `@ManyToOne`.
+- **`@OneToOne` phía `mappedBy` không lazy được** nếu không có bytecode enhancement: Hibernate phải query để biết là `null` hay có dữ liệu. → Đặt FK ở phía con và dùng `@MapsId` (dùng chung khóa chính).
+
+**Cascade** — thao tác trên cha tự lan xuống con:
+
+| Loại | Ý nghĩa | Ghi chú |
+| :--- | :--- | :--- |
+| `PERSIST` / `MERGE` | Lưu cha thì lưu luôn con | Dùng phổ biến |
+| `REMOVE` | Xóa cha thì xóa con | Hibernate xóa **từng dòng** con, bảng lớn sẽ chậm |
+| `ALL` | Tất cả các loại | Chỉ dùng khi con **thuộc hẳn về** cha (Order → OrderItem) |
+
+- Cascade chỉ đặt theo chiều **cha → con**. Không đặt `REMOVE`/`ALL` trên `@ManyToOne` hay `@ManyToMany`: xóa một dòng có thể kéo theo dữ liệu đang được nơi khác dùng chung.
+- **`orphanRemoval = true` khác `CascadeType.REMOVE`:** `REMOVE` chỉ xóa con khi **cha bị xóa**. `orphanRemoval` còn xóa con khi nó bị **gỡ khỏi collection** (`order.removeItem(item)` → `DELETE`).
+- ⚠️ Với `orphanRemoval`, không gán collection mới (`order.setItems(newList)`) — Hibernate mất dấu collection cũ và ném exception. Hãy `clear()` rồi `addAll()` trên chính collection đang được quản lý.
+
+**Các mapping khác hay bị hỏi:**
+- **`@Enumerated(EnumType.STRING)`**: mặc định là `ORDINAL` (lưu số thứ tự) → chèn thêm một giá trị enum vào giữa là toàn bộ dữ liệu cũ sai nghĩa.
+- **`@Embeddable` / `@Embedded`**: value object không có ID riêng (`Address`, `Money`), các cột nằm chung bảng với entity chứa nó.
+- **Kế thừa:**
+
+| Chiến lược | Bảng | Ưu | Nhược |
+| :--- | :--- | :--- | :--- |
+| `SINGLE_TABLE` (mặc định) | 1 bảng + cột phân loại | Nhanh nhất, không JOIN | Cột của lớp con phải cho phép NULL |
+| `JOINED` | Bảng cha + mỗi lớp con một bảng | Chuẩn hóa, có ràng buộc NOT NULL | Mỗi lần đọc phải JOIN |
+| `TABLE_PER_CLASS` | Mỗi lớp con một bảng đầy đủ | Không JOIN khi đọc một lớp con | Query đa hình phải `UNION`, ít dùng |
+| `@MappedSuperclass` | Không phải entity, chỉ chia sẻ field | Hợp với `BaseEntity` (id, createdAt...) | Không query được theo lớp cha |
+
+### 7.8. Flush: thời điểm SQL thực sự được gửi
+
+> 🎯 **Bài toán:** Gọi `save()` ở dòng 10 nhưng lỗi unique constraint lại nổ ở dòng 40, hoặc nổ ngoài cả method. Vì sao?
+
+- **Flush ≠ Commit.** *Flush* = đồng bộ Persistence Context xuống DB (gửi INSERT/UPDATE/DELETE) nhưng **vẫn trong transaction**, còn rollback được. *Commit* = kết thúc transaction, thay đổi trở thành vĩnh viễn và transaction khác mới nhìn thấy.
+- Hibernate **trì hoãn SQL càng lâu càng tốt** (*transactional write-behind*) để gom batch và rút ngắn thời gian giữ lock.
+
+**Flush xảy ra khi nào** (chế độ mặc định `FlushModeType.AUTO`):
+
+| Thời điểm | Giải thích |
+| :--- | :--- |
+| Trước khi commit | Luôn luôn |
+| Trước một câu JPQL / Criteria | Nếu query đụng tới bảng đang có thay đổi chờ ghi — để query thấy dữ liệu mới nhất |
+| Trước một native query | Hibernate không phân tích được SQL thô nên flush toàn bộ cho an toàn |
+| Gọi `em.flush()` / `repository.saveAndFlush()` / `repository.flush()` | Chủ động |
+| `persist()` entity có ID kiểu `IDENTITY` | Riêng lệnh INSERT đó phải chạy ngay để lấy ID |
+
+- `findById()` **không** kích hoạt flush: nó tra Persistence Context theo ID, không phải query.
+- `@Transactional(readOnly = true)` đặt flush mode thành `MANUAL` → không tự flush, không dirty checking.
+
+**Hệ quả 1 — lỗi nổ muộn.** Vi phạm constraint chỉ lộ ra khi flush, thường là lúc commit, tức là **sau khi method của bạn đã return**. `try/catch` bao quanh `save()` không bắt được. Muốn bắt tại chỗ thì dùng `saveAndFlush()`. Lưu ý: sau một lỗi lúc flush, transaction đã bị đánh dấu rollback-only và Persistence Context không còn đáng tin — không "bắt lỗi rồi làm tiếp" trong cùng transaction được.
+
+**Hệ quả 2 — thứ tự SQL không theo thứ tự code.** Khi flush, Hibernate chạy theo thứ tự cố định: **INSERT → UPDATE → thay đổi collection → DELETE**.
+
+```java
+@Transactional
+public void replaceEmail(Long userId) {
+    emailRepo.delete(oldEmail);          // email = 'a@x.com' (cột unique)
+    emailRepo.save(new Email("a@x.com")); // cùng giá trị
+}   // flush: INSERT chạy TRƯỚC DELETE → vi phạm unique!
+```
+→ Cách sửa: `emailRepo.flush()` ngay sau `delete`, hoặc tốt hơn là **sửa entity cũ** thay vì xóa rồi tạo mới.
+
+### 7.9. Các cách viết truy vấn trong Spring Data JPA
+
+| Cách | Ví dụ | Dùng khi | Hạn chế |
+| :--- | :--- | :--- | :--- |
+| **Derived query** (theo tên method) | `findByStatusAndCreatedAtAfter(...)` | Điều kiện đơn giản, 1–2 field | Tên dài khó đọc; sai tên field → lỗi lúc khởi động |
+| **`@Query` JPQL** | `select o from Order o join fetch o.items where ...` | Cần JOIN FETCH, projection, điều kiện vừa phải | Chuỗi tĩnh; không dùng được tính năng riêng của DB |
+| **`@Query(nativeQuery = true)`** | SQL thuần | Window function, CTE, hint | Khóa vào một loại DB; tự lo mapping kết quả |
+| **Specification** (Criteria API) | `repo.findAll(spec, pageable)` | **Bộ lọc động**: màn hình tìm kiếm nhiều điều kiện tùy chọn | Code dài dòng |
+| **Querydsl / jOOQ** | `QOrder.order.status.eq(...)` | Query động, type-safe, dễ đọc hơn Criteria | Thêm bước sinh code |
+
+- JPQL viết theo **tên entity và field**, không phải tên bảng và cột; Hibernate dịch sang SQL theo `Dialect` của từng DB.
+- Derived query được kiểm tra **lúc khởi động**; JPQL trong `@Query` cũng vậy. Native query sai thì tới lúc chạy mới biết.
+
+```java
+// Bộ lọc động: điều kiện nào null thì bỏ qua (cb.conjunction() = điều kiện luôn đúng)
+interface OrderRepository extends JpaRepository<Order, Long>, JpaSpecificationExecutor<Order> {}
+
+static Specification<Order> hasStatus(Status s) {
+    return (root, query, cb) -> s == null ? cb.conjunction() : cb.equal(root.get("status"), s);
+}
+static Specification<Order> createdAfter(Instant t) {
+    return (root, query, cb) -> t == null ? cb.conjunction() : cb.greaterThan(root.get("createdAt"), t);
+}
+
+Page<Order> page = repo.findAll(hasStatus(status).and(createdAfter(from)), pageable);
+```
+
+**Auditing — tự điền người tạo, thời điểm tạo/sửa:**
+```java
+@Configuration @EnableJpaAuditing class JpaConfig {}
+
+@MappedSuperclass
+@EntityListeners(AuditingEntityListener.class)
+abstract class BaseEntity {
+    @CreatedDate      Instant createdAt;
+    @LastModifiedDate Instant updatedAt;
+    @CreatedBy        String  createdBy;   // cần bean AuditorAware<String> (thường lấy từ SecurityContext)
+}
+```
+- Hoạt động nhờ lifecycle callback của JPA (`@PrePersist`, `@PreUpdate`) → **không chạy** với bulk `@Modifying` query (7.5 điểm 6).
+
+### 7.10. Quản lý schema: `ddl-auto` và Flyway / Liquibase
+
+> 🎯 **Bài toán:** Entity thay đổi theo code, schema DB phải đổi theo. Nhiều môi trường (dev, staging, production), nhiều instance, nhiều người cùng sửa — làm sao mọi DB cùng ở đúng một phiên bản, và biết được ai đã đổi gì?
+
+| `spring.jpa.hibernate.ddl-auto` | Hành vi | Dùng ở đâu |
+| :--- | :--- | :--- |
+| `create` / `create-drop` | Xóa và tạo lại toàn bộ schema | Test với DB tạm |
+| `update` | Tự thêm bảng/cột còn thiếu | Chỉ để thử nghiệm ở local |
+| `validate` | Chỉ **đối chiếu** entity với schema, lệch thì không khởi động | ✅ Production |
+| `none` | Không làm gì | Production |
+
+- ❌ **Vì sao không dùng `update` ở production?** Nó không xóa hay đổi tên cột (đổi tên field → thêm cột mới, dữ liệu cũ nằm lại cột cũ), không migrate dữ liệu, không có lịch sử, không review được, và có thể chạy `ALTER TABLE` khóa bảng lớn ngay lúc deploy.
+- ✅ **Cách làm chuẩn:** schema là **code có phiên bản**, mỗi thay đổi là một file migration đi cùng commit; ứng dụng đặt `ddl-auto=validate`.
+
+**Flyway** (phổ biến nhất, viết SQL thuần):
+```
+src/main/resources/db/migration/
+  V1__create_order_table.sql
+  V2__add_status_to_order.sql
+  V3__create_index_order_customer.sql
+```
+- Lúc khởi động (trước khi Hibernate tạo `EntityManagerFactory`), Flyway so các file với bảng `flyway_schema_history` rồi chạy những version chưa có, theo thứ tự.
+- Mỗi file đã chạy được lưu **checksum** → **không bao giờ sửa file đã áp dụng**; muốn đổi thì thêm file version mới.
+- Nhiều instance khởi động cùng lúc: Flyway lấy lock ở DB nên chỉ một instance chạy migration.
+
+**Liquibase**: changelog viết bằng YAML/XML/SQL, độc lập với loại DB, có sẵn khái niệm rollback; lịch sử nằm ở bảng `DATABASECHANGELOG`. Chọn khi phải hỗ trợ nhiều loại DB hoặc cần rollback có cấu trúc.
+
+**Migration không downtime (expand → contract).** Khi deploy kiểu rolling, phiên bản cũ và mới của app chạy **song song** trên cùng một schema, nên mỗi migration phải tương thích với cả hai. Ví dụ đổi tên cột `name` → `full_name`:
+1. *Expand:* thêm cột `full_name` (cho phép NULL). App mới ghi cả hai cột.
+2. Sao chép dữ liệu cũ sang cột mới theo từng lô.
+3. App chuyển sang chỉ đọc/ghi `full_name`.
+4. *Contract:* xóa cột `name` ở một lần release sau.
+
+→ Không bao giờ gộp "đổi tên cột" và "deploy code mới" vào một bước. Thao tác DDL trên bảng lớn: xem `Database.md`.
+
+<details><summary>🧠 Tự kiểm tra (7.7–7.10)</summary>
+
+1. **Thêm item vào `order.getItems()` rồi save, nhưng cột `order_id` trong DB bị NULL. Vì sao?**
+   → `items` là inverse side (`mappedBy`). Hibernate chỉ đọc owning side (`item.order`) để ghi FK, mà field đó chưa được gán. Sửa bằng helper method đồng bộ cả hai đầu.
+2. **`orphanRemoval = true` và `CascadeType.REMOVE` khác nhau ở tình huống nào?**
+   → Khi gỡ con khỏi collection mà **không xóa cha**: `orphanRemoval` sinh `DELETE` cho con, `CascadeType.REMOVE` thì không làm gì.
+3. **Bao `repository.save(user)` trong `try/catch (DataIntegrityViolationException)` nhưng không bắt được lỗi trùng email. Vì sao, sửa thế nào?**
+   → INSERT chưa được gửi ở dòng `save()`; nó được gửi lúc flush khi commit, bên ngoài khối `try`. Dùng `saveAndFlush()`, hoặc kiểm tra trước và vẫn dựa vào unique constraint, xử lý exception ở tầng gọi bên ngoài transaction.
+4. **Xóa một bản ghi rồi insert bản ghi mới có cùng giá trị unique trong một transaction thì lỗi. Vì sao?**
+   → Khi flush, Hibernate chạy INSERT trước DELETE. Cần `flush()` sau khi delete, hoặc cập nhật bản ghi cũ.
+5. **Vì sao `ddl-auto=validate` kết hợp Flyway an toàn hơn `ddl-auto=update`?**
+   → Mọi thay đổi schema là file SQL có phiên bản, được review, chạy đúng một lần và đúng thứ tự trên mọi môi trường; Hibernate chỉ kiểm tra khớp và từ chối khởi động nếu lệch, thay vì tự ý sửa schema.
+6. **Màn hình tìm kiếm có 6 bộ lọc tùy chọn. Vì sao không nên viết derived query?**
+   → Số tổ hợp điều kiện là 2⁶ = 64; không thể viết 64 method. Dùng Specification/Querydsl để ghép điều kiện lúc chạy.
+</details>
 
 > 🛠 **Áp dụng:**
 > - Mặc định mọi quan hệ `LAZY`; nạp dữ liệu cần thiết theo use case bằng `JOIN FETCH`/`@EntityGraph`; trả DTO projection cho API đọc.
@@ -1246,6 +1771,44 @@ public class SecurityConfig {
 - **CORS** không phải cơ chế bảo mật phía server — chỉ là trình duyệt tự giới hạn; cấu hình `allowedOrigins` cụ thể, không dùng `*` cùng `allowCredentials(true)`.
 - **401 vs 403**: 401 = chưa xác thực/không xác định được bạn là ai; 403 = đã biết bạn là ai nhưng không có quyền.
 - **Multi-tenant / phân quyền dữ liệu**: kiểm tra quyền sở hữu tài nguyên (IDOR — `GET /orders/123` của người khác) ở tầng service, không chỉ ở URL.
+
+### 9.4. OAuth2 & OpenID Connect — bức tranh tổng thể
+
+> 🎯 **Bài toán:** Mục 9.2 mô tả ứng dụng **tự phát** JWT. Trong thực tế, phần lớn hệ thống giao việc đăng nhập cho một máy chủ chuyên trách (Keycloak, Auth0, Okta, Cognito, Google). Khi đó API của bạn đóng vai nào, token từ đâu tới?
+
+**4 vai trong OAuth2:**
+
+| Vai | Là ai | Phía Spring |
+| :--- | :--- | :--- |
+| Resource Owner | Người dùng | — |
+| Client | Ứng dụng muốn truy cập thay người dùng (SPA, mobile, service khác) | Spring Security **OAuth2 Client** |
+| Authorization Server | Nơi đăng nhập và **phát token** | Keycloak..., hoặc **Spring Authorization Server** |
+| Resource Server | API giữ dữ liệu, **kiểm tra token** | Spring Security **OAuth2 Resource Server** (`http.oauth2ResourceServer(...)`) |
+
+→ Backend REST API thông thường là **Resource Server**: không có màn hình đăng nhập, không giữ mật khẩu, chỉ xác minh chữ ký và claim của JWT bằng public key lấy từ `issuer-uri` (JWKS).
+
+**Các luồng (grant type) cần biết:**
+
+| Luồng | Dùng khi | Ghi chú |
+| :--- | :--- | :--- |
+| **Authorization Code + PKCE** | Có người dùng đăng nhập (web, SPA, mobile) | Luồng chuẩn hiện nay |
+| **Client Credentials** | Service gọi service, không có người dùng | Client tự xác thực bằng id + secret |
+| **Refresh Token** | Lấy access token mới mà không đăng nhập lại | Nên xoay vòng (rotation) |
+| ~~Implicit~~, ~~Password~~ | — | Đã bị loại bỏ trong OAuth 2.1, không dùng cho hệ thống mới |
+
+```
+Authorization Code + PKCE:
+ 1. Client tạo code_verifier (ngẫu nhiên) + code_challenge = SHA256(verifier)
+ 2. Trình duyệt → Authorization Server: /authorize?client_id&redirect_uri&code_challenge
+ 3. Người dùng đăng nhập + đồng ý cấp quyền (tại Authorization Server, client không thấy mật khẩu)
+ 4. Authorization Server → redirect về client kèm ?code=abc   (mã dùng 1 lần, sống rất ngắn)
+ 5. Client → Authorization Server: /token  (code + code_verifier)
+ 6. Authorization Server kiểm tra SHA256(verifier) == challenge → trả access token (+ refresh, + ID token)
+ 7. Client → Resource Server: Authorization: Bearer <access token>
+```
+- **PKCE** chống việc mã `code` bị chặn giữa đường: kẻ lấy được `code` không có `code_verifier` nên không đổi được token.
+- **OAuth2 là ủy quyền** ("ứng dụng này được làm gì"), **OpenID Connect (OIDC)** thêm lớp **xác thực** ("người dùng là ai") bằng **ID token**. *Access token* gửi cho API; *ID token* dành cho client đọc thông tin người dùng — không gửi ID token cho API.
+- **Scope** (`orders.read`) là quyền client được cấp; trong Spring Security nó thành authority `SCOPE_orders.read`, dùng với `@PreAuthorize("hasAuthority('SCOPE_orders.read')")`.
 
 ---
 
@@ -1614,6 +2177,25 @@ class ReportJob {
 - ⚠️ Mặc định mọi `@Scheduled` chạy trên **1 thread duy nhất** → 1 job chậm làm trễ tất cả job khác → tăng `spring.task.scheduling.pool.size`.
 - ⚠️ **Chạy nhiều instance** (K8s scale 3 pod) → job chạy **3 lần**. Giải pháp: **ShedLock** (khóa qua bảng DB/Redis — chỉ instance lấy được lock mới chạy), Quartz clustered mode (bảng `QRTZ_*`), hoặc tách job ra K8s `CronJob`/workflow engine (Temporal, Airflow).
 - Job phải **idempotent** và chịu được chạy lại (lock hết hạn giữa chừng, pod bị kill).
+
+### 11.4. Spring Batch (tổng quan)
+
+> 🎯 **Bài toán:** Xử lý **hàng triệu bản ghi** theo lô (đối soát cuối ngày, import file, tính lãi): phải chạy được nhiều giờ, lỗi giữa chừng thì **chạy tiếp từ chỗ dừng** chứ không làm lại từ đầu, và biết được lần chạy nào đã xử lý bao nhiêu dòng. `@Scheduled` + một vòng lặp không cho bạn những thứ đó.
+
+```
+Job ─── Step 1 ─── Step 2 ─── Step 3
+          │
+          └─ chunk(1000):  ItemReader ──► ItemProcessor ──► ItemWriter
+                           đọc từng dòng   biến đổi/lọc      ghi cả lô 1000 dòng
+                           └────────── 1 transaction cho mỗi chunk ──────────┘
+JobRepository (các bảng BATCH_* trong DB): lưu trạng thái Job/Step, số dòng đã đọc/ghi, vị trí dừng
+```
+- **Chunk-oriented processing:** mỗi chunk là một transaction → lỗi chỉ rollback chunk đó; bộ nhớ không phình vì chỉ giữ một chunk.
+- **Restart:** `JobRepository` ghi lại vị trí đã commit → chạy lại cùng `JobParameters` sẽ tiếp tục từ chunk lỗi.
+- **Chịu lỗi:** `skip` (bỏ qua dòng hỏng, ghi lại), `retry` (thử lại lỗi tạm thời).
+- **Mở rộng:** multi-threaded step, partitioning (chia dữ liệu theo khoảng ID cho nhiều worker).
+- Spring Batch **không tự lên lịch**: kích hoạt bằng `@Scheduled`, Quartz, hoặc K8s `CronJob`.
+- Không cần Spring Batch khi: job nhỏ vài nghìn dòng, hoặc xử lý theo sự kiện (dùng Kafka consumer).
 
 ---
 
@@ -2149,3 +2731,26 @@ ShedLock / Quartz cluster / K8s CronJob / leader election (11.3).
 #### Q16: Bean scope `request` được inject vào singleton như thế nào mà vẫn đúng theo từng request?
 Spring inject một **scoped proxy** (`@RequestScope` mặc định `proxyMode = TARGET_CLASS`): singleton giữ proxy, mỗi lần gọi method proxy tra bean thật của request hiện tại (qua `RequestContextHolder` — ThreadLocal). Cùng nguyên lý giải quyết vấn đề prototype-in-singleton (2.2).
 
+#### Q17: Mô tả đường đi của một request từ client tới database và quay về.
+Tomcat nhận kết nối, giao một thread → Filter chain (Spring Security xác thực, phân quyền) → `DispatcherServlet` tìm handler → Interceptor → đọc JSON thành DTO và validate → Controller → **proxy** của Service mở transaction (mượn connection từ HikariCP, gắn vào ThreadLocal) → Service → Repository (proxy Spring Data) → `EntityManager`/Hibernate Session → flush sinh SQL → JDBC → DB. Đường về: commit, trả connection → Controller trả DTO → Jackson ghi JSON; nếu có exception thì rollback và `@RestControllerAdvice` tạo response lỗi. Sơ đồ ở 1.0-C.
+
+#### Q18: Phân biệt JPA, Hibernate và Spring Data JPA?
+JPA là **đặc tả** (interface `EntityManager`, annotation `@Entity`). Hibernate là **cài đặt** của đặc tả đó, làm việc ORM thật sự. Spring Data JPA là lớp tiện ích **phía trên** JPA: tự sinh repository và query, không phải ORM. Bên dưới tất cả là JDBC và connection pool (7.0).
+
+#### Q19: Phân biệt `EntityManagerFactory` và `EntityManager`?
+Factory: một cái cho cả ứng dụng, tạo rất đắt, thread-safe, giữ mapping và second-level cache. `EntityManager`: một cái cho mỗi transaction, rẻ, không thread-safe, giữ Persistence Context và một connection. Bean `EntityManager` được inject là proxy trỏ tới instance của transaction hiện tại (7.0).
+
+#### Q20: Flush khác commit thế nào? Khi nào Hibernate flush?
+Flush gửi SQL xuống DB nhưng vẫn trong transaction (còn rollback được); commit kết thúc transaction. Hibernate flush trước commit, trước query JPQL đụng tới bảng có thay đổi chờ ghi, trước native query, và khi gọi `flush()`/`saveAndFlush()`. Thứ tự khi flush: INSERT → UPDATE → DELETE (7.8).
+
+#### Q21: `mappedBy` nghĩa là gì? Quên đồng bộ hai đầu quan hệ thì sao?
+`mappedBy` đánh dấu **inverse side**: cột khóa ngoại do field bên kia (owning side, phía `@ManyToOne`) quản lý. Hibernate chỉ đọc owning side khi ghi, nên chỉ thêm vào collection mà không set phía con thì FK bị NULL (7.7).
+
+#### Q22: Quản lý thay đổi schema ở production thế nào? Vì sao không dùng `ddl-auto=update`?
+Dùng Flyway/Liquibase: mỗi thay đổi là một file migration có phiên bản, chạy tự động lúc khởi động, có lịch sử; app đặt `ddl-auto=validate`. `update` không xóa/đổi tên cột, không migrate dữ liệu, không review được. Thay đổi phá vỡ tương thích phải làm theo expand → contract (7.10).
+
+#### Q23: Vì sao không trả thẳng `@Entity` từ controller?
+Jackson chạm vào quan hệ lazy → `LazyInitializationException` hoặc N+1, quan hệ hai chiều gây lặp vô hạn; lộ field nội bộ; hợp đồng API bị buộc vào schema DB. Dùng DTO và map ở tầng service hoặc controller (1.0-D).
+
+#### Q24: Authorization Code + PKCE hoạt động thế nào? API của bạn đóng vai gì?
+Client chuyển người dùng sang Authorization Server để đăng nhập, nhận về `code` dùng một lần, rồi đổi `code` + `code_verifier` lấy access token. PKCE bảo đảm chỉ client đã khởi tạo luồng mới đổi được token. API backend là **Resource Server**: chỉ xác minh chữ ký và claim của token (9.4).
