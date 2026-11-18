@@ -7,6 +7,7 @@ Tài liệu ôn tập toàn diện System Design cho kỹ sư phần mềm và p
 > - [`SpringBoot.md`](SpringBoot.md): Kiến trúc chuyên sâu Spring Framework, Spring Boot, Spring Data JPA, Spring Security, Kafka manual partition assignment.
 > - [`Java.md`](Java.md): Core Java, Concurrency, JVM Internals, Memory Model, Garbage Collection.
 > - [`Networking.md`](Networking.md): OSI/TCP-IP, TCP deep dive (handshake, TIME_WAIT, congestion control), DNS, HTTP, TLS, Kubernetes networking, troubleshooting.
+> - [`DevOps.md`](DevOps.md): Linux (process, memory, cgroup), Docker, kiến trúc Kubernetes (scheduling, probe, autoscaling, bảo mật), CI/CD, GitOps, progressive delivery.
 
 ---
 

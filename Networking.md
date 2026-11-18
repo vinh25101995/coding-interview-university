@@ -6,6 +6,7 @@ Tài liệu ôn tập **Networking** dành cho Backend/Java engineer: từ mô h
 > - [`SystemDesign.md`](SystemDesign.md): Load Balancer, CDN, HTTP/1.1 vs 2 vs 3, WebSocket/SSE, API Gateway, Rate limiting.
 > - [`Java.md`](Java.md): Mục 15 — BIO/NIO/AIO, Selector/epoll, zero-copy, Netty.
 > - [`SpringBoot.md`](SpringBoot.md): Mục 6.4 — Embedded Tomcat threading; mục 16 — HTTP client, timeout, resilience.
+> - [`DevOps.md`](DevOps.md): Linux namespace/cgroup, Docker networking, kiến trúc Kubernetes, CI/CD & GitOps.
 
 ## 📖 Cách đọc tài liệu này
 
